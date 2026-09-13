@@ -70,7 +70,6 @@ def get_stock_name(symbol):
 
 @st.cache_data(ttl=60)
 def get_market_status():
-    """获取上证指数实时涨跌幅"""
     url = "https://qt.gtimg.cn/q=sh000001"
     try:
         res = requests.get(url, timeout=3)
@@ -78,7 +77,6 @@ def get_market_status():
         text = res.text
         if "~" in text:
             parts = text.split("~")
-            # 腾讯接口第32个字段通常是涨跌幅
             if len(parts) > 32:
                 return float(parts[32])
     except Exception:
@@ -173,6 +171,14 @@ def get_minute_data(code):
             df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
             df['Amount'] = df['Price'] * df['Volume']
             df['AvgPrice'] = df['Amount'].cumsum() / df['Volume'].cumsum()
+            
+            # 🌟 补丁3：分时级别MACD计算（用于背离检测）
+            ema12 = df['Price'].ewm(span=12, adjust=False).mean()
+            ema26 = df['Price'].ewm(span=26, adjust=False).mean()
+            df['DIFF'] = ema12 - ema26
+            df['DEA'] = df['DIFF'].ewm(span=9, adjust=False).mean()
+            df['MACD'] = 2 * (df['DIFF'] - df['DEA'])
+            
             return df
     except Exception:
         return None
@@ -253,6 +259,16 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
         elif narrow_vol:
             pattern = "缩量横盘"
             
+    # 🌟 补丁4：久盘必跌风险警告
+    narrow_count = 0
+    for i in range(1, 8):
+        if df_daily['BOLL_WIDTH'].iloc[-i] < 0.08:
+            narrow_count += 1
+            
+    flat_warning = ""
+    if narrow_count >= 5:
+        flat_warning = " (均线长期粘合，注意久盘必跌风险)"
+            
     # 4. 做T方向铁律
     allow_t = "允许"
     direction = "正T"
@@ -275,15 +291,41 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     buy_points = pd.DataFrame()
     sell_points = pd.DataFrame()
     buy_warning = ""
+    divergence_info = ""
     
     if allow_t == "允许" and df_minute is not None and not df_minute.empty:
         df_min = df_minute.copy()
         df_min = df_min[df_min['Time'] <= "1500"]
         df_min['Vol_MA5'] = df_min['Volume'].rolling(5).mean()
         
-        # 🌟 时间窗口过滤：剔除早盘9:45前和尾盘14:45后的杂乱波动
         df_min_buy = df_min[(df_min['Time'] >= "0945") & (df_min['Time'] <= "1445")]
-        df_min_sell = df_min[(df_min['Time'] >= "0930") & (df_min['Time'] <= "1455")] # 卖点允许尾盘高抛
+        df_min_sell = df_min[(df_min['Time'] >= "0930") & (df_min['Time'] <= "1455")]
+        
+        # 🌟 补丁3：底背离检测
+        # 简单算法：今日最低价区域，价格创日内新低，但MACD未创日内新低
+        low_idx = df_min['Price'].idxmin()
+        if len(df_min.loc[:low_idx]) > 5:
+            recent_low = df_min.loc[low_idx, 'Price']
+            recent_macd = df_min.loc[low_idx, 'MACD']
+            # 查找前一个波谷
+            prev_lows = df_min[df_min['Price'] < recent_low * 1.005] # 相近的低点
+            if len(prev_lows) > 0:
+                prev_low_idx = prev_lows.index[0]
+                prev_macd = df_min.loc[prev_low_idx, 'MACD']
+                if recent_macd > prev_macd: # 价格新低，MACD抬高
+                    divergence_info += " 底背离"
+        
+        # 顶背离检测
+        high_idx = df_min['Price'].idxmax()
+        if len(df_min.loc[:high_idx]) > 5:
+            recent_high = df_min.loc[high_idx, 'Price']
+            recent_macd = df_min.loc[high_idx, 'MACD']
+            prev_highs = df_min[df_min['Price'] > recent_high * 0.995]
+            if len(prev_highs) > 0:
+                prev_high_idx = prev_highs.index[-1]
+                prev_macd = df_min.loc[prev_high_idx, 'MACD']
+                if recent_macd < prev_macd: # 价格新高，MACD降低
+                    divergence_info += " 顶背离"
         
         buy_cond = (df_min_buy['Price'] < df_min_buy['AvgPrice'] * (1 - deviation)) & (df_min_buy['Volume'] < df_min_buy['Vol_MA5'] * 0.8)
         sell_cond = (df_min_sell['Price'] > df_min_sell['AvgPrice'] * (1 + deviation)) & (df_min_sell['Volume'] > df_min_sell['Vol_MA5'] * 1.2)
@@ -291,7 +333,7 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
         buy_points = df_min_buy[buy_cond]
         sell_points = df_min_sell[sell_cond]
         
-        # 🌟 大盘熔断机制
+        # 🌟 补丁1：大盘环境强化
         if market_change < -1.0:
             buy_warning = " ⚠️大盘暴跌，强制降为低置信度！"
         
@@ -300,27 +342,29 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
             time_fmt = f"{best_row['Time'][:2]}:{best_row['Time'][2:]}"
             dev_pct = (best_row['AvgPrice'] - best_row['Price']) / best_row['AvgPrice']
             
-            # 置信度判断（受大盘影响）
             if market_change < -1.0:
                 conf = "低"
             else:
                 conf = "高" if dev_pct > deviation * 2 else ("中" if dev_pct > deviation * 1.2 else "低")
-                
+                if "底背离" in divergence_info:
+                    conf = "高" # 底背离直接提升置信度
+                    
             b_type = "正T低吸" if direction == "正T" else "反T回补"
-            best_buy = f"{time_fmt} | {best_row['Price']:.3f} | {b_type} | 回踩均价线缩量企稳 | 置信度{conf}{buy_warning}"
+            best_buy = f"{time_fmt} | {best_row['Price']:.3f} | {b_type} | 回踩均价线缩量企稳{divergence_info} | 置信度{conf}{buy_warning}"
             
         if not sell_points.empty:
             best_row = sell_points.loc[sell_points['Price'].idxmax()]
             time_fmt = f"{best_row['Time'][:2]}:{best_row['Time'][2:]}"
             dev_pct = (best_row['Price'] - best_row['AvgPrice']) / best_row['AvgPrice']
             conf = "高" if dev_pct > deviation * 2 else ("中" if dev_pct > deviation * 1.2 else "低")
+            if "顶背离" in divergence_info:
+                conf = "高"
             s_type = "正T高抛" if direction == "正T" else "反T减仓"
-            best_sell = f"{time_fmt} | {best_row['Price']:.3f} | {s_type} | 冲高乖离均价线放量滞涨 | 置信度{conf}"
+            best_sell = f"{time_fmt} | {best_row['Price']:.3f} | {s_type} | 冲高乖离均价线放量滞涨{divergence_info} | 置信度{conf}"
 
     today_str = latest['Date'].strftime('%Y-%m-%d')
     time_str = datetime.now().strftime('%H:%M')
     
-    # 大盘状态显示
     market_status = f"上证 {market_change:+.2f}%"
     market_color = "color-green" if market_change >= 0 else "color-red"
     
@@ -334,7 +378,7 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     <div class="report-row">
         <span class="color-blue">日线趋势:</span> <span class="color-white">{trend}</span>
         <span class="color-blue">是否企稳:</span> <span class="color-white">{'是' if is_steady else '否'}</span>
-        <span class="color-blue">企稳形态:</span> <span class="color-white">{pattern}</span>
+        <span class="color-blue">企稳形态:</span> <span class="color-white">{pattern}{flat_warning}</span>
     </div>
     <div class="report-row">
         <span class="color-blue">做T方向:</span> <span class="color-white">{direction}</span>
@@ -352,10 +396,11 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     </div>
     """
     
-    # 🌟 生成AI实时建议（包含仓位与止损纪律提示）
     ai_advice = ""
-    if market_change < -1.0:
+    if market_change < -1.5:
         ai_advice = f"🚨 **【大盘熔断警告】** 当前上证指数跌幅为 {market_change:.2f}%，市场情绪极度恶劣。今日所有买点置信度强制降为「低」，建议暂停一切正T低吸操作，观望为主，保护好本金！"
+    elif flat_warning:
+        ai_advice = f"⚠️ **【久盘必跌警告】** 日线布林带持续收窄，均线高度粘合超过5天。虽已企稳，但向下破位风险正在积累。如果触发买点，**建议仓位减半**，且严格设好止损，一旦跌破支撑 {support:.3f} 立刻离场！"
     elif allow_t == "不允许":
         ai_advice = f"📉 **当前策略判定：不允许做T。** 日线处于下降趋势且未见企稳特征，此时严禁盲目抄底做正T。若盘中有冲高机会，仅可考虑少量反T减仓，保持观望。"
     elif direction == "反T":
@@ -407,8 +452,6 @@ def plot_minute_chart(df, buy_points, sell_points, symbol_name):
     fig = make_subplots(rows=1, cols=1)
     fig.add_trace(go.Scatter(x=df['Datetime'], y=df['Price'], mode='lines', name='分时价格', line=dict(color='#00ccff', width=2)))
     fig.add_trace(go.Scatter(x=df['Datetime'], y=df['AvgPrice'], mode='lines', name='分时均价', line=dict(color='#ffaa00', width=1.5)))
-    
-    # 画早盘/尾盘过滤区域的警戒线 (可选视觉辅助，不画也可以)
     
     if not buy_points.empty:
         buy_points = buy_points[buy_points['Time'] <= "1500"]
