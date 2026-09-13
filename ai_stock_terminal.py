@@ -45,7 +45,6 @@ st.markdown("""
     
     /* 🌟 核心修复：真正的右侧悬浮固定窗 */
     @media (min-width: 992px) {
-        /* 找到主布局中最后一个垂直块（即 AI 聊天），固定在屏幕右侧 */
         div[data-testid="stAppViewBlockContainer"] > div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"]:last-child {
             position: fixed !important;
             top: 70px !important;
@@ -60,13 +59,11 @@ st.markdown("""
             box-shadow: 0 8px 24px rgba(0,0,0,0.6) !important;
             overflow-y: auto !important;
         }
-        /* 给左侧主内容留出空间，防止被右侧固定面板挡住 */
         .main .block-container {
             padding-right: 420px !important;
         }
     }
     @media (max-width: 992px) {
-        /* 手机端取消固定，恢复正常上下流式布局 */
         div[data-testid="stAppViewBlockContainer"] > div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"]:last-child {
             position: static !important;
             width: 100% !important;
@@ -90,6 +87,7 @@ else:
 
 # ================= 2. 本地持久化存储工具 =================
 WATCHLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.json")
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 def load_watchlist():
     try:
@@ -106,6 +104,24 @@ def save_watchlist(stock_list):
     try:
         with open(WATCHLIST_FILE, 'w', encoding='utf-8') as f:
             json.dump(stock_list, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        pass
+
+def load_config():
+    """从本地加载配置（如 API Key）"""
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_config(config_data):
+    """保存配置到本地"""
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config_data, f, ensure_ascii=False, indent=4)
     except Exception as e:
         pass
 
@@ -204,9 +220,20 @@ with st.sidebar:
         
     st.markdown("---")
     st.header("🤖 DeepSeek AI 配置")
-    api_key = st.text_input("DeepSeek API Key", type="password", help="请前往 platform.deepseek.com 注册获取")
-    if api_key:
-        st.success("API Key 已配置。")
+    
+    # 🌟 核心修复：从本地文件加载 API Key 并持久化
+    if 'api_key' not in st.session_state:
+        config = load_config()
+        st.session_state.api_key = config.get('api_key', '')
+    
+    def on_api_key_change():
+        """当输入框改变时，自动保存到本地文件"""
+        save_config({'api_key': st.session_state.api_key})
+        
+    st.text_input("DeepSeek API Key", type="password", key="api_key", on_change=on_api_key_change, help="只需配置一次，会自动保存到本地 config.json 文件")
+    
+    if st.session_state.api_key:
+        st.success("API Key 已配置且已持久化保存。")
     else:
         st.warning("未配置 API Key，无法使用AI问答。")
 
@@ -605,16 +632,16 @@ if __name__ == "__main__":
         st.warning("暂无分时数据")
 
     # ================= 🌟 右侧悬浮 AI 聊天区域 =================
-    # 这里使用一个空的容器，通过 CSS 的 :last-child 选择器将它固定在右侧
     with st.container():
         st.subheader("💬 DeepSeek AI")
-        if not api_key:
+        
+        # 这里直接读取 st.session_state.api_key，因为已经持久化
+        if not st.session_state.api_key:
             st.warning("⚠️ 请先在左侧侧边栏配置 DeepSeek API Key，才能使用AI问答功能。")
         else:
             if "messages" not in st.session_state:
                 st.session_state.messages = []
             
-            # 聊天历史展示
             for message in st.session_state.messages:
                 with st.chat_message(message["role"]):
                     st.markdown(message["content"])
@@ -636,7 +663,7 @@ if __name__ == "__main__":
                     full_response = ""
                     try:
                         headers = {
-                            "Authorization": f"Bearer {api_key}",
+                            "Authorization": f"Bearer {st.session_state.api_key}",
                             "Content-Type": "application/json"
                         }
                         data = {
