@@ -32,7 +32,6 @@ st.markdown("""
     .color-green { color: #00cc66; font-weight: bold; }
     .color-blue { color: #89b4fa; font-weight: bold; }
     .color-white { color: #f0f2f6; }
-    .color-warning { color: #f9e2af; font-weight: bold; }
     .ai-advice-box {
         background-color: #2b2b3b; padding: 15px; border-left: 5px solid #ffaa00;
         border-radius: 8px; color: #f0f2f6; font-size: 16px; margin-bottom: 20px;
@@ -42,6 +41,41 @@ st.markdown("""
     }
     div.stButton > button[kind="secondary"] {
         background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+    }
+    
+    /* 🌟 核心修复：真正的右侧悬浮固定窗 */
+    @media (min-width: 992px) {
+        /* 找到主布局中最后一个垂直块（即 AI 聊天），固定在屏幕右侧 */
+        div[data-testid="stAppViewBlockContainer"] > div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"]:last-child {
+            position: fixed !important;
+            top: 70px !important;
+            right: 20px !important;
+            width: 380px !important;
+            max-height: 85vh !important;
+            background-color: #1e1e2e !important;
+            border: 1px solid #30363d !important;
+            border-radius: 12px !important;
+            padding: 15px !important;
+            z-index: 9999 !important;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.6) !important;
+            overflow-y: auto !important;
+        }
+        /* 给左侧主内容留出空间，防止被右侧固定面板挡住 */
+        .main .block-container {
+            padding-right: 420px !important;
+        }
+    }
+    @media (max-width: 992px) {
+        /* 手机端取消固定，恢复正常上下流式布局 */
+        div[data-testid="stAppViewBlockContainer"] > div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"]:last-child {
+            position: static !important;
+            width: 100% !important;
+            max-height: none !important;
+            margin-top: 20px !important;
+        }
+        .main .block-container {
+            padding-right: 1rem !important;
+        }
     }
     </style>
     """, unsafe_allow_html=True)
@@ -167,6 +201,14 @@ with st.sidebar:
         manual_dev = st.slider("手动偏离阈值(%)", 0.5, 2.0, 0.8) / 100
     else:
         st.info("已开启动态阈值，根据当日振幅自动计算。")
+        
+    st.markdown("---")
+    st.header("🤖 DeepSeek AI 配置")
+    api_key = st.text_input("DeepSeek API Key", type="password", help="请前往 platform.deepseek.com 注册获取")
+    if api_key:
+        st.success("API Key 已配置。")
+    else:
+        st.warning("未配置 API Key，无法使用AI问答。")
 
 symbol = st.session_state.current_stock
 current_name = get_stock_name(symbol)
@@ -433,7 +475,21 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
         else:
             ai_advice = f"⏳ **当前策略判定：等待正T买点。** 日线趋势向上且已企稳，但当前分时价格尚未回踩至均价线缩量企稳，耐心等待最优买点出现，不要盲目追高。"
             
-    return report, ai_advice, buy_points, sell_points
+    context = f"""
+    【当前盘面实时数据】
+    标的: {current_name} ({symbol})
+    当前价格: {latest['Close']:.3f}
+    日线趋势: {trend}
+    是否企稳: {'是' if is_steady else '否'}
+    做T方向: {direction}
+    关键支撑: {support:.3f}
+    关键压力: {resistance:.3f}
+    大盘涨跌幅: {market_change:.2f}%
+    当前最优买点: {best_buy}
+    当前最优卖点: {best_sell}
+    """
+            
+    return report, ai_advice, buy_points, sell_points, context
 
 # ================= 8. 绘制图表 =================
 def plot_daily_chart(df, symbol_name):
@@ -473,7 +529,6 @@ def plot_minute_chart(df, buy_points, sell_points, symbol_name):
     fig.add_trace(go.Scatter(x=df['Datetime'], y=df['Price'], mode='lines', name='分时价格', line=dict(color='#00ccff', width=2)))
     fig.add_trace(go.Scatter(x=df['Datetime'], y=df['AvgPrice'], mode='lines', name='分时均价', line=dict(color='#ffaa00', width=1.5)))
     
-    # 🌟 核心新增：在分时图左上角直接显示实时价格和均价
     if not df.empty:
         latest_price = df['Price'].iloc[-1]
         latest_avg = df['AvgPrice'].iloc[-1]
@@ -533,8 +588,9 @@ if __name__ == "__main__":
     else:
         actual_deviation = manual_dev
 
-    report, ai_advice, buy_points, sell_points = generate_report_and_advice(df_daily, df_minute, actual_deviation, market_change)
+    report, ai_advice, buy_points, sell_points, context = generate_report_and_advice(df_daily, df_minute, actual_deviation, market_change)
     
+    # 🌟 主界面：左侧图表直接渲染，右侧留白由 CSS 控制
     st.markdown(f'<div class="report-box">{report}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="ai-advice-box">🤖 <b>AI 实时建议</b><br>{ai_advice}</div>', unsafe_allow_html=True)
 
@@ -547,3 +603,57 @@ if __name__ == "__main__":
         st.caption("策略说明：在日线趋势向上或震荡且允许做T的前提下，分时价格缩量回踩均价线时提示买入，分时价格放量冲高乖离均价线时提示卖出，趋势向下时不再生成任何信号。")
     else:
         st.warning("暂无分时数据")
+
+    # ================= 🌟 右侧悬浮 AI 聊天区域 =================
+    # 这里使用一个空的容器，通过 CSS 的 :last-child 选择器将它固定在右侧
+    with st.container():
+        st.subheader("💬 DeepSeek AI")
+        if not api_key:
+            st.warning("⚠️ 请先在左侧侧边栏配置 DeepSeek API Key，才能使用AI问答功能。")
+        else:
+            if "messages" not in st.session_state:
+                st.session_state.messages = []
+            
+            # 聊天历史展示
+            for message in st.session_state.messages:
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+            
+            if prompt := st.chat_input("在此提问..."):
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+                st.session_state.messages.append({"role": "user", "content": prompt})
+                
+                system_prompt = f"""你是一个专业的A股做T交易助手。请根据以下实时盘面数据，用简洁专业的语言回答用户的问题。
+                注意：不要盲目看多或看空，要结合支撑压力、量能和趋势给出客观判断。
+                {context}
+                """
+                
+                messages_to_send = [{"role": "system", "content": system_prompt}] + st.session_state.messages
+                
+                with st.chat_message("assistant"):
+                    message_placeholder = st.empty()
+                    full_response = ""
+                    try:
+                        headers = {
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json"
+                        }
+                        data = {
+                            "model": "deepseek-chat",
+                            "messages": messages_to_send,
+                            "stream": False
+                        }
+                        response = requests.post("https://api.deepseek.com/chat/completions", headers=headers, json=data, timeout=30)
+                        
+                        if response.status_code == 200:
+                            result = response.json()
+                            full_response = result['choices'][0]['message']['content']
+                        else:
+                            full_response = f"API请求失败，状态码：{response.status_code}。请检查API Key是否正确或余额是否充足。"
+                    except Exception as e:
+                        full_response = f"网络请求异常：{str(e)}"
+                    
+                    message_placeholder.markdown(full_response)
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+                st.rerun()
