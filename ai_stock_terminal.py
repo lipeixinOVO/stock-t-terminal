@@ -58,7 +58,6 @@ else:
 WATCHLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.json")
 
 def load_watchlist():
-    """从本地 JSON 文件读取自选股列表"""
     try:
         if os.path.exists(WATCHLIST_FILE):
             with open(WATCHLIST_FILE, 'r', encoding='utf-8') as f:
@@ -67,16 +66,14 @@ def load_watchlist():
                     return data
     except Exception:
         pass
-    # 如果文件不存在或读取失败，返回默认值
     return ['515880', '159915']
 
 def save_watchlist(stock_list):
-    """将自选股列表保存到本地 JSON 文件"""
     try:
         with open(WATCHLIST_FILE, 'w', encoding='utf-8') as f:
             json.dump(stock_list, f, ensure_ascii=False, indent=4)
     except Exception as e:
-        pass # 避免因为写文件失败导致程序崩溃
+        pass
 
 # ================= 3. 辅助函数 =================
 @st.cache_data(ttl=3600)
@@ -110,17 +107,15 @@ def get_market_status():
         pass
     return 0.0
 
-# ================= 4. 侧边栏（批量添加 + 持久化存储） =================
+# ================= 4. 侧边栏 =================
 with st.sidebar:
     st.header("📈 自选股管理")
     
-    # 初始化时从本地文件读取
     if 'stock_list' not in st.session_state:
         st.session_state.stock_list = load_watchlist()
     if 'current_stock' not in st.session_state:
         st.session_state.current_stock = st.session_state.stock_list[0] if st.session_state.stock_list else '515880'
 
-    # 批量添加
     with st.form("batch_add_form", clear_on_submit=True):
         new_stocks = st.text_input("批量添加股票代码", placeholder="例如: 512480, 159915 000001", label_visibility="collapsed")
         submit_add = st.form_submit_button("➕ 批量添加", use_container_width=True)
@@ -133,14 +128,13 @@ with st.sidebar:
                     st.session_state.stock_list.append(code)
                     added = True
             if added:
-                save_watchlist(st.session_state.stock_list) # 同步写入文件
+                save_watchlist(st.session_state.stock_list)
                 st.rerun()
             else:
                 st.warning("未发现新的有效股票代码，或格式不正确。")
 
     st.markdown("---")
     
-    # 显示自选股列表
     if not st.session_state.stock_list:
         st.info("暂无自选股，请添加")
         st.session_state.current_stock = '515880'
@@ -158,8 +152,7 @@ with st.sidebar:
             with col_del:
                 if st.button("❌", key=f"del_{stock}"):
                     st.session_state.stock_list.remove(stock)
-                    save_watchlist(st.session_state.stock_list) # 删除后也同步写入文件
-                    
+                    save_watchlist(st.session_state.stock_list)
                     if st.session_state.current_stock == stock:
                         if st.session_state.stock_list:
                             st.session_state.current_stock = st.session_state.stock_list[0]
@@ -479,6 +472,18 @@ def plot_minute_chart(df, buy_points, sell_points, symbol_name):
     fig = make_subplots(rows=1, cols=1)
     fig.add_trace(go.Scatter(x=df['Datetime'], y=df['Price'], mode='lines', name='分时价格', line=dict(color='#00ccff', width=2)))
     fig.add_trace(go.Scatter(x=df['Datetime'], y=df['AvgPrice'], mode='lines', name='分时均价', line=dict(color='#ffaa00', width=1.5)))
+    
+    # 🌟 核心新增：在分时图左上角直接显示实时价格和均价
+    if not df.empty:
+        latest_price = df['Price'].iloc[-1]
+        latest_avg = df['AvgPrice'].iloc[-1]
+        fig.add_annotation(
+            x=0.02, y=0.98, xref="paper", yref="paper",
+            text=f"<b>实时价格:</b> <span style='color:#00ccff'>{latest_price:.3f}</span><br><b>分时均价:</b> <span style='color:#ffaa00'>{latest_avg:.3f}</span>",
+            showarrow=False, align="left",
+            bgcolor="rgba(30,30,46,0.85)", bordercolor="#444", borderwidth=1, borderpad=6,
+            font=dict(color="#f0f2f6", size=14)
+        )
     
     if not buy_points.empty:
         buy_points = buy_points[buy_points['Time'] <= "1500"]
