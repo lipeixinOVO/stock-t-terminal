@@ -5,6 +5,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
 import re
+import json
+import os
 from datetime import datetime, time
 
 try:
@@ -52,7 +54,31 @@ if HAS_AUTOREFRESH:
 else:
     st.caption("⚠️ 未安装自动刷新组件，请按 F5 手动刷新网页")
 
-# ================= 2. 辅助函数 =================
+# ================= 2. 本地持久化存储工具 =================
+WATCHLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.json")
+
+def load_watchlist():
+    """从本地 JSON 文件读取自选股列表"""
+    try:
+        if os.path.exists(WATCHLIST_FILE):
+            with open(WATCHLIST_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+    except Exception:
+        pass
+    # 如果文件不存在或读取失败，返回默认值
+    return ['515880', '159915']
+
+def save_watchlist(stock_list):
+    """将自选股列表保存到本地 JSON 文件"""
+    try:
+        with open(WATCHLIST_FILE, 'w', encoding='utf-8') as f:
+            json.dump(stock_list, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        pass # 避免因为写文件失败导致程序崩溃
+
+# ================= 3. 辅助函数 =================
 @st.cache_data(ttl=3600)
 def get_stock_name(symbol):
     prefix = "sh" if symbol.startswith(('5', '6', '9')) else "sz"
@@ -84,22 +110,22 @@ def get_market_status():
         pass
     return 0.0
 
-# ================= 3. 侧边栏（批量添加自选股） =================
+# ================= 4. 侧边栏（批量添加 + 持久化存储） =================
 with st.sidebar:
     st.header("📈 自选股管理")
     
+    # 初始化时从本地文件读取
     if 'stock_list' not in st.session_state:
-        st.session_state.stock_list = ['515880', '159915']
+        st.session_state.stock_list = load_watchlist()
     if 'current_stock' not in st.session_state:
-        st.session_state.current_stock = '515880'
+        st.session_state.current_stock = st.session_state.stock_list[0] if st.session_state.stock_list else '515880'
 
-    # 🌟 核心修改：支持批量添加
+    # 批量添加
     with st.form("batch_add_form", clear_on_submit=True):
         new_stocks = st.text_input("批量添加股票代码", placeholder="例如: 512480, 159915 000001", label_visibility="collapsed")
         submit_add = st.form_submit_button("➕ 批量添加", use_container_width=True)
         
         if submit_add and new_stocks.strip():
-            # 使用正则表达式提取所有6位数字的股票代码
             codes = re.findall(r'\d{6}', new_stocks)
             added = False
             for code in codes:
@@ -107,6 +133,7 @@ with st.sidebar:
                     st.session_state.stock_list.append(code)
                     added = True
             if added:
+                save_watchlist(st.session_state.stock_list) # 同步写入文件
                 st.rerun()
             else:
                 st.warning("未发现新的有效股票代码，或格式不正确。")
@@ -131,6 +158,8 @@ with st.sidebar:
             with col_del:
                 if st.button("❌", key=f"del_{stock}"):
                     st.session_state.stock_list.remove(stock)
+                    save_watchlist(st.session_state.stock_list) # 删除后也同步写入文件
+                    
                     if st.session_state.current_stock == stock:
                         if st.session_state.stock_list:
                             st.session_state.current_stock = st.session_state.stock_list[0]
@@ -150,7 +179,7 @@ symbol = st.session_state.current_stock
 current_name = get_stock_name(symbol)
 st.sidebar.success(f"当前标的: {current_name} ({symbol})")
 
-# ================= 4. 数据获取工具 =================
+# ================= 5. 数据获取工具 =================
 code = f"sh{symbol}" if symbol.startswith(('5', '6', '9')) else f"sz{symbol}"
 
 @st.cache_data(ttl=60)
@@ -193,7 +222,7 @@ def get_minute_data(code):
     except Exception:
         return None
 
-# ================= 5. 指标计算 =================
+# ================= 6. 指标计算 =================
 def calculate_daily_indicators(df):
     df = df.copy()
     df['MA5'] = df['Close'].rolling(5).mean()
@@ -237,7 +266,7 @@ def calculate_daily_indicators(df):
     
     return df.bfill().ffill()
 
-# ================= 6. 核心策略判定与AI建议 =================
+# ================= 7. 核心策略判定与AI建议 =================
 def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     latest = df_daily.iloc[-1]
     prev = df_daily.iloc[-2]
@@ -413,7 +442,7 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
             
     return report, ai_advice, buy_points, sell_points
 
-# ================= 7. 绘制图表 =================
+# ================= 8. 绘制图表 =================
 def plot_daily_chart(df, symbol_name):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
     fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='日K',
@@ -472,7 +501,7 @@ def plot_minute_chart(df, buy_points, sell_points, symbol_name):
     fig.update_xaxes(type='date', tickformat="%H:%M", rangebreaks=[dict(bounds=[11.5, 13], pattern="hour")])
     return fig
 
-# ================= 8. 主程序执行 =================
+# ================= 9. 主程序执行 =================
 if __name__ == "__main__":
     df_daily = get_daily_data(code)
     df_minute = get_minute_data(code)
