@@ -19,7 +19,6 @@ st.markdown("""
     <style>
     .main { background-color: #0e1117; }
     h1, h2, h3 { color: #f0f2f6; font-family: 'Microsoft YaHei'; }
-    /* 紧凑型报告盒子 */
     .report-box { 
         background-color: #1e1e2e; padding: 12px 18px; border-radius: 8px; 
         font-family: 'Consolas', monospace; font-size: 15px; line-height: 1.6; 
@@ -30,6 +29,17 @@ st.markdown("""
     .color-green { color: #00cc66; font-weight: bold; }
     .color-blue { color: #89b4fa; font-weight: bold; }
     .color-white { color: #f0f2f6; }
+    .color-warning { color: #f9e2af; font-weight: bold; }
+    .ai-advice-box {
+        background-color: #2b2b3b; padding: 15px; border-left: 5px solid #ffaa00;
+        border-radius: 8px; color: #f0f2f6; font-size: 16px; margin-bottom: 20px;
+    }
+    div.stButton > button[kind="primary"] {
+        background-color: #1f6feb; color: white; border: none; font-weight: bold;
+    }
+    div.stButton > button[kind="secondary"] {
+        background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -41,14 +51,97 @@ if HAS_AUTOREFRESH:
 else:
     st.caption("⚠️ 未安装自动刷新组件，请按 F5 手动刷新网页")
 
-# ================= 2. 侧边栏参数 =================
-with st.sidebar:
-    st.header("⚙️ 参数设置")
-    symbol = st.text_input("股票/ETF代码", value="515880", help="默认: 515880 (通信ETF)")
-    st.markdown("**分时极值参数**")
-    min_deviation = st.slider("分时偏离均价阈值(%)", 0.5, 2.0, 0.8) / 100
+# ================= 2. 辅助函数 =================
+@st.cache_data(ttl=3600)
+def get_stock_name(symbol):
+    prefix = "sh" if symbol.startswith(('5', '6', '9')) else "sz"
+    url = f"https://qt.gtimg.cn/q={prefix}{symbol}"
+    try:
+        res = requests.get(url, timeout=3)
+        res.encoding = 'gbk'
+        text = res.text
+        if "~" in text:
+            parts = text.split("~")
+            if len(parts) > 1:
+                return parts[1].strip('"')
+    except Exception:
+        pass
+    return symbol
 
-# ================= 3. 数据获取工具 =================
+@st.cache_data(ttl=60)
+def get_market_status():
+    """获取上证指数实时涨跌幅"""
+    url = "https://qt.gtimg.cn/q=sh000001"
+    try:
+        res = requests.get(url, timeout=3)
+        res.encoding = 'gbk'
+        text = res.text
+        if "~" in text:
+            parts = text.split("~")
+            # 腾讯接口第32个字段通常是涨跌幅
+            if len(parts) > 32:
+                return float(parts[32])
+    except Exception:
+        pass
+    return 0.0
+
+# ================= 3. 侧边栏 =================
+with st.sidebar:
+    st.header("📈 自选股管理")
+    
+    if 'stock_list' not in st.session_state:
+        st.session_state.stock_list = ['515880', '159915']
+    if 'current_stock' not in st.session_state:
+        st.session_state.current_stock = '515880'
+
+    col_add1, col_add2 = st.columns([3, 1])
+    with col_add1:
+        new_stock = st.text_input("添加股票代码", placeholder="例如: 512480", label_visibility="collapsed")
+    with col_add2:
+        if st.button("➕", use_container_width=True):
+            if new_stock.strip() and new_stock.strip() not in st.session_state.stock_list:
+                st.session_state.stock_list.append(new_stock.strip())
+                st.rerun()
+
+    st.markdown("---")
+    
+    if not st.session_state.stock_list:
+        st.info("暂无自选股，请添加")
+        st.session_state.current_stock = '515880'
+    else:
+        for stock in st.session_state.stock_list:
+            col_stock, col_del = st.columns([4, 1])
+            with col_stock:
+                stock_name = get_stock_name(stock)
+                display_text = f"{stock_name} ({stock})"
+                is_selected = (stock == st.session_state.current_stock)
+                if st.button(display_text, key=f"select_{stock}", use_container_width=True, 
+                             type="primary" if is_selected else "secondary"):
+                    st.session_state.current_stock = stock
+                    st.rerun()
+            with col_del:
+                if st.button("❌", key=f"del_{stock}"):
+                    st.session_state.stock_list.remove(stock)
+                    if st.session_state.current_stock == stock:
+                        if st.session_state.stock_list:
+                            st.session_state.current_stock = st.session_state.stock_list[0]
+                        else:
+                            st.session_state.current_stock = '515880'
+                    st.rerun()
+    
+    st.markdown("---")
+    st.header("⚙️ 参数设置")
+    auto_dev = st.checkbox("启用动态偏离阈值（自动适配波动）", value=True)
+    if not auto_dev:
+        manual_dev = st.slider("手动偏离阈值(%)", 0.5, 2.0, 0.8) / 100
+    else:
+        st.info("已开启动态阈值，根据当日振幅自动计算。")
+
+symbol = st.session_state.current_stock
+current_name = get_stock_name(symbol)
+st.sidebar.success(f"当前标的: {current_name} ({symbol})")
+
+# ================= 4. 数据获取工具 =================
 code = f"sh{symbol}" if symbol.startswith(('5', '6', '9')) else f"sz{symbol}"
 
 @st.cache_data(ttl=60)
@@ -84,12 +177,13 @@ def get_minute_data(code):
     except Exception:
         return None
 
-# ================= 4. 指标计算 =================
+# ================= 5. 指标计算 =================
 def calculate_daily_indicators(df):
     df = df.copy()
     df['MA5'] = df['Close'].rolling(5).mean()
     df['MA20'] = df['Close'].rolling(20).mean()
     df['MA20_UP'] = df['MA20'] > df['MA20'].shift(1)
+    df['MA5_UP'] = df['MA5'] > df['MA5'].shift(1)
     
     ema12 = df['Close'].ewm(span=12, adjust=False).mean()
     ema26 = df['Close'].ewm(span=26, adjust=False).mean()
@@ -108,104 +202,175 @@ def calculate_daily_indicators(df):
     std = df['Close'].rolling(20).std()
     df['BOLL_UP'] = df['BOLL_MID'] + 2 * std
     df['BOLL_LOW'] = df['BOLL_MID'] - 2 * std
+    df['BOLL_WIDTH'] = (df['BOLL_UP'] - df['BOLL_LOW']) / df['BOLL_MID']
     
     df['VOL_MA5'] = df['Volume'].rolling(5).mean()
-    return df.bfill().ffill()
-
-def generate_daily_signals(df):
-    df = df.copy()
+    
     df['Signal'] = 0
     buy_cond = (df['MA20_UP'] == True) & \
                (df['J'] < 15) & \
                (df['Close'] <= df['BOLL_MID'] * 1.02) & \
                (df['Volume'] < df['VOL_MA5'] * 1.5)
-               
     sell_cond = (df['J'] > 105) & \
                 (df['Close'] >= df['BOLL_UP'] * 0.98) & \
                 (df['Volume'] > df['VOL_MA5'] * 0.8)
-                
     buy_cond = buy_cond & (df['Signal'].shift(1) != 1)
     sell_cond = sell_cond & (df['Signal'].shift(1) != -1)
     df.loc[buy_cond, 'Signal'] = 1
     df.loc[sell_cond, 'Signal'] = -1
-    return df
+    
+    return df.bfill().ffill()
 
-# ================= 5. 生成极简策略报告 =================
-def generate_report(df_daily, df_minute, deviation):
+# ================= 6. 核心策略判定与AI建议 =================
+def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     latest = df_daily.iloc[-1]
+    prev = df_daily.iloc[-2]
+    
+    # 1. 日线趋势
     trend = "震荡"
     if latest['MA20_UP'] and latest['Close'] > latest['MA20']:
         trend = "上升"
     elif not latest['MA20_UP'] and latest['Close'] < latest['MA20']:
         trend = "下降"
         
-    allow_t = "允许" if trend != "下降" else "不允许"
-    direction = "正T" if trend == "上升" or (trend == "震荡" and latest['Close'] < latest['BOLL_MID']) else ("反T" if trend == "震荡" else "不做")
+    # 2. 是否企稳
+    is_steady = False
+    price_stop = latest['Close'] > prev['Close'] or (latest['Close'] - latest['Low']) > (latest['High'] - latest['Close'])
+    vol_stop = latest['Volume'] < latest['VOL_MA5'] * 1.5
+    support_hold = latest['Close'] > latest['BOLL_LOW'] * 0.98
+    narrow_vol = latest['BOLL_WIDTH'] < 0.15 
     
+    if price_stop and vol_stop and support_hold:
+        is_steady = True
+        
+    # 3. 企稳形态
+    pattern = "无明显形态"
+    if is_steady:
+        if latest['BOLL_WIDTH'] < 0.08 and abs(latest['MA5'] - latest['MA20']) < 0.01:
+            pattern = "均线粘合走平"
+        elif latest['Close'] > latest['MA20'] and prev['Close'] < prev['MA20']:
+            pattern = "W底/N字结构"
+        elif narrow_vol:
+            pattern = "缩量横盘"
+            
+    # 4. 做T方向铁律
+    allow_t = "允许"
+    direction = "正T"
+    if trend == "下降" and not is_steady:
+        allow_t = "不允许"
+        direction = "不做"
+    elif trend == "下降" and is_steady:
+        allow_t = "允许"
+        direction = "反T"
+    elif trend == "震荡":
+        direction = "正T" if latest['Close'] < latest['BOLL_MID'] else "反T"
+        
+    # 5. 支撑与压力
     support = round(min(latest['MA20'], latest['BOLL_LOW']), 3)
     resistance = round(max(latest['Close'] * 1.02, latest['BOLL_UP']), 3)
     
-    best_buy = None
-    best_sell = None
+    # 6. 分时极值计算 (加入时间窗口过滤)
+    best_buy = "无有效点"
+    best_sell = "无有效点"
     buy_points = pd.DataFrame()
     sell_points = pd.DataFrame()
+    buy_warning = ""
     
     if allow_t == "允许" and df_minute is not None and not df_minute.empty:
         df_min = df_minute.copy()
         df_min = df_min[df_min['Time'] <= "1500"]
         df_min['Vol_MA5'] = df_min['Volume'].rolling(5).mean()
         
-        buy_cond = (df_min['Price'] < df_min['AvgPrice'] * (1 - deviation)) & (df_min['Volume'] < df_min['Vol_MA5'] * 0.8)
-        sell_cond = (df_min['Price'] > df_min['AvgPrice'] * (1 + deviation)) & (df_min['Volume'] > df_min['Vol_MA5'] * 1.2)
+        # 🌟 时间窗口过滤：剔除早盘9:45前和尾盘14:45后的杂乱波动
+        df_min_buy = df_min[(df_min['Time'] >= "0945") & (df_min['Time'] <= "1445")]
+        df_min_sell = df_min[(df_min['Time'] >= "0930") & (df_min['Time'] <= "1455")] # 卖点允许尾盘高抛
         
-        buy_points = df_min[buy_cond]
-        sell_points = df_min[sell_cond]
+        buy_cond = (df_min_buy['Price'] < df_min_buy['AvgPrice'] * (1 - deviation)) & (df_min_buy['Volume'] < df_min_buy['Vol_MA5'] * 0.8)
+        sell_cond = (df_min_sell['Price'] > df_min_sell['AvgPrice'] * (1 + deviation)) & (df_min_sell['Volume'] > df_min_sell['Vol_MA5'] * 1.2)
+        
+        buy_points = df_min_buy[buy_cond]
+        sell_points = df_min_sell[sell_cond]
+        
+        # 🌟 大盘熔断机制
+        if market_change < -1.0:
+            buy_warning = " ⚠️大盘暴跌，强制降为低置信度！"
         
         if not buy_points.empty:
             best_row = buy_points.loc[buy_points['Price'].idxmin()]
             time_fmt = f"{best_row['Time'][:2]}:{best_row['Time'][2:]}"
             dev_pct = (best_row['AvgPrice'] - best_row['Price']) / best_row['AvgPrice']
-            conf = "高" if dev_pct > deviation * 2 else ("中" if dev_pct > deviation * 1.2 else "低")
-            b_type = "正T低吸" if trend == "上升" or (trend == "震荡" and latest['Close'] < latest['BOLL_MID']) else "反T回补"
-            best_buy = f"{time_fmt} | {best_row['Price']:.3f} | {b_type} | 回踩均价线缩量企稳 | 置信度{conf}"
+            
+            # 置信度判断（受大盘影响）
+            if market_change < -1.0:
+                conf = "低"
+            else:
+                conf = "高" if dev_pct > deviation * 2 else ("中" if dev_pct > deviation * 1.2 else "低")
+                
+            b_type = "正T低吸" if direction == "正T" else "反T回补"
+            best_buy = f"{time_fmt} | {best_row['Price']:.3f} | {b_type} | 回踩均价线缩量企稳 | 置信度{conf}{buy_warning}"
             
         if not sell_points.empty:
             best_row = sell_points.loc[sell_points['Price'].idxmax()]
             time_fmt = f"{best_row['Time'][:2]}:{best_row['Time'][2:]}"
             dev_pct = (best_row['Price'] - best_row['AvgPrice']) / best_row['AvgPrice']
             conf = "高" if dev_pct > deviation * 2 else ("中" if dev_pct > deviation * 1.2 else "低")
-            s_type = "正T高抛" if trend == "上升" or (trend == "震荡" and latest['Close'] < latest['BOLL_MID']) else "反T减仓"
+            s_type = "正T高抛" if direction == "正T" else "反T减仓"
             best_sell = f"{time_fmt} | {best_row['Price']:.3f} | {s_type} | 冲高乖离均价线放量滞涨 | 置信度{conf}"
-
-    if best_buy is None: best_buy = "无有效点"
-    if best_sell is None: best_sell = "无有效点"
 
     today_str = latest['Date'].strftime('%Y-%m-%d')
     time_str = datetime.now().strftime('%H:%M')
     
-    # 紧凑型 HTML 报告（移除风险提示，买点红字，卖点绿字）
+    # 大盘状态显示
+    market_status = f"上证 {market_change:+.2f}%"
+    market_color = "color-green" if market_change >= 0 else "color-red"
+    
     report = f"""
     <div class="report-row">
         <span class="color-blue">日期:</span> <span class="color-white">{today_str}</span>
         <span class="color-blue">数据时间:</span> <span class="color-white">{time_str}</span>
-        <span class="color-blue">日线趋势:</span> <span class="color-white">{trend}</span>
-        <span class="color-blue">做T方向:</span> <span class="color-white">{direction}</span>
+        <span class="color-blue">大盘环境:</span> <span class="{market_color}">{market_status}</span>
+        <span class="color-blue">当前分时阈值:</span> <span class="color-white">{deviation*100:.2f}%</span>
     </div>
     <div class="report-row">
+        <span class="color-blue">日线趋势:</span> <span class="color-white">{trend}</span>
+        <span class="color-blue">是否企稳:</span> <span class="color-white">{'是' if is_steady else '否'}</span>
+        <span class="color-blue">企稳形态:</span> <span class="color-white">{pattern}</span>
+    </div>
+    <div class="report-row">
+        <span class="color-blue">做T方向:</span> <span class="color-white">{direction}</span>
         <span class="color-blue">关键支撑:</span> <span class="color-white">{support:.3f}</span>
         <span class="color-blue">关键压力:</span> <span class="color-white">{resistance:.3f}</span>
-        <span class="color-blue">失效条件:</span> <span class="color-white">跌破支撑 {support:.3f} 或 日线趋势转下降</span>
     </div>
-    <div style="margin-top: 5px;">
+    <div class="report-row">
         <span class="color-red">最优买点:</span> <span class="color-red">{best_buy}</span>
     </div>
-    <div>
+    <div class="report-row">
         <span class="color-green">最优卖点:</span> <span class="color-green">{best_sell}</span>
     </div>
+    <div class="report-row">
+        <span class="color-blue">失效条件:</span> <span class="color-white">跌破支撑 {support:.3f} 或 日线趋势转下降</span>
+    </div>
     """
-    return report, buy_points, sell_points
+    
+    # 🌟 生成AI实时建议（包含仓位与止损纪律提示）
+    ai_advice = ""
+    if market_change < -1.0:
+        ai_advice = f"🚨 **【大盘熔断警告】** 当前上证指数跌幅为 {market_change:.2f}%，市场情绪极度恶劣。今日所有买点置信度强制降为「低」，建议暂停一切正T低吸操作，观望为主，保护好本金！"
+    elif allow_t == "不允许":
+        ai_advice = f"📉 **当前策略判定：不允许做T。** 日线处于下降趋势且未见企稳特征，此时严禁盲目抄底做正T。若盘中有冲高机会，仅可考虑少量反T减仓，保持观望。"
+    elif direction == "反T":
+        ai_advice = f"🔄 **当前策略判定：优先反T。** 日线处于下降趋势中的企稳阶段，或震荡区间上沿。建议先抛后买，利用冲高乖离均价线（卖点）进行减仓，待回踩日线支撑（{support:.3f}）附近缩量企稳时再回补。"
+    else:
+        if best_buy != "无有效点":
+            buy_price = float(best_buy.split('|')[1].strip())
+            stop_loss = buy_price * 0.995 # 0.5%止损
+            ai_advice = f"🔥 **当前策略判定：适合正T低吸。** 日线趋势向上且已企稳。目前分时图已触发最优买点（{best_buy.split('|')[0].strip()}）。<br>📝 **纪律提示**：本次做T建议仓位**不超过底仓的30%**，止损价严格设于 **{stop_loss:.3f}**（买入价下方0.5%）。目标价看向压力位 {resistance:.3f} 附近。"
+        else:
+            ai_advice = f"⏳ **当前策略判定：等待正T买点。** 日线趋势向上且已企稳，但当前分时价格尚未回踩至均价线缩量企稳，耐心等待最优买点出现，不要盲目追高。"
+            
+    return report, ai_advice, buy_points, sell_points
 
-# ================= 6. 绘制图表 =================
+# ================= 7. 绘制图表 =================
 def plot_daily_chart(df, symbol_name):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
     fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='日K',
@@ -243,7 +408,8 @@ def plot_minute_chart(df, buy_points, sell_points, symbol_name):
     fig.add_trace(go.Scatter(x=df['Datetime'], y=df['Price'], mode='lines', name='分时价格', line=dict(color='#00ccff', width=2)))
     fig.add_trace(go.Scatter(x=df['Datetime'], y=df['AvgPrice'], mode='lines', name='分时均价', line=dict(color='#ffaa00', width=1.5)))
     
-    # 分时买点标记
+    # 画早盘/尾盘过滤区域的警戒线 (可选视觉辅助，不画也可以)
+    
     if not buy_points.empty:
         buy_points = buy_points[buy_points['Time'] <= "1500"]
         buy_points['Datetime'] = pd.to_datetime("2024-01-01 " + buy_points['Time'].str[:2] + ":" + buy_points['Time'].str[2:])
@@ -252,7 +418,6 @@ def plot_minute_chart(df, buy_points, sell_points, symbol_name):
             name='分时买点', marker=dict(symbol='triangle-up', size=16, color='#ff4b4b', line=dict(width=2, color='white'))
         ))
         
-    # 分时卖点标记
     if not sell_points.empty:
         sell_points = sell_points[sell_points['Time'] <= "1500"]
         sell_points['Datetime'] = pd.to_datetime("2024-01-01 " + sell_points['Time'].str[:2] + ":" + sell_points['Time'].str[2:])
@@ -266,31 +431,45 @@ def plot_minute_chart(df, buy_points, sell_points, symbol_name):
     fig.update_xaxes(type='date', tickformat="%H:%M", rangebreaks=[dict(bounds=[11.5, 13], pattern="hour")])
     return fig
 
-# ================= 7. 主程序执行 =================
+# ================= 8. 主程序执行 =================
 if __name__ == "__main__":
     df_daily = get_daily_data(code)
     df_minute = get_minute_data(code)
+    market_change = get_market_status()
     
     if df_daily is not None:
         df_daily = calculate_daily_indicators(df_daily)
-        df_daily = generate_daily_signals(df_daily)
     else:
         st.error("数据不足，无法标注。")
         st.stop()
 
-    report, buy_points, sell_points = generate_report(df_daily, df_minute, min_deviation)
-    
-    # 显示紧凑型报告
-    st.markdown(f'<div class="report-box">{report}</div>', unsafe_allow_html=True)
+    # 动态阈值计算
+    if auto_dev:
+        if df_minute is not None and not df_minute.empty:
+            high_price = df_minute['Price'].max()
+            low_price = df_minute['Price'].min()
+            avg_price = df_minute['AvgPrice'].mean()
+            if avg_price > 0:
+                amplitude = (high_price - low_price) / avg_price
+                actual_deviation = max(0.003, min(amplitude * 0.4, 0.015))
+            else:
+                actual_deviation = 0.008
+        else:
+            actual_deviation = 0.008
+    else:
+        actual_deviation = manual_dev
 
-    st.subheader("📈 日线级别走势")
+    report, ai_advice, buy_points, sell_points = generate_report_and_advice(df_daily, df_minute, actual_deviation, market_change)
+    
+    st.markdown(f'<div class="report-box">{report}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="ai-advice-box">🤖 <b>AI 实时建议</b><br>{ai_advice}</div>', unsafe_allow_html=True)
+
+    st.subheader(f"📈 {current_name} ({symbol}) 日线级别走势")
     st.plotly_chart(plot_daily_chart(df_daily.tail(120), symbol), use_container_width=True)
     
-    st.subheader("⏱️ 分时级别走势 (实时)")
+    st.subheader(f"⏱️ {current_name} ({symbol}) 分时级别走势 (实时)")
     if df_minute is not None and not df_minute.empty:
         st.plotly_chart(plot_minute_chart(df_minute, buy_points, sell_points, symbol), use_container_width=True)
-        
-        # 显示一句话策略总结
         st.caption("策略说明：在日线趋势向上或震荡且允许做T的前提下，分时价格缩量回踩均价线时提示买入，分时价格放量冲高乖离均价线时提示卖出，趋势向下时不再生成任何信号。")
     else:
         st.warning("暂无分时数据")
