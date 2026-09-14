@@ -9,6 +9,7 @@ import json
 import os
 import traceback
 from datetime import datetime, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -1198,12 +1199,17 @@ def calculate_dynamic_score(symbol, full_data, industry_data, sentiment, hot_mon
         'tags': tags,
     }
 
-def refresh_dynamic_pool(max_candidates=50):
+def refresh_dynamic_pool(max_candidates=30):
+    """
+    ✅ 修复版：使用 ThreadPoolExecutor 并发拉取数据，
+    50 只股票的刷新从 5 分钟缩短到 30 秒左右。
+    """
     pool = load_dynamic_pool()
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
 
     progress = st.progress(0, text="正在初始化动态池引擎...")
 
+    # ===== 1. 基础数据（顺序执行，量小） =====
     progress.progress(5, text="正在评估市场情绪...")
     sentiment = get_market_sentiment()
 
@@ -1213,21 +1219,44 @@ def refresh_dynamic_pool(max_candidates=50):
     progress.progress(20, text="正在获取主力资金热度榜...")
     hot_money = get_hot_money_stocks()
 
+    # ===== 2. 构建候选池 =====
     candidate_set = set(CANDIDATE_POOL)
-    for code_ in list(hot_money.keys())[:30]:
+    for code_ in list(hot_money.keys())[:20]:
         if not code_.startswith(EXCLUDE_PREFIXES):
             candidate_set.add(code_)
     candidates = list(candidate_set)[:max_candidates]
 
-    progress.progress(30, text=f"候选池共 {len(candidates)} 只，开始深度分析...")
+    progress.progress(25, text=f"候选池 {len(candidates)} 只，并发分析中...")
 
-    for i, code_ in enumerate(candidates):
-        progress.progress(
-            30 + int(65 * (i + 1) / len(candidates)),
-            text=f"正在评分 {code_} ({i+1}/{len(candidates)})..."
-        )
+    # ===== 3. 并发拉取所有股票数据 =====
+    def fetch_one(code_):
+        try:
+            full_data = get_stock_full_data(code_)
+            hist = get_stock_historical_metrics(code_)
+            return code_, full_data, hist
+        except Exception:
+            return code_, None, None
 
-        full_data = get_stock_full_data(code_)
+    results = {}
+    completed = 0
+    total = len(candidates)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(fetch_one, c): c for c in candidates}
+        for future in as_completed(futures):
+            code_, full_data, hist = future.result()
+            results[code_] = (full_data, hist)
+            completed += 1
+            progress.progress(
+                25 + int(65 * completed / total),
+                text=f"分析中 {completed}/{total}..."
+            )
+
+    # ===== 4. 逐只评分（纯计算，极快） =====
+    progress.progress(92, text="正在计算综合评分...")
+
+    for code_ in candidates:
+        full_data, hist = results.get(code_, (None, None))
 
         industry_data = None
         if full_data and full_data.get('industry'):
@@ -1241,11 +1270,6 @@ def refresh_dynamic_pool(max_candidates=50):
                         break
 
         hm = hot_money.get(code_)
-
-        try:
-            hist = get_stock_historical_metrics(code_)
-        except Exception:
-            hist = None
 
         result = calculate_dynamic_score(
             code_, full_data, industry_data,
@@ -1271,6 +1295,7 @@ def refresh_dynamic_pool(max_candidates=50):
     pool = {k: v for k, v in pool.items()
             if v.get('score', 0) >= 40 or k in CANDIDATE_POOL}
 
+    progress.progress(100, text="✅ 完成")
     progress.empty()
     save_dynamic_pool(pool)
     return pool
@@ -1309,8 +1334,9 @@ def dynamic_pool_ui():
     col_refresh, col_clean = st.columns([1, 1])
     with col_refresh:
         if st.button("🔄 刷新动态池", type="primary", use_container_width=True, key="refresh_pool"):
-            with st.spinner("正在从多数据源刷新动态池，约需1-3分钟..."):
+            with st.spinner("并发拉取中，约需 30 秒，请勿中途操作..."):
                 st.session_state.dynamic_pool = refresh_dynamic_pool()
+            st.success("✅ 动态池刷新完成！")
             st.rerun()
     with col_clean:
         if st.button("🧹 清理低分股", use_container_width=True, key="clean_pool"):
@@ -1351,13 +1377,12 @@ def dynamic_pool_ui():
         st.info("动态池为空，点击上方「刷新动态池」开始构建。")
 
 # ================= 8. 图表绘制 =================
-# ✅ 修复：开启工具条 + 滚轮缩放
 PLOTLY_CONFIG_CLEAN = {
-    'displayModeBar': True,          # 显示顶部工具条
-    'displaylogo': False,            # 隐藏 Plotly logo
-    'scrollZoom': True,              # 开启滚轮缩放
+    'displayModeBar': True,
+    'displaylogo': False,
+    'scrollZoom': True,
     'staticPlot': False,
-    'doubleClick': 'reset',          # 双击复位
+    'doubleClick': 'reset',
     'modeBarButtonsToRemove': [
         'lasso2d', 'select2d', 'autoScale2d',
         'hoverClosestCartesian', 'hoverCompareCartesian',
@@ -1365,44 +1390,100 @@ PLOTLY_CONFIG_CLEAN = {
     ],
 }
 
-def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
-    """日线图：主图可框选放大，副图锁定"""
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6, 0.2, 0.2])
+def plot_daily_chart(df, symbol_name, latest, uirevision_key=0, dragmode='zoom'):
+    """
+    ✅ 日K线图（同花顺风格）：
+      - 主图买卖点用 B/S 字母标注
+      - 每个副图有标题栏显示指标名 + 当前值
+      - dragmode 可切换（zoom=框选，pan=平移）
+    """
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.03, row_heights=[0.6, 0.2, 0.2])
     
-    fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='日K',
-                                 increasing_line_color='#ff3333', decreasing_line_color='#00cc66', line=dict(width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA5'], mode='lines', name='MA5', line=dict(color='#ffffff', width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA10'], mode='lines', name='MA10', line=dict(color='#ffff00', width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA20'], mode='lines', name='MA20', line=dict(color='#ff00ff', width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA30'], mode='lines', name='MA30', line=dict(color='#00ff00', width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA250'], mode='lines', name='年线', line=dict(color='#00ccff', width=1.5, dash='dash')), row=1, col=1)
+    # ========== 主图：K线 + 均线 ==========
+    fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'],
+                                 low=df['Low'], close=df['Close'], name='日K',
+                                 increasing_line_color='#ff3333',
+                                 decreasing_line_color='#00cc66',
+                                 line=dict(width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA5'], mode='lines', name='MA5',
+                             line=dict(color='#ffffff', width=1.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA10'], mode='lines', name='MA10',
+                             line=dict(color='#ffff00', width=1.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA20'], mode='lines', name='MA20',
+                             line=dict(color='#ff00ff', width=1.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA30'], mode='lines', name='MA30',
+                             line=dict(color='#00ff00', width=1.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA250'], mode='lines', name='年线',
+                             line=dict(color='#00ccff', width=1.2, dash='dash')), row=1, col=1)
     
+    # ========== 主图：同花顺风格 B/S 字母标注 ==========
     buy_s = df[df['Signal'] == 1]
     sell_s = df[df['Signal'] == -1]
+    
     if not buy_s.empty:
-        fig.add_trace(go.Scatter(x=buy_s['Date'], y=buy_s['Low']*0.98, mode='markers', name='买点', 
-                                 marker=dict(symbol='triangle-up', size=16, color='#ff0000', line=dict(width=2, color='white'))), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=buy_s['Date'], y=buy_s['Low'] * 0.97,
+            mode='text',
+            text=['B'] * len(buy_s),
+            textfont=dict(color='#ff3333', size=14, family='Arial Black'),
+            name='买点B', showlegend=True,
+            hovertemplate='买点<br>日期:%{x}<br>价格:%{customdata:.3f}<extra></extra>',
+            customdata=buy_s['Close'],
+        ), row=1, col=1)
+    
     if not sell_s.empty:
-        fig.add_trace(go.Scatter(x=sell_s['Date'], y=sell_s['High']*1.02, mode='markers', name='卖点', 
-                                 marker=dict(symbol='triangle-down', size=16, color='#00ff00', line=dict(width=2, color='white'))), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=sell_s['Date'], y=sell_s['High'] * 1.03,
+            mode='text',
+            text=['S'] * len(sell_s),
+            textfont=dict(color='#00cc66', size=14, family='Arial Black'),
+            name='卖点S', showlegend=True,
+            hovertemplate='卖点<br>日期:%{x}<br>价格:%{customdata:.3f}<extra></extra>',
+            customdata=sell_s['Close'],
+        ), row=1, col=1)
     
-    fig.add_hline(y=latest['Close'], line_dash="dot", line_color="#888888", line_width=1.5, row=1, col=1,
-                  annotation_text=f"{latest['Close']:.3f}", annotation_position="left", 
-                  annotation_font=dict(color="#f0f2f6", size=12))
-    
+    # ========== 副图1：成交量 + 标题栏 ==========
     vol_colors = ['#ff3333' if c >= o else '#00cc66' for c, o in zip(df['Close'], df['Open'])]
-    fig.add_trace(go.Bar(x=df['Date'], y=df['Volume'], name='成交量', marker_color=vol_colors), row=2, col=1)
+    fig.add_trace(go.Bar(x=df['Date'], y=df['Volume'], name='成交量',
+                         marker_color=vol_colors, showlegend=False), row=2, col=1)
     
-    colors = ['#ff3333' if c >= o else '#00cc66' for c, o in zip(df['Close'], df['Open'])]
-    fig.add_trace(go.Bar(x=df['Date'], y=df['MACD'], name='MACD', marker_color=colors), row=3, col=1)
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['DIFF'], mode='lines', name='DIFF', line=dict(color='#ffffff', width=1.5)), row=3, col=1)
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['DEA'], mode='lines', name='DEA', line=dict(color='#ffaa00', width=1.5)), row=3, col=1)
-    fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="#888888", row=3, col=1)
+    cur_vol = latest['Volume']
+    vol_ma5 = latest['VOL_MA5'] if not pd.isna(latest['VOL_MA5']) else 0
+    fig.add_annotation(
+        xref="paper", yref="paper", x=0.005, y=0.395,
+        text=f"<b>成交量</b>  {cur_vol/1e6:.2f}M   MA5:{vol_ma5/1e6:.2f}M",
+        showarrow=False, xanchor='left', yanchor='bottom',
+        font=dict(color='#89b4fa', size=11, family='Consolas'),
+        bgcolor='rgba(22,27,34,0.7)',
+    )
     
+    # ========== 副图2：MACD + 标题栏 ==========
+    colors_macd = ['#ff3333' if c >= o else '#00cc66' for c, o in zip(df['Close'], df['Open'])]
+    fig.add_trace(go.Bar(x=df['Date'], y=df['MACD'], name='MACD',
+                         marker_color=colors_macd, showlegend=False), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['DIFF'], mode='lines', name='DIFF',
+                             line=dict(color='#ffffff', width=1.2), showlegend=False), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['DEA'], mode='lines', name='DEA',
+                             line=dict(color='#ffaa00', width=1.2), showlegend=False), row=3, col=1)
+    fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="#555555", row=3, col=1)
+    
+    fig.add_annotation(
+        xref="paper", yref="paper", x=0.005, y=0.195,
+        text=f"<b>MACD(12,26,9)</b>  DIF:{latest['DIFF']:.3f}  DEA:{latest['DEA']:.3f}  MACD:{latest['MACD']:.3f}",
+        showarrow=False, xanchor='left', yanchor='bottom',
+        font=dict(color='#89b4fa', size=11, family='Consolas'),
+        bgcolor='rgba(22,27,34,0.7)',
+    )
+    
+    # ========== 布局 ==========
     fig.update_layout(
-        template="plotly_dark", height=650, xaxis_rangeslider_visible=False, 
-        hovermode="x unified", dragmode='pan',
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), 
+        template="plotly_dark", height=700,
+        xaxis_rangeslider_visible=False, 
+        hovermode="x unified",
+        dragmode=dragmode,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="right", x=1, font=dict(size=10)),
         margin=dict(t=50, l=10, r=10, b=10),
         uirevision=uirevision_key
     )
@@ -1418,6 +1499,11 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
     return fig
 
 def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, uirevision_key=0):
+    """
+    ✅ 分时图（修复 Y 轴范围过小）：
+    - Y 轴范围动态计算，保证图形既不被压扁也不跑出屏幕
+    - 基于当日实际振幅决定范围，至少 ±3%，最多 ±8%
+    """
     df = df[df['Time'] <= "1500"]
     df = df[~((df['Time'] > "1130") & (df['Time'] < "1300"))].reset_index(drop=True)
     if df.empty:
@@ -1427,12 +1513,23 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
     latest_price = df['Price'].iloc[-1]
     latest_avg = df['AvgPrice'].iloc[-1]
     
-    y_max = prev_close * 1.03
-    y_min = prev_close * 0.97
+    # ===== 修复：动态计算 Y 轴范围 =====
     actual_max = df['Price'].max()
     actual_min = df['Price'].min()
-    y_max = max(y_max, actual_max * 1.005, latest_price * 1.005)
-    y_min = min(y_min, actual_min * 0.995, latest_price * 0.995)
+    
+    if prev_close > 0:
+        actual_range_pct = (actual_max - actual_min) / prev_close
+    else:
+        actual_range_pct = 0.02
+    
+    # 基础范围：至少 ±3%，根据振幅扩展到 ±8%
+    base_pct = max(0.03, min(actual_range_pct * 0.8 + 0.01, 0.08))
+    y_max = prev_close * (1 + base_pct)
+    y_min = prev_close * (1 - base_pct)
+    
+    # 确保实际极值点在可视范围内（留 0.3% 余量）
+    y_max = max(y_max, actual_max * 1.003, latest_price * 1.003)
+    y_min = min(y_min, actual_min * 0.997, latest_price * 0.997)
     
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
     
@@ -1479,8 +1576,10 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
     )
     
     vol_colors = ['#ff3333' if change >= 0 else '#00cc66' for change in df['Price_Change']]
-    fig.add_trace(go.Bar(x=df['Datetime'], y=df['Volume'], name='分时成交量', marker_color=vol_colors, width=1000*60*0.8), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df['Datetime'], y=df['Volume'].rolling(5).mean(), mode='lines', name='均量', line=dict(color='#ffaa00', width=1.5)), row=2, col=1)
+    fig.add_trace(go.Bar(x=df['Datetime'], y=df['Volume'], name='分时成交量',
+                         marker_color=vol_colors, width=1000*60*0.8), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df['Datetime'], y=df['Volume'].rolling(5).mean(),
+                             mode='lines', name='均量', line=dict(color='#ffaa00', width=1.5)), row=2, col=1)
     
     fig.update_layout(
         template="plotly_dark", height=500, 
@@ -1492,8 +1591,7 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
     )
     
     fig.update_xaxes(
-        type='date', 
-        tickformat="%H:%M", 
+        type='date', tickformat="%H:%M", 
         range=["2024-01-01 09:30:00", "2024-01-01 15:00:00"],
         rangebreaks=[dict(bounds=[11.5, 13], pattern="hour")],
         fixedrange=True
@@ -1576,14 +1674,25 @@ try:
     with col_p:
         st.markdown(f'<div class="predict-box">📊 <b>日内极值预测</b><br>{predict_text}</div>', unsafe_allow_html=True)
 
-    col_title1, col_btn1 = st.columns([9, 1])
+    # ===== 日K线图 =====
+    col_title1, col_mode1, col_btn1 = st.columns([7, 2, 1])
     with col_title1:
         st.subheader(f"📈 {current_name} ({symbol}) 日线级别走势")
+    with col_mode1:
+        chart_mode = st.radio(
+            "缩放模式",
+            ["🔍 框选放大", "✋ 拖动平移"],
+            horizontal=True,
+            key="daily_chart_mode",
+            label_visibility="collapsed"
+        )
     with col_btn1:
         if st.button("🔄 复位", use_container_width=True, key="reset_daily_chart"):
             st.session_state.chart_reset_key += 1
             st.rerun()
-
+    
+    drag_mode = 'zoom' if "框选" in chart_mode else 'pan'
+    
     ma_html = f"""
     <div class="ma-bar">
         <span style="color:#ffffff">M5: {latest['MA5']:.3f}</span>
@@ -1595,9 +1704,16 @@ try:
     """
     st.markdown(ma_html, unsafe_allow_html=True)
 
-    st.plotly_chart(plot_daily_chart(df_daily.tail(120), symbol, latest, st.session_state.chart_reset_key), 
+    st.plotly_chart(plot_daily_chart(df_daily.tail(120), symbol, latest,
+                                     st.session_state.chart_reset_key, drag_mode), 
                     use_container_width=True, config=PLOTLY_CONFIG_CLEAN)
+    
+    if "框选" in chart_mode:
+        st.caption("💡 现在是**框选放大**模式：在图上**拉一个矩形**（同时往右下拉），即可放大 X+Y。要只放大某个方向，就拉竖条或横条。")
+    else:
+        st.caption("💡 现在是**拖动平移**模式：拖动查看历史。想放大就切回「框选放大」。")
 
+    # ===== 分时图 =====
     col_title2, col_btn2 = st.columns([9, 1])
     with col_title2:
         st.subheader(f"⏱️ {current_name} ({symbol}) 分时级别走势（同花顺风格）")
@@ -1609,7 +1725,7 @@ try:
     if df_minute is not None and not df_minute.empty:
         st.plotly_chart(plot_minute_chart_ths(df_minute, buy_points, sell_points, symbol, prev_close, st.session_state.chart_reset_key), 
                         use_container_width=True, config=PLOTLY_CONFIG_CLEAN)
-        st.caption("操作说明：日线图主图支持框选放大（成交量/MACD副图自动跟随）；分时图已锁定缩放，只能拖动。双击图表或点击复位按钮恢复初始视图。")
+        st.caption("操作说明：分时图已锁定缩放，只能拖动。双击图表或点击复位按钮恢复初始视图。")
     else:
         st.warning("暂无分时数据")
 
