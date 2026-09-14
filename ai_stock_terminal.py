@@ -284,6 +284,7 @@ def get_minute_data(code):
             records = [item.split(" ") for item in data]
             df = pd.DataFrame(records, columns=['Time', 'Price', 'AvgPrice', 'Volume'])
             df['Price'] = pd.to_numeric(df['Price'], errors='coerce')
+            # 🌟 注：这里的 Volume 是腾讯接口返回的每一分钟成交量（增量），并非总成交量
             df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
             df['Amount'] = df['Price'] * df['Volume']
             df['AvgPrice'] = df['Amount'].cumsum() / df['Volume'].cumsum()
@@ -397,7 +398,7 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     buy_warning = ""
     divergence_info = ""
     
-    # 🌟 核心修复：动态极值预测（基于时间衰减 + 实时波动率）
+    # 动态极值预测（基于时间衰减 + 实时波动率）
     intraday_high_predict = 0
     intraday_low_predict = 0
     if not df_minute.empty:
@@ -408,15 +409,12 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
         
         now_time = datetime.now().time()
         if now_time < time(9, 30):
-            # 盘前预测
             intraday_high_predict = round(latest['Close'] + atr * 0.5, 3)
             intraday_low_predict = round(latest['Close'] - atr * 0.5, 3)
         elif now_time > time(15, 0):
-            # 盘后展示实际极值
             intraday_high_predict = day_high
             intraday_low_predict = day_low
         else:
-            # 盘中动态计算
             current_dt = datetime.combine(datetime.today(), now_time)
             start_am = datetime.combine(datetime.today(), time(9, 30))
             end_am = datetime.combine(datetime.today(), time(11, 30))
@@ -431,7 +429,6 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
             passed_minutes = max(passed_minutes, 1)
             remaining_minutes = max(240 - passed_minutes, 0)
             
-            # 基于今日已实现波动的动态预估
             if passed_minutes > 10:
                 realized_volatility_per_min = (day_high - day_low) / passed_minutes
                 remaining_range = realized_volatility_per_min * remaining_minutes
@@ -587,7 +584,7 @@ PLOTLY_CONFIG_CLEAN = {
 }
 
 def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
-    """日线图：三面板（K线、成交量、MACD），仅主图允许框选放大"""
+    """日线图：三面板（K线、成交量、MACD），主图框选放大，副图自动跟随"""
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6, 0.2, 0.2])
     
     fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='日K',
@@ -630,40 +627,52 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
     
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], fixedrange=False, row=1, col=1)
     fig.update_yaxes(fixedrange=False, row=1, col=1)
-    
-    fig.update_xaxes(fixedrange=True, row=2, col=1)
-    fig.update_yaxes(fixedrange=True, row=2, col=1)
-    fig.update_xaxes(fixedrange=True, row=3, col=1)
-    fig.update_yaxes(fixedrange=True, row=3, col=1)
+    fig.update_xaxes(fixedrange=False, row=2, col=1)
+    fig.update_yaxes(fixedrange=False, row=2, col=1)
+    fig.update_xaxes(fixedrange=False, row=3, col=1)
+    fig.update_yaxes(fixedrange=False, row=3, col=1)
     
     return fig
 
 def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, uirevision_key=0):
-    """分时图：双面板（价格线、成交量），完全禁止缩放，只保留拖动"""
+    """分时图：双面板（价格线、成交量），完全禁止缩放，当前价格用虚线对齐左侧"""
     df = df[df['Time'] <= "1500"]
     df = df[~((df['Time'] > "1130") & (df['Time'] < "1300"))].reset_index(drop=True)
     if df.empty:
         return go.Figure()
     df['Datetime'] = pd.to_datetime("2024-01-01 " + df['Time'].str[:2] + ":" + df['Time'].str[2:])
     
+    latest_price = df['Price'].iloc[-1]
+    latest_avg = df['AvgPrice'].iloc[-1]
+    
+    # 固定Y轴范围，并确保当前价格在可视范围内
     y_max = prev_close * 1.03
     y_min = prev_close * 0.97
     actual_max = df['Price'].max()
     actual_min = df['Price'].min()
-    y_max = max(y_max, actual_max * 1.005)
-    y_min = min(y_min, actual_min * 0.995)
+    y_max = max(y_max, actual_max * 1.005, latest_price * 1.005)
+    y_min = min(y_min, actual_min * 0.995, latest_price * 0.995)
     
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
     
+    # 分时价格线
     fig.add_trace(go.Scatter(x=df['Datetime'], y=df['Price'], mode='lines', name='分时价格', 
                              line=dict(color='#00ccff', width=2)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['Datetime'], y=df['AvgPrice'], mode='lines', name='分时均价', 
                              line=dict(color='#ffaa00', width=1.5)), row=1, col=1)
     
+    # 昨收虚线
     fig.add_hline(y=prev_close, line_dash="dash", line_color="#888888", line_width=1, row=1, col=1,
                   annotation_text=f"昨收 {prev_close:.3f}", annotation_position="right",
                   annotation_font=dict(color="#f0f2f6", size=12))
     
+    # 🌟 核心修复1：当前价格虚线对齐左侧价格轴
+    color_price = "#ff3333" if latest_price >= prev_close else "#00cc66"
+    fig.add_hline(y=latest_price, line_dash="dot", line_color=color_price, line_width=1.5, row=1, col=1,
+                  annotation_text=f"{latest_price:.3f}", annotation_position="left", 
+                  annotation_font=dict(color=color_price, size=12))
+    
+    # 买卖点
     if not buy_points.empty:
         buy_points = buy_points[buy_points['Time'] <= "1500"]
         if not buy_points.empty:
@@ -684,9 +693,7 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
                 name='分时卖点', marker=dict(symbol='triangle-down', size=16, color='#00cc66', line=dict(width=2, color='white'))
             ), row=1, col=1)
     
-    latest_price = df['Price'].iloc[-1]
-    latest_avg = df['AvgPrice'].iloc[-1]
-    color_price = "#ff3333" if latest_price >= prev_close else "#00cc66"
+    # 右上角保留文本（作为补充）
     fig.add_annotation(
         x=0.99, y=0.98, xref="paper", yref="paper",
         text=f"<b>价格:</b> <span style='color:{color_price}'>{latest_price:.3f}</span><br><b>均价:</b> <span style='color:#ffaa00'>{latest_avg:.3f}</span>",
@@ -695,8 +702,10 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
         font=dict(color="#f0f2f6", size=14)
     )
     
+    # 🌟 核心修复2：分时成交量（每分钟增量） + 5分钟均量线
     vol_colors = ['#ff3333' if change >= 0 else '#00cc66' for change in df['Price_Change']]
-    fig.add_trace(go.Bar(x=df['Datetime'], y=df['Volume'], name='成交量', marker_color=vol_colors, width=1000*60*0.8), row=2, col=1)
+    fig.add_trace(go.Bar(x=df['Datetime'], y=df['Volume'], name='分时成交量', marker_color=vol_colors, width=1000*60*0.8), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df['Datetime'], y=df['Volume'].rolling(5).mean(), mode='lines', name='均量', line=dict(color='#ffaa00', width=1.5)), row=2, col=1)
     
     fig.update_layout(
         template="plotly_dark", height=500, 
