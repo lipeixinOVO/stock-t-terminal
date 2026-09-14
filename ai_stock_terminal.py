@@ -276,25 +276,88 @@ def get_daily_data(code):
 
 @st.cache_data(ttl=60)
 def get_minute_data(code):
+    """
+    获取分时数据。
+    腾讯分钟接口的4列字段在不同版本下语义可能不同：
+      A. [时间, 价格, 累计成交量, 累计成交额]   ← 官方标准
+      B. [时间, 价格, 分时均价, 累计成交量]
+    本函数通过量级自动识别并统一输出：
+      - Price:     每分钟价格
+      - Volume:    【每分钟成交量增量】（用于分时图柱状 + 策略判断）
+      - CumVolume: 累计成交量
+      - AvgPrice:  分时均价 = 累计成交额 / 累计成交量
+    """
     url = f"https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={code}"
     try:
         res = requests.get(url, timeout=3).json()
-        if res.get("code") == 0:
-            data = res["data"][code]["data"]["data"]
-            records = [item.split(" ") for item in data]
-            df = pd.DataFrame(records, columns=['Time', 'Price', 'AvgPrice', 'Volume'])
-            df['Price'] = pd.to_numeric(df['Price'], errors='coerce')
-            # 🌟 注：这里的 Volume 是腾讯接口返回的每一分钟成交量（增量），并非总成交量
-            df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
-            df['Amount'] = df['Price'] * df['Volume']
-            df['AvgPrice'] = df['Amount'].cumsum() / df['Volume'].cumsum()
-            df['Price_Change'] = df['Price'].diff()
-            ema12 = df['Price'].ewm(span=12, adjust=False).mean()
-            ema26 = df['Price'].ewm(span=26, adjust=False).mean()
-            df['DIFF'] = ema12 - ema26
-            df['DEA'] = df['DIFF'].ewm(span=9, adjust=False).mean()
-            df['MACD'] = 2 * (df['DIFF'] - df['DEA'])
-            return df
+        if res.get("code") != 0:
+            return None
+        raw = res["data"][code]["data"]["data"]
+        records = [item.split(" ") for item in raw]
+        if not records:
+            return None
+        ncol = len(records[0])
+        if ncol < 3:
+            return None
+        cols = ['Time', 'Price', 'F3', 'F4'][:ncol]
+        df = pd.DataFrame(records, columns=cols)
+        for c in cols:
+            if c != 'Time':
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+        if df['Price'].isna().all():
+            return None
+
+        last_price = float(df['Price'].dropna().iloc[-1])
+        f3 = df['F3'].fillna(0) if 'F3' in df.columns else pd.Series([0.0] * len(df))
+        f4 = df['F4'].fillna(0) if 'F4' in df.columns else pd.Series([0.0] * len(df))
+
+        # ===== 智能识别字段语义 =====
+        # F3 是否与价格量级接近 → 可能是"分时均价"
+        f3_like_price = f3.iloc[-1] > 0 and 0.7 < f3.iloc[-1] / last_price < 1.3
+        # F4 是否单调递增 → 可能是"累计值"
+        f4_mono = f4.iloc[-1] > 0 and (f4.diff().dropna() >= -1e-6).all()
+
+        if f3_like_price and f4_mono:
+            # 情形B：F3=分时均价, F4=累计成交量
+            df['AvgPrice']  = f3
+            df['CumVolume'] = f4
+        elif f4_mono:
+            # 情形A：F4=累计成交量, F3=累计成交额
+            df['CumVolume'] = f4
+            ratio = f3.iloc[-1] / f4.iloc[-1] if f4.iloc[-1] > 0 else 0
+            if 0.3 * last_price < ratio < 3 * last_price:
+                # F3 元 / F4 股
+                df['AvgPrice'] = f3 / f4.replace(0, np.nan)
+            elif 0.3 * last_price * 100 < ratio < 3 * last_price * 100:
+                # F3 元 / F4 手
+                df['AvgPrice'] = f3 / (f4 * 100)
+            else:
+                df['AvgPrice'] = np.nan
+        else:
+            # 未知情形兜底
+            df['CumVolume'] = f4 if f4.iloc[-1] > 0 else f3
+            df['AvgPrice']  = np.nan
+
+        # ===== 核心修复：每分钟增量成交量 =====
+        df['Volume'] = df['CumVolume'].diff()
+        if len(df) > 0:
+            df.loc[df.index[0], 'Volume'] = df['CumVolume'].iloc[0]
+        df['Volume'] = df['Volume'].fillna(0).clip(lower=0)
+
+        # ===== 均价兜底：用增量重建累计成交额 =====
+        if df['AvgPrice'].isna().any() or (df['AvgPrice'] <= 0).any():
+            amt = df['Price'] * df['Volume']
+            cum_amt = amt.cumsum()
+            df['AvgPrice'] = (cum_amt / df['CumVolume'].replace(0, np.nan)).ffill().fillna(df['Price'])
+
+        # ===== 分时 MACD =====
+        df['Price_Change'] = df['Price'].diff()
+        ema12 = df['Price'].ewm(span=12, adjust=False).mean()
+        ema26 = df['Price'].ewm(span=26, adjust=False).mean()
+        df['DIFF'] = ema12 - ema26
+        df['DEA'] = df['DIFF'].ewm(span=9, adjust=False).mean()
+        df['MACD'] = 2 * (df['DIFF'] - df['DEA'])
+        return df
     except Exception:
         return None
 
@@ -666,7 +729,7 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
                   annotation_text=f"昨收 {prev_close:.3f}", annotation_position="right",
                   annotation_font=dict(color="#f0f2f6", size=12))
     
-    # 🌟 核心修复1：当前价格虚线对齐左侧价格轴
+    # 当前价格虚线对齐左侧价格轴
     color_price = "#ff3333" if latest_price >= prev_close else "#00cc66"
     fig.add_hline(y=latest_price, line_dash="dot", line_color=color_price, line_width=1.5, row=1, col=1,
                   annotation_text=f"{latest_price:.3f}", annotation_position="left", 
@@ -702,7 +765,7 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
         font=dict(color="#f0f2f6", size=14)
     )
     
-    # 🌟 核心修复2：分时成交量（每分钟增量） + 5分钟均量线
+    # 分时成交量（每分钟增量） + 5分钟均量线
     vol_colors = ['#ff3333' if change >= 0 else '#00cc66' for change in df['Price_Change']]
     fig.add_trace(go.Bar(x=df['Datetime'], y=df['Volume'], name='分时成交量', marker_color=vol_colors, width=1000*60*0.8), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['Datetime'], y=df['Volume'].rolling(5).mean(), mode='lines', name='均量', line=dict(color='#ffaa00', width=1.5)), row=2, col=1)
@@ -745,7 +808,15 @@ if __name__ == "__main__":
         st.error("数据不足，无法标注。")
         st.stop()
     
-    prev_close = df_daily['Close'].iloc[-2] if len(df_daily) > 1 else df_daily['Close'].iloc[-1]
+    # ===== 修复：根据日K最后一根是不是今日，正确识别"昨收" =====
+    today_norm  = pd.Timestamp.now().normalize()
+    last_k_norm = df_daily['Date'].iloc[-1].normalize()
+    if len(df_daily) >= 2 and last_k_norm == today_norm:
+        # 最后一根是今日实时K线 → iloc[-2] 才是昨收
+        prev_close = df_daily['Close'].iloc[-2]
+    else:
+        # 最后一根就是最近交易日收盘（盘前/周末/数据延迟）→ iloc[-1] 即昨收
+        prev_close = df_daily['Close'].iloc[-1]
 
     if auto_dev:
         if df_minute is not None and not df_minute.empty:
