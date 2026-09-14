@@ -83,6 +83,12 @@ st.markdown("""
             padding-right: 1rem !important;
         }
     }
+    /* 顶部均线数值栏 */
+    .ma-bar { 
+        background-color: #161b22; padding: 8px 15px; border-radius: 6px; 
+        font-family: 'Consolas', monospace; font-size: 14px; 
+        display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 5px;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -151,6 +157,11 @@ def get_market_status():
     except Exception:
         pass
     return 0.0
+
+def is_trading_time():
+    """判断当前是否处于A股交易时段"""
+    now = datetime.now().time()
+    return (time(9, 30) <= now <= time(11, 30)) or (time(13, 0) <= now <= time(15, 0))
 
 def send_wechat_notification(send_key, title, content):
     if not send_key:
@@ -289,31 +300,40 @@ def get_minute_data(code):
 # ================= 6. 指标计算 =================
 def calculate_daily_indicators(df):
     df = df.copy()
+    # 均线系统
     df['MA5'] = df['Close'].rolling(5).mean()
+    df['MA10'] = df['Close'].rolling(10).mean()
     df['MA20'] = df['Close'].rolling(20).mean()
+    df['MA30'] = df['Close'].rolling(30).mean()
+    df['MA250'] = df['Close'].rolling(250).mean()  # 年线
+    
     df['MA20_UP'] = df['MA20'] > df['MA20'].shift(1)
-    df['MA5_UP'] = df['MA5'] > df['MA5'].shift(1)
+    
     ema12 = df['Close'].ewm(span=12, adjust=False).mean()
     ema26 = df['Close'].ewm(span=26, adjust=False).mean()
     df['DIFF'] = ema12 - ema26
     df['DEA'] = df['DIFF'].ewm(span=9, adjust=False).mean()
     df['MACD'] = 2 * (df['DIFF'] - df['DEA'])
+    
     low_9 = df['Low'].rolling(9).min()
     high_9 = df['High'].rolling(9).max()
     rsv = (df['Close'] - low_9) / (high_9 - low_9) * 100
     df['K'] = rsv.ewm(com=2, adjust=False).mean()
     df['D'] = df['K'].ewm(com=2, adjust=False).mean()
     df['J'] = 3 * df['K'] - 2 * df['D']
+    
     df['BOLL_MID'] = df['Close'].rolling(20).mean()
     std = df['Close'].rolling(20).std()
     df['BOLL_UP'] = df['BOLL_MID'] + 2 * std
     df['BOLL_LOW'] = df['BOLL_MID'] - 2 * std
     df['BOLL_WIDTH'] = (df['BOLL_UP'] - df['BOLL_LOW']) / df['BOLL_MID']
+    
     df['VOL_MA5'] = df['Volume'].rolling(5).mean()
     df['TR'] = np.maximum(df['High'] - df['Low'], 
                           np.maximum(abs(df['High'] - df['Close'].shift(1)), 
                                      abs(df['Low'] - df['Close'].shift(1))))
     df['ATR14'] = df['TR'].rolling(14).mean()
+    
     df['Signal'] = 0
     buy_cond = (df['MA20_UP'] == True) & (df['J'] < 15) & (df['Close'] <= df['BOLL_MID'] * 1.02) & (df['Volume'] < df['VOL_MA5'] * 1.5)
     sell_cond = (df['J'] > 105) & (df['Close'] >= df['BOLL_UP'] * 0.98) & (df['Volume'] > df['VOL_MA5'] * 0.8)
@@ -523,10 +543,9 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     日内预估最低: {intraday_low_predict:.3f}
     """
     
-    return report, ai_advice, t_guide, predict_text, buy_points, sell_points, context, best_buy, best_sell
+    return report, ai_advice, t_guide, predict_text, buy_points, sell_points, context, best_buy, best_sell, latest
 
 # ================= 8. 图表绘制（同花顺风格） =================
-# 🌟 彻底关闭悬浮工具栏，拖拽模式为 zoom（框选放大）
 PLOTLY_CONFIG_CLEAN = {
     'displayModeBar': False,
     'scrollZoom': False,
@@ -534,15 +553,23 @@ PLOTLY_CONFIG_CLEAN = {
     'doubleClick': 'reset',
 }
 
-def plot_daily_chart(df, symbol_name, uirevision_key=0):
-    """日线图：框选放大，隐藏工具栏，支持复位"""
+def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
+    """日线图：同花顺风格，带MA5/10/20/30/250，左侧虚线标价格"""
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
+    
+    # K线
     fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='日K',
                                  increasing_line_color='#ff3333', decreasing_line_color='#00cc66', line=dict(width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA20'], mode='lines', name='MA20', line=dict(color='#ffaa00', width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['BOLL_UP'], mode='lines', name='BOLL上轨', line=dict(color='#888888', width=1, dash='dot')), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['BOLL_LOW'], mode='lines', name='BOLL下轨', line=dict(color='#888888', width=1, dash='dot')), row=1, col=1)
     
+    # 均线系统（同花顺配色）
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA5'], mode='lines', name='MA5', line=dict(color='#ffffff', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA10'], mode='lines', name='MA10', line=dict(color='#ffff00', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA20'], mode='lines', name='MA20', line=dict(color='#ff00ff', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA30'], mode='lines', name='MA30', line=dict(color='#00ff00', width=1.5)), row=1, col=1)
+    # 年线（用蓝色虚线表示，防止跟MA20紫色混淆）
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA250'], mode='lines', name='年线', line=dict(color='#00ccff', width=1.5, dash='dash')), row=1, col=1)
+    
+    # 买卖点
     buy_s = df[df['Signal'] == 1]
     sell_s = df[df['Signal'] == -1]
     if not buy_s.empty:
@@ -552,6 +579,12 @@ def plot_daily_chart(df, symbol_name, uirevision_key=0):
         fig.add_trace(go.Scatter(x=sell_s['Date'], y=sell_s['High']*1.02, mode='markers', name='卖点', 
                                  marker=dict(symbol='triangle-down', size=16, color='#00ff00', line=dict(width=2, color='white'))), row=1, col=1)
     
+    # 🌟 核心修复：左侧当前价格虚线
+    fig.add_hline(y=latest['Close'], line_dash="dot", line_color="#888888", line_width=1.5, row=1, col=1,
+                  annotation_text=f"{latest['Close']:.3f}", annotation_position="left", 
+                  annotation_font=dict(color="#f0f2f6", size=12))
+    
+    # MACD
     colors = ['#ff3333' if c >= o else '#00cc66' for c, o in zip(df['Close'], df['Open'])]
     fig.add_trace(go.Bar(x=df['Date'], y=df['MACD'], name='MACD', marker_color=colors), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['Date'], y=df['DIFF'], mode='lines', name='DIFF', line=dict(color='#ffffff', width=1.5)), row=2, col=1)
@@ -560,8 +593,7 @@ def plot_daily_chart(df, symbol_name, uirevision_key=0):
     
     fig.update_layout(
         template="plotly_dark", height=600, xaxis_rangeslider_visible=False, 
-        hovermode="x unified", 
-        dragmode='zoom',  # 🌟 框选放大模式
+        hovermode="x unified", dragmode='zoom',
         legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="right", x=1), 
         margin=dict(t=60, l=10, r=10, b=10),
         uirevision=uirevision_key
@@ -570,7 +602,7 @@ def plot_daily_chart(df, symbol_name, uirevision_key=0):
     return fig
 
 def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, uirevision_key=0):
-    """分时图：框选放大，X轴全天预留，图例左上角"""
+    """分时图：X轴全天预留，图例左上角，框选放大"""
     df = df[df['Time'] <= "1500"]
     df = df[~((df['Time'] > "1130") & (df['Time'] < "1300"))].reset_index(drop=True)
     if df.empty:
@@ -628,14 +660,13 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
     fig.update_layout(
         template="plotly_dark", height=500, 
         xaxis_rangeslider_visible=False, hovermode="x unified",
-        dragmode='zoom',  # 🌟 框选放大模式
+        dragmode='zoom',
         legend=dict(orientation="h", yanchor="top", y=1.0, xanchor="left", x=0),
         margin=dict(t=40, l=10, r=10, b=10),
         uirevision=uirevision_key
     )
     fig.update_yaxes(range=[y_min, y_max], fixedrange=False)
     
-    # X轴全天预留
     fig.update_xaxes(
         type='date', 
         tickformat="%H:%M", 
@@ -649,6 +680,8 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
 if __name__ == "__main__":
     if 'chart_reset_key' not in st.session_state:
         st.session_state.chart_reset_key = 0
+    if 'notified_keys' not in st.session_state:
+        st.session_state.notified_keys = set()
     
     df_daily = get_daily_data(code)
     df_minute = get_minute_data(code)
@@ -677,24 +710,33 @@ if __name__ == "__main__":
     else:
         actual_deviation = manual_dev
 
-    report, ai_advice, t_guide, predict_text, buy_points, sell_points, context, best_buy, best_sell = generate_report_and_advice(
+    report, ai_advice, t_guide, predict_text, buy_points, sell_points, context, best_buy, best_sell, latest = generate_report_and_advice(
         df_daily, df_minute, actual_deviation, market_change
     )
     
-    if best_buy != "无有效点":
-        st.toast(f"🔴 {current_name} 出现买点！{best_buy.split('|')[1].strip()}", icon="🔔")
-    if best_sell != "无有效点":
-        st.toast(f"🟢 {current_name} 出现卖点！{best_sell.split('|')[1].strip()}", icon="🔔")
-    
-    if st.session_state.get('send_key'):
+    # 🌟 核心修复：买卖点提醒防重复 + 交易时段判断
+    if is_trading_time():
+        # 买点提醒
         if best_buy != "无有效点":
-            send_wechat_notification(st.session_state.send_key, 
-                                    f"【买点提醒】{current_name}", 
-                                    f"股票：{current_name} ({symbol})\n时间：{best_buy.split('|')[0].strip()}\n价格：{best_buy.split('|')[1].strip()}\n依据：{best_buy.split('|')[3].strip()}")
+            buy_key = f"{symbol}_buy_{best_buy.split('|')[0].strip()}"
+            if buy_key not in st.session_state.notified_keys:
+                st.session_state.notified_keys.add(buy_key)
+                st.toast(f"🔴 {current_name} 出现买点！{best_buy.split('|')[1].strip()}", icon="🔔")
+                if st.session_state.get('send_key'):
+                    send_wechat_notification(st.session_state.send_key, 
+                                            f"【买点提醒】{current_name}", 
+                                            f"股票：{current_name} ({symbol})\n时间：{best_buy.split('|')[0].strip()}\n价格：{best_buy.split('|')[1].strip()}\n依据：{best_buy.split('|')[3].strip()}")
+        
+        # 卖点提醒
         if best_sell != "无有效点":
-            send_wechat_notification(st.session_state.send_key, 
-                                    f"【卖点提醒】{current_name}", 
-                                    f"股票：{current_name} ({symbol})\n时间：{best_sell.split('|')[0].strip()}\n价格：{best_sell.split('|')[1].strip()}\n依据：{best_sell.split('|')[3].strip()}")
+            sell_key = f"{symbol}_sell_{best_sell.split('|')[0].strip()}"
+            if sell_key not in st.session_state.notified_keys:
+                st.session_state.notified_keys.add(sell_key)
+                st.toast(f"🟢 {current_name} 出现卖点！{best_sell.split('|')[1].strip()}", icon="🔔")
+                if st.session_state.get('send_key'):
+                    send_wechat_notification(st.session_state.send_key, 
+                                            f"【卖点提醒】{current_name}", 
+                                            f"股票：{current_name} ({symbol})\n时间：{best_sell.split('|')[0].strip()}\n价格：{best_sell.split('|')[1].strip()}\n依据：{best_sell.split('|')[3].strip()}")
 
     # ================= 主界面 =================
     st.markdown(f'<div class="report-box">{report}</div>', unsafe_allow_html=True)
@@ -715,7 +757,19 @@ if __name__ == "__main__":
             st.session_state.chart_reset_key += 1
             st.rerun()
     
-    st.plotly_chart(plot_daily_chart(df_daily.tail(120), symbol, st.session_state.chart_reset_key), 
+    # 🌟 顶部均线数值栏
+    ma_html = f"""
+    <div class="ma-bar">
+        <span style="color:#ffffff">M5: {latest['MA5']:.3f}</span>
+        <span style="color:#ffff00">M10: {latest['MA10']:.3f}</span>
+        <span style="color:#ff00ff">M20: {latest['MA20']:.3f}</span>
+        <span style="color:#00ff00">M30: {latest['MA30']:.3f}</span>
+        <span style="color:#00ccff">年线: {latest['MA250']:.3f}</span>
+    </div>
+    """
+    st.markdown(ma_html, unsafe_allow_html=True)
+    
+    st.plotly_chart(plot_daily_chart(df_daily.tail(120), symbol, latest, st.session_state.chart_reset_key), 
                     use_container_width=True, config=PLOTLY_CONFIG_CLEAN)
     
     # 分时图
