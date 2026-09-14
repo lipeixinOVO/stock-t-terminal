@@ -32,8 +32,17 @@ st.markdown("""
     .color-green { color: #00cc66; font-weight: bold; }
     .color-blue { color: #89b4fa; font-weight: bold; }
     .color-white { color: #f0f2f6; }
+    .color-yellow { color: #f9e2af; font-weight: bold; }
     .ai-advice-box {
         background-color: #2b2b3b; padding: 15px; border-left: 5px solid #ffaa00;
+        border-radius: 8px; color: #f0f2f6; font-size: 16px; margin-bottom: 20px;
+    }
+    .guide-box {
+        background-color: #1a2b1a; padding: 15px; border-left: 5px solid #00cc66;
+        border-radius: 8px; color: #f0f2f6; font-size: 16px; margin-bottom: 20px;
+    }
+    .predict-box {
+        background-color: #2b1a1a; padding: 15px; border-left: 5px solid #ff4b4b;
         border-radius: 8px; color: #f0f2f6; font-size: 16px; margin-bottom: 20px;
     }
     div.stButton > button[kind="primary"] {
@@ -43,24 +52,24 @@ st.markdown("""
         background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d;
     }
     
-    /* 🌟 核心修复：真正的右侧悬浮固定窗 */
+    /* 右侧悬浮 AI 聊天固定窗 */
     @media (min-width: 992px) {
         div[data-testid="stAppViewBlockContainer"] > div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"]:last-child {
             position: fixed !important;
             top: 70px !important;
             right: 20px !important;
-            width: 380px !important;
-            max-height: 85vh !important;
+            width: 400px !important;
+            max-height: 88vh !important;
             background-color: #1e1e2e !important;
             border: 1px solid #30363d !important;
             border-radius: 12px !important;
-            padding: 15px !important;
+            padding: 12px !important;
             z-index: 9999 !important;
             box-shadow: 0 8px 24px rgba(0,0,0,0.6) !important;
             overflow-y: auto !important;
         }
         .main .block-container {
-            padding-right: 420px !important;
+            padding-right: 440px !important;
         }
     }
     @media (max-width: 992px) {
@@ -85,45 +94,31 @@ if HAS_AUTOREFRESH:
 else:
     st.caption("⚠️ 未安装自动刷新组件，请按 F5 手动刷新网页")
 
-# ================= 2. 本地持久化存储工具 =================
-WATCHLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.json")
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# ================= 2. 本地持久化存储 =================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WATCHLIST_FILE = os.path.join(BASE_DIR, "watchlist.json")
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
-def load_watchlist():
+def _load_json(path, default):
     try:
-        if os.path.exists(WATCHLIST_FILE):
-            with open(WATCHLIST_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return data
-    except Exception:
-        pass
-    return ['515880', '159915']
-
-def save_watchlist(stock_list):
-    try:
-        with open(WATCHLIST_FILE, 'w', encoding='utf-8') as f:
-            json.dump(stock_list, f, ensure_ascii=False, indent=4)
-    except Exception as e:
-        pass
-
-def load_config():
-    """从本地加载配置（如 API Key）"""
-    try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
                 return json.load(f)
     except Exception:
         pass
-    return {}
+    return default
 
-def save_config(config_data):
-    """保存配置到本地"""
+def _save_json(path, data):
     try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config_data, f, ensure_ascii=False, indent=4)
-    except Exception as e:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception:
         pass
+
+def load_watchlist(): return _load_json(WATCHLIST_FILE, ['515880', '159915'])
+def save_watchlist(lst): _save_json(WATCHLIST_FILE, lst)
+def load_config(): return _load_json(CONFIG_FILE, {})
+def save_config(cfg): _save_json(CONFIG_FILE, cfg)
 
 # ================= 3. 辅助函数 =================
 @st.cache_data(ttl=3600)
@@ -157,6 +152,17 @@ def get_market_status():
         pass
     return 0.0
 
+def send_wechat_notification(send_key, title, content):
+    if not send_key:
+        return False
+    try:
+        url = f"https://sctapi.ftqq.com/{send_key}.send"
+        data = {"title": title, "desp": content}
+        res = requests.post(url, data=data, timeout=5)
+        return res.status_code == 200
+    except Exception:
+        return False
+
 # ================= 4. 侧边栏 =================
 with st.sidebar:
     st.header("📈 自选股管理")
@@ -169,7 +175,6 @@ with st.sidebar:
     with st.form("batch_add_form", clear_on_submit=True):
         new_stocks = st.text_input("批量添加股票代码", placeholder="例如: 512480, 159915 000001", label_visibility="collapsed")
         submit_add = st.form_submit_button("➕ 批量添加", use_container_width=True)
-        
         if submit_add and new_stocks.strip():
             codes = re.findall(r'\d{6}', new_stocks)
             added = False
@@ -181,7 +186,7 @@ with st.sidebar:
                 save_watchlist(st.session_state.stock_list)
                 st.rerun()
             else:
-                st.warning("未发现新的有效股票代码，或格式不正确。")
+                st.warning("未发现新的有效股票代码。")
 
     st.markdown("---")
     
@@ -204,44 +209,43 @@ with st.sidebar:
                     st.session_state.stock_list.remove(stock)
                     save_watchlist(st.session_state.stock_list)
                     if st.session_state.current_stock == stock:
-                        if st.session_state.stock_list:
-                            st.session_state.current_stock = st.session_state.stock_list[0]
-                        else:
-                            st.session_state.current_stock = '515880'
+                        st.session_state.current_stock = st.session_state.stock_list[0] if st.session_state.stock_list else '515880'
                     st.rerun()
     
     st.markdown("---")
     st.header("⚙️ 参数设置")
-    auto_dev = st.checkbox("启用动态偏离阈值（自动适配波动）", value=True)
+    auto_dev = st.checkbox("启用动态偏离阈值", value=True)
     if not auto_dev:
         manual_dev = st.slider("手动偏离阈值(%)", 0.5, 2.0, 0.8) / 100
-    else:
-        st.info("已开启动态阈值，根据当日振幅自动计算。")
-        
+    
     st.markdown("---")
-    st.header("🤖 DeepSeek AI 配置")
-    
-    # 🌟 核心修复：从本地文件加载 API Key 并持久化
+    st.header("🤖 AI 配置")
+    config = load_config()
     if 'api_key' not in st.session_state:
-        config = load_config()
         st.session_state.api_key = config.get('api_key', '')
-    
     def on_api_key_change():
-        """当输入框改变时，自动保存到本地文件"""
-        save_config({'api_key': st.session_state.api_key})
-        
-    st.text_input("DeepSeek API Key", type="password", key="api_key", on_change=on_api_key_change, help="只需配置一次，会自动保存到本地 config.json 文件")
-    
+        save_config({**load_config(), 'api_key': st.session_state.api_key})
+    st.text_input("DeepSeek API Key", type="password", key="api_key", 
+                  on_change=on_api_key_change, help="保存后无需再配置")
     if st.session_state.api_key:
-        st.success("API Key 已配置且已持久化保存。")
-    else:
-        st.warning("未配置 API Key，无法使用AI问答。")
+        st.success("API Key 已保存")
+    
+    st.markdown("---")
+    st.header("📱 微信提醒（可选）")
+    if 'send_key' not in st.session_state:
+        st.session_state.send_key = config.get('send_key', '')
+    def on_send_key_change():
+        save_config({**load_config(), 'send_key': st.session_state.send_key})
+    st.text_input("Server酱 SendKey", type="password", key="send_key", 
+                  on_change=on_send_key_change, help="去 sct.ftqq.com 免费注册获取")
+    if st.session_state.send_key:
+        st.success("微信提醒已开启")
 
 symbol = st.session_state.current_stock
 current_name = get_stock_name(symbol)
 st.sidebar.success(f"当前标的: {current_name} ({symbol})")
 
-# ================= 5. 数据获取工具 =================
+# ================= 5. 数据获取 =================
 code = f"sh{symbol}" if symbol.startswith(('5', '6', '9')) else f"sz{symbol}"
 
 @st.cache_data(ttl=60)
@@ -273,13 +277,11 @@ def get_minute_data(code):
             df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
             df['Amount'] = df['Price'] * df['Volume']
             df['AvgPrice'] = df['Amount'].cumsum() / df['Volume'].cumsum()
-            
             ema12 = df['Price'].ewm(span=12, adjust=False).mean()
             ema26 = df['Price'].ewm(span=26, adjust=False).mean()
             df['DIFF'] = ema12 - ema26
             df['DEA'] = df['DIFF'].ewm(span=9, adjust=False).mean()
             df['MACD'] = 2 * (df['DIFF'] - df['DEA'])
-            
             return df
     except Exception:
         return None
@@ -291,44 +293,37 @@ def calculate_daily_indicators(df):
     df['MA20'] = df['Close'].rolling(20).mean()
     df['MA20_UP'] = df['MA20'] > df['MA20'].shift(1)
     df['MA5_UP'] = df['MA5'] > df['MA5'].shift(1)
-    
     ema12 = df['Close'].ewm(span=12, adjust=False).mean()
     ema26 = df['Close'].ewm(span=26, adjust=False).mean()
     df['DIFF'] = ema12 - ema26
     df['DEA'] = df['DIFF'].ewm(span=9, adjust=False).mean()
     df['MACD'] = 2 * (df['DIFF'] - df['DEA'])
-    
     low_9 = df['Low'].rolling(9).min()
     high_9 = df['High'].rolling(9).max()
     rsv = (df['Close'] - low_9) / (high_9 - low_9) * 100
     df['K'] = rsv.ewm(com=2, adjust=False).mean()
     df['D'] = df['K'].ewm(com=2, adjust=False).mean()
     df['J'] = 3 * df['K'] - 2 * df['D']
-    
     df['BOLL_MID'] = df['Close'].rolling(20).mean()
     std = df['Close'].rolling(20).std()
     df['BOLL_UP'] = df['BOLL_MID'] + 2 * std
     df['BOLL_LOW'] = df['BOLL_MID'] - 2 * std
     df['BOLL_WIDTH'] = (df['BOLL_UP'] - df['BOLL_LOW']) / df['BOLL_MID']
-    
     df['VOL_MA5'] = df['Volume'].rolling(5).mean()
-    
+    df['TR'] = np.maximum(df['High'] - df['Low'], 
+                          np.maximum(abs(df['High'] - df['Close'].shift(1)), 
+                                     abs(df['Low'] - df['Close'].shift(1))))
+    df['ATR14'] = df['TR'].rolling(14).mean()
     df['Signal'] = 0
-    buy_cond = (df['MA20_UP'] == True) & \
-               (df['J'] < 15) & \
-               (df['Close'] <= df['BOLL_MID'] * 1.02) & \
-               (df['Volume'] < df['VOL_MA5'] * 1.5)
-    sell_cond = (df['J'] > 105) & \
-                (df['Close'] >= df['BOLL_UP'] * 0.98) & \
-                (df['Volume'] > df['VOL_MA5'] * 0.8)
+    buy_cond = (df['MA20_UP'] == True) & (df['J'] < 15) & (df['Close'] <= df['BOLL_MID'] * 1.02) & (df['Volume'] < df['VOL_MA5'] * 1.5)
+    sell_cond = (df['J'] > 105) & (df['Close'] >= df['BOLL_UP'] * 0.98) & (df['Volume'] > df['VOL_MA5'] * 0.8)
     buy_cond = buy_cond & (df['Signal'].shift(1) != 1)
     sell_cond = sell_cond & (df['Signal'].shift(1) != -1)
     df.loc[buy_cond, 'Signal'] = 1
     df.loc[sell_cond, 'Signal'] = -1
-    
     return df.bfill().ffill()
 
-# ================= 7. 核心策略判定与AI建议 =================
+# ================= 7. 核心策略判定 =================
 def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     latest = df_daily.iloc[-1]
     prev = df_daily.iloc[-2]
@@ -344,7 +339,6 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     vol_stop = latest['Volume'] < latest['VOL_MA5'] * 1.5
     support_hold = latest['Close'] > latest['BOLL_LOW'] * 0.98
     narrow_vol = latest['BOLL_WIDTH'] < 0.15 
-    
     if price_stop and vol_stop and support_hold:
         is_steady = True
         
@@ -361,10 +355,7 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     for i in range(1, 8):
         if df_daily['BOLL_WIDTH'].iloc[-i] < 0.08:
             narrow_count += 1
-            
-    flat_warning = ""
-    if narrow_count >= 5:
-        flat_warning = " (均线长期粘合，注意久盘必跌风险)"
+    flat_warning = " (均盘必跌风险)" if narrow_count >= 5 else ""
             
     allow_t = "允许"
     direction = "正T"
@@ -387,11 +378,21 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     buy_warning = ""
     divergence_info = ""
     
+    intraday_high_predict = 0
+    intraday_low_predict = 0
+    if not df_minute.empty:
+        cur_price = df_minute['Price'].iloc[-1]
+        atr = latest['ATR14'] if not pd.isna(latest['ATR14']) else cur_price * 0.02
+        day_high = df_minute['Price'].max()
+        day_low = df_minute['Price'].min()
+        remaining_range = atr * 0.6
+        intraday_high_predict = round(max(day_high, cur_price + remaining_range * 0.5), 3)
+        intraday_low_predict = round(min(day_low, cur_price - remaining_range * 0.5), 3)
+    
     if allow_t == "允许" and df_minute is not None and not df_minute.empty:
         df_min = df_minute.copy()
         df_min = df_min[df_min['Time'] <= "1500"]
         df_min['Vol_MA5'] = df_min['Volume'].rolling(5).mean()
-        
         df_min_buy = df_min[(df_min['Time'] >= "0945") & (df_min['Time'] <= "1445")]
         df_min_sell = df_min[(df_min['Time'] >= "0930") & (df_min['Time'] <= "1455")]
         
@@ -401,8 +402,7 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
             recent_macd = df_min.loc[low_idx, 'MACD']
             prev_lows = df_min[df_min['Price'] < recent_low * 1.005]
             if len(prev_lows) > 0:
-                prev_low_idx = prev_lows.index[0]
-                prev_macd = df_min.loc[prev_low_idx, 'MACD']
+                prev_macd = df_min.loc[prev_lows.index[0], 'MACD']
                 if recent_macd > prev_macd:
                     divergence_info += " 底背离"
         
@@ -412,48 +412,41 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
             recent_macd = df_min.loc[high_idx, 'MACD']
             prev_highs = df_min[df_min['Price'] > recent_high * 0.995]
             if len(prev_highs) > 0:
-                prev_high_idx = prev_highs.index[-1]
-                prev_macd = df_min.loc[prev_high_idx, 'MACD']
+                prev_macd = df_min.loc[prev_highs.index[-1], 'MACD']
                 if recent_macd < prev_macd:
                     divergence_info += " 顶背离"
         
         buy_cond = (df_min_buy['Price'] < df_min_buy['AvgPrice'] * (1 - deviation)) & (df_min_buy['Volume'] < df_min_buy['Vol_MA5'] * 0.8)
         sell_cond = (df_min_sell['Price'] > df_min_sell['AvgPrice'] * (1 + deviation)) & (df_min_sell['Volume'] > df_min_sell['Vol_MA5'] * 1.2)
-        
         buy_points = df_min_buy[buy_cond]
         sell_points = df_min_sell[sell_cond]
         
         if market_change < -1.0:
-            buy_warning = " ⚠️大盘暴跌，强制降为低置信度！"
+            buy_warning = " ⚠️大盘暴跌，低置信度！"
         
         if not buy_points.empty:
             best_row = buy_points.loc[buy_points['Price'].idxmin()]
             time_fmt = f"{best_row['Time'][:2]}:{best_row['Time'][2:]}"
             dev_pct = (best_row['AvgPrice'] - best_row['Price']) / best_row['AvgPrice']
-            
             if market_change < -1.0:
                 conf = "低"
             else:
                 conf = "高" if dev_pct > deviation * 2 else ("中" if dev_pct > deviation * 1.2 else "低")
-                if "底背离" in divergence_info:
-                    conf = "高"
-                    
+                if "底背离" in divergence_info: conf = "高"
             b_type = "正T低吸" if direction == "正T" else "反T回补"
-            best_buy = f"{time_fmt} | {best_row['Price']:.3f} | {b_type} | 回踩均价线缩量企稳{divergence_info} | 置信度{conf}{buy_warning}"
+            best_buy = f"{time_fmt} | {best_row['Price']:.3f} | {b_type} | 回踩均价线缩量{divergence_info} | 置信度{conf}{buy_warning}"
             
         if not sell_points.empty:
             best_row = sell_points.loc[sell_points['Price'].idxmax()]
             time_fmt = f"{best_row['Time'][:2]}:{best_row['Time'][2:]}"
             dev_pct = (best_row['Price'] - best_row['AvgPrice']) / best_row['AvgPrice']
             conf = "高" if dev_pct > deviation * 2 else ("中" if dev_pct > deviation * 1.2 else "低")
-            if "顶背离" in divergence_info:
-                conf = "高"
+            if "顶背离" in divergence_info: conf = "高"
             s_type = "正T高抛" if direction == "正T" else "反T减仓"
-            best_sell = f"{time_fmt} | {best_row['Price']:.3f} | {s_type} | 冲高乖离均价线放量滞涨{divergence_info} | 置信度{conf}"
+            best_sell = f"{time_fmt} | {best_row['Price']:.3f} | {s_type} | 冲高乖离均价线放量{divergence_info} | 置信度{conf}"
 
     today_str = latest['Date'].strftime('%Y-%m-%d')
     time_str = datetime.now().strftime('%H:%M')
-    
     market_status = f"上证 {market_change:+.2f}%"
     market_color = "color-green" if market_change >= 0 else "color-red"
     
@@ -461,8 +454,8 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     <div class="report-row">
         <span class="color-blue">日期:</span> <span class="color-white">{today_str}</span>
         <span class="color-blue">数据时间:</span> <span class="color-white">{time_str}</span>
-        <span class="color-blue">大盘环境:</span> <span class="{market_color}">{market_status}</span>
-        <span class="color-blue">当前分时阈值:</span> <span class="color-white">{deviation*100:.2f}%</span>
+        <span class="color-blue">大盘:</span> <span class="{market_color}">{market_status}</span>
+        <span class="color-blue">阈值:</span> <span class="color-white">{deviation*100:.2f}%</span>
     </div>
     <div class="report-row">
         <span class="color-blue">日线趋势:</span> <span class="color-white">{trend}</span>
@@ -487,21 +480,33 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     
     ai_advice = ""
     if market_change < -1.5:
-        ai_advice = f"🚨 **【大盘熔断警告】** 当前上证指数跌幅为 {market_change:.2f}%，市场情绪极度恶劣。今日所有买点置信度强制降为「低」，建议暂停一切正T低吸操作，观望为主，保护好本金！"
+        ai_advice = f"🚨 **大盘熔断警告**：上证跌幅 {market_change:.2f}%，暂停一切正T低吸，观望为主。"
     elif flat_warning:
-        ai_advice = f"⚠️ **【久盘必跌警告】** 日线布林带持续收窄，均线高度粘合超过5天。虽已企稳，但向下破位风险正在积累。如果触发买点，**建议仓位减半**，且严格设好止损，一旦跌破支撑 {support:.3f} 立刻离场！"
+        ai_advice = f"⚠️ **久盘必跌警告**：均线粘合超过5天，若触发买点请**仓位减半**，跌破 {support:.3f} 立刻离场！"
     elif allow_t == "不允许":
-        ai_advice = f"📉 **当前策略判定：不允许做T。** 日线处于下降趋势且未见企稳特征，此时严禁盲目抄底做正T。若盘中有冲高机会，仅可考虑少量反T减仓，保持观望。"
+        ai_advice = f"📉 **不允许做T**：日线下降趋势且未企稳，严禁抄底做正T。仅可少量反T减仓。"
     elif direction == "反T":
-        ai_advice = f"🔄 **当前策略判定：优先反T。** 日线处于下降趋势中的企稳阶段，或震荡区间上沿。建议先抛后买，利用冲高乖离均价线（卖点）进行减仓，待回踩日线支撑（{support:.3f}）附近缩量企稳时再回补。"
+        ai_advice = f"🔄 **优先反T**：日线下降趋稳或震荡上沿。先抛后买，冲高乖离均价线减仓，回踩 {support:.3f} 附近回补。"
     else:
         if best_buy != "无有效点":
             buy_price = float(best_buy.split('|')[1].strip())
             stop_loss = buy_price * 0.995
-            ai_advice = f"🔥 **当前策略判定：适合正T低吸。** 日线趋势向上且已企稳。目前分时图已触发最优买点（{best_buy.split('|')[0].strip()}）。<br>📝 **纪律提示**：本次做T建议仓位**不超过底仓的30%**，止损价严格设于 **{stop_loss:.3f}**（买入价下方0.5%）。目标价看向压力位 {resistance:.3f} 附近。"
+            ai_advice = f"🔥 **适合正T低吸**：已触发买点（{best_buy.split('|')[0].strip()}）。仓位≤底仓30%，止损 {stop_loss:.3f}，目标 {resistance:.3f}。"
         else:
-            ai_advice = f"⏳ **当前策略判定：等待正T买点。** 日线趋势向上且已企稳，但当前分时价格尚未回踩至均价线缩量企稳，耐心等待最优买点出现，不要盲目追高。"
-            
+            ai_advice = f"⏳ **等待正T买点**：日线向上且企稳，但分时价格尚未回踩均价线企稳，耐心等待。"
+    
+    if allow_t == "不允许":
+        t_guide = f"**今日不做T** —— 日线处于下降趋势且未企稳，风险大于收益。\n\n操作建议：\n1. 空仓观望或仅持底仓不动。\n2. 若盘中有冲高至压力位 {resistance:.3f} 附近，可少量反T减仓。\n3. 等待日线企稳信号（缩量止跌+支撑不破）再考虑重新入场。"
+    elif direction == "反T":
+        t_guide = f"**今日优先做反T（先卖后买）** —— 日线下降趋稳或震荡区间上沿。\n\n操作步骤：\n1. **高抛**：当分时价格冲高至均价线以上 {deviation*100:.2f}% 且放量滞涨时，减仓 30%。\n2. **低吸回补**：待价格回落至日线支撑 {support:.3f} 附近缩量企稳时，用同等仓位买回。\n3. **止损**：若回补后跌破 {support:.3f}，立刻止损。\n4. **仓位**：单次不超过底仓 30%。"
+    else:
+        t_guide = f"**今日优先做正T（先买后卖）** —— 日线趋势向上且已企稳。\n\n操作步骤：\n1. **低吸**：当分时价格回踩均价线以下 {deviation*100:.2f}% 且缩量企稳时，买入 30% 仓位。\n2. **高抛**：待价格冲高至压力位 {resistance:.3f} 附近且放量滞涨时，卖出回补的仓位。\n3. **止损**：若买入后跌破买入价 0.5%，立刻止损。\n4. **仓位**：单次不超过底仓 30%，单日最多操作 2-3 次。"
+    
+    if intraday_high_predict > 0:
+        predict_text = f"**今日预估波动区间**：\n- 预估最高点：**{intraday_high_predict:.3f}**（基于ATR波动率）\n- 预估最低点：**{intraday_low_predict:.3f}**（基于ATR波动率）\n- 当前价格：**{df_minute['Price'].iloc[-1]:.3f}**\n\n⚠️ 该预测仅基于历史波动率，仅供参考，不构成操作依据。"
+    else:
+        predict_text = "数据不足，无法预测日内极值。"
+    
     context = f"""
     【当前盘面实时数据】
     标的: {current_name} ({symbol})
@@ -514,12 +519,22 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     大盘涨跌幅: {market_change:.2f}%
     当前最优买点: {best_buy}
     当前最优卖点: {best_sell}
+    日内预估最高: {intraday_high_predict:.3f}
+    日内预估最低: {intraday_low_predict:.3f}
     """
-            
-    return report, ai_advice, buy_points, sell_points, context
+    
+    return report, ai_advice, t_guide, predict_text, buy_points, sell_points, context, best_buy, best_sell
 
-# ================= 8. 绘制图表 =================
-def plot_daily_chart(df, symbol_name):
+# ================= 8. 图表绘制（同花顺风格） =================
+PLOTLY_CONFIG = {
+    'displayModeBar': False,
+    'scrollZoom': False,
+    'staticPlot': False,
+    'doubleClick': 'reset',
+}
+
+def plot_daily_chart(df, symbol_name, uirevision_key=0):
+    """日线图：同花顺风格，隐藏工具栏，支持 uirevision 复位"""
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
     fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='日K',
                                  increasing_line_color='#ff3333', decreasing_line_color='#00cc66', line=dict(width=1.5)), row=1, col=1)
@@ -530,66 +545,104 @@ def plot_daily_chart(df, symbol_name):
     buy_s = df[df['Signal'] == 1]
     sell_s = df[df['Signal'] == -1]
     if not buy_s.empty:
-        fig.add_trace(go.Scatter(x=buy_s['Date'], y=buy_s['Low']*0.98, mode='markers', name='王牌买点', 
+        fig.add_trace(go.Scatter(x=buy_s['Date'], y=buy_s['Low']*0.98, mode='markers', name='买点', 
                                  marker=dict(symbol='triangle-up', size=16, color='#ff0000', line=dict(width=2, color='white'))), row=1, col=1)
     if not sell_s.empty:
-        fig.add_trace(go.Scatter(x=sell_s['Date'], y=sell_s['High']*1.02, mode='markers', name='王牌卖点', 
+        fig.add_trace(go.Scatter(x=sell_s['Date'], y=sell_s['High']*1.02, mode='markers', name='卖点', 
                                  marker=dict(symbol='triangle-down', size=16, color='#00ff00', line=dict(width=2, color='white'))), row=1, col=1)
     
     colors = ['#ff3333' if c >= o else '#00cc66' for c, o in zip(df['Close'], df['Open'])]
-    fig.add_trace(go.Bar(x=df['Date'], y=df['MACD'], name='MACD柱', marker_color=colors), row=2, col=1)
+    fig.add_trace(go.Bar(x=df['Date'], y=df['MACD'], name='MACD', marker_color=colors), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['Date'], y=df['DIFF'], mode='lines', name='DIFF', line=dict(color='#ffffff', width=1.5)), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['DEA'], mode='lines', name='DEA线', line=dict(color='#ffaa00', width=1.5)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['DEA'], mode='lines', name='DEA', line=dict(color='#ffaa00', width=1.5)), row=2, col=1)
     fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="#888888", row=2, col=1)
     
-    fig.update_layout(template="plotly_dark", height=600, xaxis_rangeslider_visible=False, hovermode="x unified", 
-                      legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="right", x=1), margin=dict(t=80, l=10, r=10, b=10))
+    fig.update_layout(
+        template="plotly_dark", height=600, xaxis_rangeslider_visible=False, 
+        hovermode="x unified", dragmode='pan',
+        legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="right", x=1), 
+        margin=dict(t=60, l=10, r=10, b=10),
+        uirevision=uirevision_key  # 🌟 复位关键：这个值变化时，图表会重置缩放
+    )
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     return fig
 
-def plot_minute_chart(df, buy_points, sell_points, symbol_name):
+def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, uirevision_key=0):
+    """分时图：同花顺风格，以昨收为中轴，隐藏工具栏，支持 uirevision 复位"""
     df = df[df['Time'] <= "1500"]
     df = df[~((df['Time'] > "1130") & (df['Time'] < "1300"))].reset_index(drop=True)
+    if df.empty:
+        return go.Figure()
     df['Datetime'] = pd.to_datetime("2024-01-01 " + df['Time'].str[:2] + ":" + df['Time'].str[2:])
     
-    fig = make_subplots(rows=1, cols=1)
-    fig.add_trace(go.Scatter(x=df['Datetime'], y=df['Price'], mode='lines', name='分时价格', line=dict(color='#00ccff', width=2)))
-    fig.add_trace(go.Scatter(x=df['Datetime'], y=df['AvgPrice'], mode='lines', name='分时均价', line=dict(color='#ffaa00', width=1.5)))
+    y_max = prev_close * 1.03
+    y_min = prev_close * 0.97
+    actual_max = df['Price'].max()
+    actual_min = df['Price'].min()
+    y_max = max(y_max, actual_max * 1.005)
+    y_min = min(y_min, actual_min * 0.995)
     
-    if not df.empty:
-        latest_price = df['Price'].iloc[-1]
-        latest_avg = df['AvgPrice'].iloc[-1]
-        fig.add_annotation(
-            x=0.02, y=0.98, xref="paper", yref="paper",
-            text=f"<b>实时价格:</b> <span style='color:#00ccff'>{latest_price:.3f}</span><br><b>分时均价:</b> <span style='color:#ffaa00'>{latest_avg:.3f}</span>",
-            showarrow=False, align="left",
-            bgcolor="rgba(30,30,46,0.85)", bordercolor="#444", borderwidth=1, borderpad=6,
-            font=dict(color="#f0f2f6", size=14)
-        )
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df['Datetime'], y=df['Price'], mode='lines', name='分时价格', 
+                             line=dict(color='#00ccff', width=2)))
+    fig.add_trace(go.Scatter(x=df['Datetime'], y=df['AvgPrice'], mode='lines', name='分时均价', 
+                             line=dict(color='#ffaa00', width=1.5)))
+    
+    fig.add_hline(y=prev_close, line_dash="dash", line_color="#888888", line_width=1,
+                  annotation_text=f"昨收 {prev_close:.3f}", annotation_position="right",
+                  annotation_font=dict(color="#f0f2f6", size=12))
     
     if not buy_points.empty:
         buy_points = buy_points[buy_points['Time'] <= "1500"]
-        buy_points['Datetime'] = pd.to_datetime("2024-01-01 " + buy_points['Time'].str[:2] + ":" + buy_points['Time'].str[2:])
-        fig.add_trace(go.Scatter(
-            x=buy_points['Datetime'], y=buy_points['Price']*0.998, mode='markers',
-            name='分时买点', marker=dict(symbol='triangle-up', size=16, color='#ff4b4b', line=dict(width=2, color='white'))
-        ))
+        if not buy_points.empty:
+            buy_points = buy_points.copy()
+            buy_points['Datetime'] = pd.to_datetime("2024-01-01 " + buy_points['Time'].str[:2] + ":" + buy_points['Time'].str[2:])
+            fig.add_trace(go.Scatter(
+                x=buy_points['Datetime'], y=buy_points['Price']*0.998, mode='markers',
+                name='分时买点', marker=dict(symbol='triangle-up', size=16, color='#ff4b4b', line=dict(width=2, color='white'))
+            ))
         
     if not sell_points.empty:
         sell_points = sell_points[sell_points['Time'] <= "1500"]
-        sell_points['Datetime'] = pd.to_datetime("2024-01-01 " + sell_points['Time'].str[:2] + ":" + sell_points['Time'].str[2:])
-        fig.add_trace(go.Scatter(
-            x=sell_points['Datetime'], y=sell_points['Price']*1.002, mode='markers',
-            name='分时卖点', marker=dict(symbol='triangle-down', size=16, color='#00cc66', line=dict(width=2, color='white'))
-        ))
+        if not sell_points.empty:
+            sell_points = sell_points.copy()
+            sell_points['Datetime'] = pd.to_datetime("2024-01-01 " + sell_points['Time'].str[:2] + ":" + sell_points['Time'].str[2:])
+            fig.add_trace(go.Scatter(
+                x=sell_points['Datetime'], y=sell_points['Price']*1.002, mode='markers',
+                name='分时卖点', marker=dict(symbol='triangle-down', size=16, color='#00cc66', line=dict(width=2, color='white'))
+            ))
     
-    fig.update_layout(template="plotly_dark", height=450, xaxis_rangeslider_visible=False, hovermode="x unified", 
-                      legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="right", x=1), margin=dict(t=80, l=10, r=10, b=10))
-    fig.update_xaxes(type='date', tickformat="%H:%M", rangebreaks=[dict(bounds=[11.5, 13], pattern="hour")])
+    latest_price = df['Price'].iloc[-1]
+    latest_avg = df['AvgPrice'].iloc[-1]
+    color_price = "#ff3333" if latest_price >= prev_close else "#00cc66"
+    fig.add_annotation(
+        x=0.99, y=0.98, xref="paper", yref="paper",
+        text=f"<b>价格:</b> <span style='color:{color_price}'>{latest_price:.3f}</span><br><b>均价:</b> <span style='color:#ffaa00'>{latest_avg:.3f}</span>",
+        showarrow=False, align="right",
+        bgcolor="rgba(30,30,46,0.85)", bordercolor="#444", borderwidth=1, borderpad=6,
+        font=dict(color="#f0f2f6", size=14)
+    )
+    
+    fig.update_layout(
+        template="plotly_dark", height=500, 
+        xaxis_rangeslider_visible=False, hovermode="x unified",
+        dragmode='pan',
+        legend=dict(orientation="h", y=1.02, x=1),
+        margin=dict(t=40, l=10, r=10, b=10),
+        uirevision=uirevision_key  # 🌟 复位关键
+    )
+    fig.update_yaxes(range=[y_min, y_max], fixedrange=False)
+    fig.update_xaxes(type='date', tickformat="%H:%M", 
+                     rangebreaks=[dict(bounds=[11.5, 13], pattern="hour")],
+                     fixedrange=False)
     return fig
 
 # ================= 9. 主程序执行 =================
 if __name__ == "__main__":
+    # 🌟 初始化复位计数器
+    if 'chart_reset_key' not in st.session_state:
+        st.session_state.chart_reset_key = 0
+    
     df_daily = get_daily_data(code)
     df_minute = get_minute_data(code)
     market_change = get_market_status()
@@ -599,6 +652,8 @@ if __name__ == "__main__":
     else:
         st.error("数据不足，无法标注。")
         st.stop()
+    
+    prev_close = df_daily['Close'].iloc[-2] if len(df_daily) > 1 else df_daily['Close'].iloc[-1]
 
     if auto_dev:
         if df_minute is not None and not df_minute.empty:
@@ -615,19 +670,61 @@ if __name__ == "__main__":
     else:
         actual_deviation = manual_dev
 
-    report, ai_advice, buy_points, sell_points, context = generate_report_and_advice(df_daily, df_minute, actual_deviation, market_change)
+    report, ai_advice, t_guide, predict_text, buy_points, sell_points, context, best_buy, best_sell = generate_report_and_advice(
+        df_daily, df_minute, actual_deviation, market_change
+    )
     
-    # 🌟 主界面：左侧图表直接渲染，右侧留白由 CSS 控制
+    # 买卖点提醒
+    if best_buy != "无有效点":
+        st.toast(f"🔴 {current_name} 出现买点！{best_buy.split('|')[1].strip()}", icon="🔔")
+    if best_sell != "无有效点":
+        st.toast(f"🟢 {current_name} 出现卖点！{best_sell.split('|')[1].strip()}", icon="🔔")
+    
+    if st.session_state.get('send_key'):
+        if best_buy != "无有效点":
+            send_wechat_notification(st.session_state.send_key, 
+                                    f"【买点提醒】{current_name}", 
+                                    f"股票：{current_name} ({symbol})\n时间：{best_buy.split('|')[0].strip()}\n价格：{best_buy.split('|')[1].strip()}\n依据：{best_buy.split('|')[3].strip()}")
+        if best_sell != "无有效点":
+            send_wechat_notification(st.session_state.send_key, 
+                                    f"【卖点提醒】{current_name}", 
+                                    f"股票：{current_name} ({symbol})\n时间：{best_sell.split('|')[0].strip()}\n价格：{best_sell.split('|')[1].strip()}\n依据：{best_sell.split('|')[3].strip()}")
+
+    # ================= 主界面 =================
     st.markdown(f'<div class="report-box">{report}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="ai-advice-box">🤖 <b>AI 实时建议</b><br>{ai_advice}</div>', unsafe_allow_html=True)
-
-    st.subheader(f"📈 {current_name} ({symbol}) 日线级别走势")
-    st.plotly_chart(plot_daily_chart(df_daily.tail(120), symbol), use_container_width=True)
     
-    st.subheader(f"⏱️ {current_name} ({symbol}) 分时级别走势 (实时)")
+    col_g, col_p = st.columns(2)
+    with col_g:
+        st.markdown(f'<div class="guide-box">🎯 <b>今日做T指引</b><br>{t_guide}</div>', unsafe_allow_html=True)
+    with col_p:
+        st.markdown(f'<div class="predict-box">📊 <b>日内极值预测</b><br>{predict_text}</div>', unsafe_allow_html=True)
+
+    # 🌟 日线图标题 + 复位按钮
+    col_title1, col_btn1 = st.columns([9, 1])
+    with col_title1:
+        st.subheader(f"📈 {current_name} ({symbol}) 日线级别走势")
+    with col_btn1:
+        if st.button("🔄 复位", use_container_width=True, key="reset_daily_chart", help="点击恢复图表到初始视图"):
+            st.session_state.chart_reset_key += 1
+            st.rerun()
+    
+    st.plotly_chart(plot_daily_chart(df_daily.tail(120), symbol, st.session_state.chart_reset_key), 
+                    use_container_width=True, config=PLOTLY_CONFIG)
+    
+    # 🌟 分时图标题 + 复位按钮
+    col_title2, col_btn2 = st.columns([9, 1])
+    with col_title2:
+        st.subheader(f"⏱️ {current_name} ({symbol}) 分时级别走势（同花顺风格）")
+    with col_btn2:
+        if st.button("🔄 复位", use_container_width=True, key="reset_minute_chart", help="点击恢复图表到初始视图"):
+            st.session_state.chart_reset_key += 1
+            st.rerun()
+    
     if df_minute is not None and not df_minute.empty:
-        st.plotly_chart(plot_minute_chart(df_minute, buy_points, sell_points, symbol), use_container_width=True)
-        st.caption("策略说明：在日线趋势向上或震荡且允许做T的前提下，分时价格缩量回踩均价线时提示买入，分时价格放量冲高乖离均价线时提示卖出，趋势向下时不再生成任何信号。")
+        st.plotly_chart(plot_minute_chart_ths(df_minute, buy_points, sell_points, symbol, prev_close, st.session_state.chart_reset_key), 
+                        use_container_width=True, config=PLOTLY_CONFIG)
+        st.caption("策略说明：在日线趋势向上或震荡且允许做T的前提下，分时价格缩量回踩均价线时提示买入，分时价格放量冲高乖离均价线时提示卖出，趋势向下时不再生成任何信号。图表仅支持拖动（鼠标按住拖动），双击或点击复位按钮可回到初始视图。")
     else:
         st.warning("暂无分时数据")
 
@@ -635,52 +732,67 @@ if __name__ == "__main__":
     with st.container():
         st.subheader("💬 DeepSeek AI")
         
-        # 这里直接读取 st.session_state.api_key，因为已经持久化
-        if not st.session_state.api_key:
-            st.warning("⚠️ 请先在左侧侧边栏配置 DeepSeek API Key，才能使用AI问答功能。")
-        else:
-            if "messages" not in st.session_state:
-                st.session_state.messages = []
-            
-            for message in st.session_state.messages:
-                with st.chat_message(message["role"]):
-                    st.markdown(message["content"])
-            
-            if prompt := st.chat_input("在此提问..."):
-                with st.chat_message("user"):
-                    st.markdown(prompt)
-                st.session_state.messages.append({"role": "user", "content": prompt})
+        if 'messages' not in st.session_state:
+            st.session_state.messages = []
+        if 'history_questions' not in st.session_state:
+            st.session_state.history_questions = []
+        
+        col_hist, col_chat = st.columns([1, 2])
+        
+        with col_hist:
+            st.markdown("**📜 历史提问**")
+            if not st.session_state.history_questions:
+                st.caption("暂无历史")
+            else:
+                for i, q in enumerate(reversed(st.session_state.history_questions[-15:])):
+                    if st.button(f"• {q[:12]}...", key=f"hist_{i}", use_container_width=True):
+                        st.session_state.messages = [{"role": "user", "content": q}]
+                        st.rerun()
+        
+        with col_chat:
+            if not st.session_state.api_key:
+                st.warning("⚠️ 请先在左侧侧边栏配置 DeepSeek API Key")
+            else:
+                chat_container = st.container(height=420, border=True)
+                with chat_container:
+                    for message in st.session_state.messages:
+                        with st.chat_message(message["role"]):
+                            st.markdown(message["content"])
                 
-                system_prompt = f"""你是一个专业的A股做T交易助手。请根据以下实时盘面数据，用简洁专业的语言回答用户的问题。
-                注意：不要盲目看多或看空，要结合支撑压力、量能和趋势给出客观判断。
-                {context}
-                """
-                
-                messages_to_send = [{"role": "system", "content": system_prompt}] + st.session_state.messages
-                
-                with st.chat_message("assistant"):
-                    message_placeholder = st.empty()
-                    full_response = ""
-                    try:
-                        headers = {
-                            "Authorization": f"Bearer {st.session_state.api_key}",
-                            "Content-Type": "application/json"
-                        }
-                        data = {
-                            "model": "deepseek-chat",
-                            "messages": messages_to_send,
-                            "stream": False
-                        }
-                        response = requests.post("https://api.deepseek.com/chat/completions", headers=headers, json=data, timeout=30)
-                        
-                        if response.status_code == 200:
-                            result = response.json()
-                            full_response = result['choices'][0]['message']['content']
-                        else:
-                            full_response = f"API请求失败，状态码：{response.status_code}。请检查API Key是否正确或余额是否充足。"
-                    except Exception as e:
-                        full_response = f"网络请求异常：{str(e)}"
+                if prompt := st.chat_input("在此提问..."):
+                    with st.chat_message("user"):
+                        st.markdown(prompt)
+                    st.session_state.messages.append({"role": "user", "content": prompt})
+                    st.session_state.history_questions.append(prompt)
                     
-                    message_placeholder.markdown(full_response)
-                st.session_state.messages.append({"role": "assistant", "content": full_response})
-                st.rerun()
+                    system_prompt = f"""你是一个专业的A股做T交易助手。请根据以下实时盘面数据，用简洁专业的语言回答用户的问题。
+                    注意：不要盲目看多或看空，要结合支撑压力、量能和趋势给出客观判断。
+                    {context}
+                    """
+                    messages_to_send = [{"role": "system", "content": system_prompt}] + st.session_state.messages
+                    
+                    with st.chat_message("assistant"):
+                        message_placeholder = st.empty()
+                        full_response = ""
+                        try:
+                            headers = {
+                                "Authorization": f"Bearer {st.session_state.api_key}",
+                                "Content-Type": "application/json"
+                            }
+                            data = {
+                                "model": "deepseek-chat",
+                                "messages": messages_to_send,
+                                "stream": False
+                            }
+                            response = requests.post("https://api.deepseek.com/chat/completions", 
+                                                     headers=headers, json=data, timeout=30)
+                            if response.status_code == 200:
+                                result = response.json()
+                                full_response = result['choices'][0]['message']['content']
+                            else:
+                                full_response = f"API请求失败（{response.status_code}）。请检查API Key或余额。"
+                        except Exception as e:
+                            full_response = f"网络异常：{str(e)}"
+                        message_placeholder.markdown(full_response)
+                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                    st.rerun()
