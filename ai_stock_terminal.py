@@ -526,7 +526,7 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     return report, ai_advice, t_guide, predict_text, buy_points, sell_points, context, best_buy, best_sell
 
 # ================= 8. 图表绘制（同花顺风格） =================
-# 🌟 彻底关闭悬浮工具栏
+# 🌟 彻底关闭悬浮工具栏，拖拽模式为 zoom（框选放大）
 PLOTLY_CONFIG_CLEAN = {
     'displayModeBar': False,
     'scrollZoom': False,
@@ -535,7 +535,7 @@ PLOTLY_CONFIG_CLEAN = {
 }
 
 def plot_daily_chart(df, symbol_name, uirevision_key=0):
-    """日线图：隐藏工具栏，支持复位"""
+    """日线图：框选放大，隐藏工具栏，支持复位"""
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
     fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='日K',
                                  increasing_line_color='#ff3333', decreasing_line_color='#00cc66', line=dict(width=1.5)), row=1, col=1)
@@ -560,7 +560,8 @@ def plot_daily_chart(df, symbol_name, uirevision_key=0):
     
     fig.update_layout(
         template="plotly_dark", height=600, xaxis_rangeslider_visible=False, 
-        hovermode="x unified", dragmode='pan',
+        hovermode="x unified", 
+        dragmode='zoom',  # 🌟 框选放大模式
         legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="right", x=1), 
         margin=dict(t=60, l=10, r=10, b=10),
         uirevision=uirevision_key
@@ -568,8 +569,8 @@ def plot_daily_chart(df, symbol_name, uirevision_key=0):
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     return fig
 
-def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, zoom_level, uirevision_key=0):
-    """分时图：同花顺风格，X轴全天预留，图例左上角，缩放由外部按钮控制"""
+def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, uirevision_key=0):
+    """分时图：框选放大，X轴全天预留，图例左上角"""
     df = df[df['Time'] <= "1500"]
     df = df[~((df['Time'] > "1130") & (df['Time'] < "1300"))].reset_index(drop=True)
     if df.empty:
@@ -627,31 +628,18 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
     fig.update_layout(
         template="plotly_dark", height=500, 
         xaxis_rangeslider_visible=False, hovermode="x unified",
-        dragmode='pan',
+        dragmode='zoom',  # 🌟 框选放大模式
         legend=dict(orientation="h", yanchor="top", y=1.0, xanchor="left", x=0),
         margin=dict(t=40, l=10, r=10, b=10),
         uirevision=uirevision_key
     )
     fig.update_yaxes(range=[y_min, y_max], fixedrange=False)
     
-    # 🌟 根据 zoom_level 调整 X 轴范围
-    if zoom_level <= 1.0:
-        x_range = ["2024-01-01 09:30:00", "2024-01-01 15:00:00"]
-    else:
-        # 放大时，以最新数据为右边界，向左展开
-        last_time = df['Datetime'].iloc[-1]
-        # 全天总计 240 分钟，缩放后显示的时间窗口（分钟）
-        window_minutes = int(240 / zoom_level)
-        start_time = last_time - pd.Timedelta(minutes=window_minutes)
-        # 保证不早于 09:30
-        if start_time < pd.to_datetime("2024-01-01 09:30:00"):
-            start_time = pd.to_datetime("2024-01-01 09:30:00")
-        x_range = [start_time, "2024-01-01 15:00:00"]
-    
+    # X轴全天预留
     fig.update_xaxes(
         type='date', 
         tickformat="%H:%M", 
-        range=x_range,
+        range=["2024-01-01 09:30:00", "2024-01-01 15:00:00"],
         rangebreaks=[dict(bounds=[11.5, 13], pattern="hour")],
         fixedrange=False
     )
@@ -661,8 +649,6 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
 if __name__ == "__main__":
     if 'chart_reset_key' not in st.session_state:
         st.session_state.chart_reset_key = 0
-    if 'minute_zoom' not in st.session_state:
-        st.session_state.minute_zoom = 1.0
     
     df_daily = get_daily_data(code)
     df_minute = get_minute_data(code)
@@ -733,29 +719,18 @@ if __name__ == "__main__":
                     use_container_width=True, config=PLOTLY_CONFIG_CLEAN)
     
     # 分时图
-    st.subheader(f"⏱️ {current_name} ({symbol}) 分时级别走势（同花顺风格）")
+    col_title2, col_btn2 = st.columns([9, 1])
+    with col_title2:
+        st.subheader(f"⏱️ {current_name} ({symbol}) 分时级别走势（同花顺风格）")
+    with col_btn2:
+        if st.button("🔄 复位", use_container_width=True, key="reset_minute_chart"):
+            st.session_state.chart_reset_key += 1
+            st.rerun()
     
     if df_minute is not None and not df_minute.empty:
-        # 🌟 使用外部按钮控制的缩放
-        st.plotly_chart(plot_minute_chart_ths(df_minute, buy_points, sell_points, symbol, prev_close, st.session_state.minute_zoom, st.session_state.chart_reset_key), 
+        st.plotly_chart(plot_minute_chart_ths(df_minute, buy_points, sell_points, symbol, prev_close, st.session_state.chart_reset_key), 
                         use_container_width=True, config=PLOTLY_CONFIG_CLEAN)
-        
-        # 🌟 固定在图形下方的放大、缩小、复位按钮
-        col_zoom1, col_zoom2, col_zoom3, col_zoom4 = st.columns([1, 1, 1, 6])
-        with col_zoom1:
-            if st.button("🔍 放大", use_container_width=True, key="zoom_in_btn"):
-                st.session_state.minute_zoom = min(3.0, st.session_state.minute_zoom * 1.2)
-                st.rerun()
-        with col_zoom2:
-            if st.button("🔍 缩小", use_container_width=True, key="zoom_out_btn"):
-                st.session_state.minute_zoom = max(0.5, st.session_state.minute_zoom / 1.2)
-                st.rerun()
-        with col_zoom3:
-            if st.button("🔄 复位", use_container_width=True, key="zoom_reset_btn"):
-                st.session_state.minute_zoom = 1.0
-                st.rerun()
-        
-        st.caption("策略说明：在日线趋势向上或震荡且允许做T的前提下，分时价格缩量回踩均价线时提示买入，分时价格放量冲高乖离均价线时提示卖出，趋势向下时不再生成任何信号。图表支持拖动，使用下方按钮进行缩放。")
+        st.caption("操作说明：鼠标按住拖动可框选放大；双击图表任意位置或点击上方复位按钮，可恢复全天视图。")
     else:
         st.warning("暂无分时数据")
 
