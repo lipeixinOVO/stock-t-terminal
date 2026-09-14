@@ -1351,11 +1351,18 @@ def dynamic_pool_ui():
         st.info("动态池为空，点击上方「刷新动态池」开始构建。")
 
 # ================= 8. 图表绘制 =================
+# ✅ 修复：开启工具条 + 滚轮缩放
 PLOTLY_CONFIG_CLEAN = {
-    'displayModeBar': False,
-    'scrollZoom': False,
+    'displayModeBar': True,          # 显示顶部工具条
+    'displaylogo': False,            # 隐藏 Plotly logo
+    'scrollZoom': True,              # 开启滚轮缩放
     'staticPlot': False,
-    'doubleClick': 'reset',
+    'doubleClick': 'reset',          # 双击复位
+    'modeBarButtonsToRemove': [
+        'lasso2d', 'select2d', 'autoScale2d',
+        'hoverClosestCartesian', 'hoverCompareCartesian',
+        'toggleSpikelines', 'sendDataToCloud',
+    ],
 }
 
 def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
@@ -1394,7 +1401,7 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
     
     fig.update_layout(
         template="plotly_dark", height=650, xaxis_rangeslider_visible=False, 
-        hovermode="x unified", dragmode='zoom',
+        hovermode="x unified", dragmode='pan',
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), 
         margin=dict(t=50, l=10, r=10, b=10),
         uirevision=uirevision_key
@@ -1497,7 +1504,6 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
     return fig
 
 # ================= 9. 主程序执行 =================
-# ⚠️ 已去掉 if __name__ == "__main__": 判断（Streamlit Cloud 必须去掉）
 try:
     if 'chart_reset_key' not in st.session_state:
         st.session_state.chart_reset_key = 0
