@@ -159,7 +159,6 @@ def get_market_status():
     return 0.0
 
 def is_trading_time():
-    """判断当前是否处于A股交易时段"""
     now = datetime.now().time()
     return (time(9, 30) <= now <= time(11, 30)) or (time(13, 0) <= now <= time(15, 0))
 
@@ -300,12 +299,11 @@ def get_minute_data(code):
 # ================= 6. 指标计算 =================
 def calculate_daily_indicators(df):
     df = df.copy()
-    # 均线系统
     df['MA5'] = df['Close'].rolling(5).mean()
     df['MA10'] = df['Close'].rolling(10).mean()
     df['MA20'] = df['Close'].rolling(20).mean()
     df['MA30'] = df['Close'].rolling(30).mean()
-    df['MA250'] = df['Close'].rolling(250).mean()  # 年线
+    df['MA250'] = df['Close'].rolling(250).mean()
     
     df['MA20_UP'] = df['MA20'] > df['MA20'].shift(1)
     
@@ -561,12 +559,11 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
     fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='日K',
                                  increasing_line_color='#ff3333', decreasing_line_color='#00cc66', line=dict(width=1.5)), row=1, col=1)
     
-    # 均线系统（同花顺配色）
+    # 均线系统
     fig.add_trace(go.Scatter(x=df['Date'], y=df['MA5'], mode='lines', name='MA5', line=dict(color='#ffffff', width=1.5)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['Date'], y=df['MA10'], mode='lines', name='MA10', line=dict(color='#ffff00', width=1.5)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['Date'], y=df['MA20'], mode='lines', name='MA20', line=dict(color='#ff00ff', width=1.5)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['Date'], y=df['MA30'], mode='lines', name='MA30', line=dict(color='#00ff00', width=1.5)), row=1, col=1)
-    # 年线（用蓝色虚线表示，防止跟MA20紫色混淆）
     fig.add_trace(go.Scatter(x=df['Date'], y=df['MA250'], mode='lines', name='年线', line=dict(color='#00ccff', width=1.5, dash='dash')), row=1, col=1)
     
     # 买卖点
@@ -579,12 +576,12 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
         fig.add_trace(go.Scatter(x=sell_s['Date'], y=sell_s['High']*1.02, mode='markers', name='卖点', 
                                  marker=dict(symbol='triangle-down', size=16, color='#00ff00', line=dict(width=2, color='white'))), row=1, col=1)
     
-    # 🌟 核心修复：左侧当前价格虚线
+    # 左侧当前价格虚线
     fig.add_hline(y=latest['Close'], line_dash="dot", line_color="#888888", line_width=1.5, row=1, col=1,
                   annotation_text=f"{latest['Close']:.3f}", annotation_position="left", 
                   annotation_font=dict(color="#f0f2f6", size=12))
     
-    # MACD
+    # MACD (副图)
     colors = ['#ff3333' if c >= o else '#00cc66' for c, o in zip(df['Close'], df['Open'])]
     fig.add_trace(go.Bar(x=df['Date'], y=df['MACD'], name='MACD', marker_color=colors), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['Date'], y=df['DIFF'], mode='lines', name='DIFF', line=dict(color='#ffffff', width=1.5)), row=2, col=1)
@@ -598,7 +595,14 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
         margin=dict(t=60, l=10, r=10, b=10),
         uirevision=uirevision_key
     )
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    
+    # 🌟 核心修复：主图（第1行）允许缩放，副图（第2行）禁止缩放
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], fixedrange=False, row=1, col=1)
+    fig.update_yaxes(fixedrange=False, row=1, col=1)
+    
+    fig.update_xaxes(fixedrange=True, row=2, col=1)  # 禁止副图 X 轴缩放
+    fig.update_yaxes(fixedrange=True, row=2, col=1)  # 禁止副图 Y 轴缩放
+    
     return fig
 
 def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, uirevision_key=0):
@@ -666,7 +670,6 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
         uirevision=uirevision_key
     )
     fig.update_yaxes(range=[y_min, y_max], fixedrange=False)
-    
     fig.update_xaxes(
         type='date', 
         tickformat="%H:%M", 
@@ -714,9 +717,7 @@ if __name__ == "__main__":
         df_daily, df_minute, actual_deviation, market_change
     )
     
-    # 🌟 核心修复：买卖点提醒防重复 + 交易时段判断
     if is_trading_time():
-        # 买点提醒
         if best_buy != "无有效点":
             buy_key = f"{symbol}_buy_{best_buy.split('|')[0].strip()}"
             if buy_key not in st.session_state.notified_keys:
@@ -727,7 +728,6 @@ if __name__ == "__main__":
                                             f"【买点提醒】{current_name}", 
                                             f"股票：{current_name} ({symbol})\n时间：{best_buy.split('|')[0].strip()}\n价格：{best_buy.split('|')[1].strip()}\n依据：{best_buy.split('|')[3].strip()}")
         
-        # 卖点提醒
         if best_sell != "无有效点":
             sell_key = f"{symbol}_sell_{best_sell.split('|')[0].strip()}"
             if sell_key not in st.session_state.notified_keys:
@@ -748,7 +748,6 @@ if __name__ == "__main__":
     with col_p:
         st.markdown(f'<div class="predict-box">📊 <b>日内极值预测</b><br>{predict_text}</div>', unsafe_allow_html=True)
 
-    # 日线图
     col_title1, col_btn1 = st.columns([9, 1])
     with col_title1:
         st.subheader(f"📈 {current_name} ({symbol}) 日线级别走势")
@@ -757,7 +756,6 @@ if __name__ == "__main__":
             st.session_state.chart_reset_key += 1
             st.rerun()
     
-    # 🌟 顶部均线数值栏
     ma_html = f"""
     <div class="ma-bar">
         <span style="color:#ffffff">M5: {latest['MA5']:.3f}</span>
@@ -772,7 +770,6 @@ if __name__ == "__main__":
     st.plotly_chart(plot_daily_chart(df_daily.tail(120), symbol, latest, st.session_state.chart_reset_key), 
                     use_container_width=True, config=PLOTLY_CONFIG_CLEAN)
     
-    # 分时图
     col_title2, col_btn2 = st.columns([9, 1])
     with col_title2:
         st.subheader(f"⏱️ {current_name} ({symbol}) 分时级别走势（同花顺风格）")
@@ -784,11 +781,10 @@ if __name__ == "__main__":
     if df_minute is not None and not df_minute.empty:
         st.plotly_chart(plot_minute_chart_ths(df_minute, buy_points, sell_points, symbol, prev_close, st.session_state.chart_reset_key), 
                         use_container_width=True, config=PLOTLY_CONFIG_CLEAN)
-        st.caption("操作说明：鼠标按住拖动可框选放大；双击图表任意位置或点击上方复位按钮，可恢复全天视图。")
+        st.caption("操作说明：鼠标按住拖动可框选放大（仅主图生效，副图自动跟随）；双击图表任意位置或点击上方复位按钮，可恢复全天视图。")
     else:
         st.warning("暂无分时数据")
 
-    # ================= 🌟 右侧悬浮 AI 聊天区域 =================
     with st.container():
         st.subheader("💬 DeepSeek AI")
         
