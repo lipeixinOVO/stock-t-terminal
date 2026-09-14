@@ -526,10 +526,24 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     return report, ai_advice, t_guide, predict_text, buy_points, sell_points, context, best_buy, best_sell
 
 # ================= 8. 图表绘制（同花顺风格） =================
-PLOTLY_CONFIG = {
+# 🌟 配置1：完全无工具栏（用于日线图，保持干净，只能拖动）
+PLOTLY_CONFIG_CLEAN = {
     'displayModeBar': False,
     'scrollZoom': False,
     'staticPlot': False,
+    'doubleClick': 'reset',
+}
+
+# 🌟 配置2：带有放大、缩小、复位按钮的工具栏（用于分时图，符合同花顺操作习惯）
+PLOTLY_CONFIG_WITH_BAR = {
+    'displayModeBar': True,
+    'displaylogo': False,
+    'scrollZoom': False,
+    'modeBarButtonsToRemove': [
+        'lasso2d', 'select2d', 'autoScale', 'hoverClosestCartesian', 
+        'hoverCompareCartesian', 'toggleSpikelines', 'sendDataToCloud'
+    ],
+    'modeBarButtonsToAdd': [],
     'doubleClick': 'reset',
 }
 
@@ -562,13 +576,13 @@ def plot_daily_chart(df, symbol_name, uirevision_key=0):
         hovermode="x unified", dragmode='pan',
         legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="right", x=1), 
         margin=dict(t=60, l=10, r=10, b=10),
-        uirevision=uirevision_key  # 🌟 复位关键：这个值变化时，图表会重置缩放
+        uirevision=uirevision_key
     )
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     return fig
 
 def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, uirevision_key=0):
-    """分时图：同花顺风格，以昨收为中轴，隐藏工具栏，支持 uirevision 复位"""
+    """分时图：同花顺风格，以昨收为中轴，X轴全天预留，图例在左上角，带缩放按钮"""
     df = df[df['Time'] <= "1500"]
     df = df[~((df['Time'] > "1130") & (df['Time'] < "1300"))].reset_index(drop=True)
     if df.empty:
@@ -627,19 +641,25 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
         template="plotly_dark", height=500, 
         xaxis_rangeslider_visible=False, hovermode="x unified",
         dragmode='pan',
-        legend=dict(orientation="h", y=1.02, x=1),
+        # 🌟 核心修复1：图例放置到左上角
+        legend=dict(orientation="h", yanchor="top", y=1.0, xanchor="left", x=0),
         margin=dict(t=40, l=10, r=10, b=10),
-        uirevision=uirevision_key  # 🌟 复位关键
+        uirevision=uirevision_key
     )
     fig.update_yaxes(range=[y_min, y_max], fixedrange=False)
-    fig.update_xaxes(type='date', tickformat="%H:%M", 
-                     rangebreaks=[dict(bounds=[11.5, 13], pattern="hour")],
-                     fixedrange=False)
+    
+    # 🌟 核心修复2：固定X轴全天范围，未走到的时间段自然留白
+    fig.update_xaxes(
+        type='date', 
+        tickformat="%H:%M", 
+        range=[f"2024-01-01 09:30:00", f"2024-01-01 15:00:00"],  # 强制设定全天范围
+        rangebreaks=[dict(bounds=[11.5, 13], pattern="hour")], # 隐藏中午休市
+        fixedrange=False
+    )
     return fig
 
 # ================= 9. 主程序执行 =================
 if __name__ == "__main__":
-    # 🌟 初始化复位计数器
     if 'chart_reset_key' not in st.session_state:
         st.session_state.chart_reset_key = 0
     
@@ -674,7 +694,6 @@ if __name__ == "__main__":
         df_daily, df_minute, actual_deviation, market_change
     )
     
-    # 买卖点提醒
     if best_buy != "无有效点":
         st.toast(f"🔴 {current_name} 出现买点！{best_buy.split('|')[1].strip()}", icon="🔔")
     if best_sell != "无有效点":
@@ -700,31 +719,32 @@ if __name__ == "__main__":
     with col_p:
         st.markdown(f'<div class="predict-box">📊 <b>日内极值预测</b><br>{predict_text}</div>', unsafe_allow_html=True)
 
-    # 🌟 日线图标题 + 复位按钮
+    # 日线图标题 + 复位按钮
     col_title1, col_btn1 = st.columns([9, 1])
     with col_title1:
         st.subheader(f"📈 {current_name} ({symbol}) 日线级别走势")
     with col_btn1:
-        if st.button("🔄 复位", use_container_width=True, key="reset_daily_chart", help="点击恢复图表到初始视图"):
+        if st.button("🔄 复位", use_container_width=True, key="reset_daily_chart"):
             st.session_state.chart_reset_key += 1
             st.rerun()
     
     st.plotly_chart(plot_daily_chart(df_daily.tail(120), symbol, st.session_state.chart_reset_key), 
-                    use_container_width=True, config=PLOTLY_CONFIG)
+                    use_container_width=True, config=PLOTLY_CONFIG_CLEAN)
     
-    # 🌟 分时图标题 + 复位按钮
+    # 分时图标题 + 复位按钮
     col_title2, col_btn2 = st.columns([9, 1])
     with col_title2:
         st.subheader(f"⏱️ {current_name} ({symbol}) 分时级别走势（同花顺风格）")
     with col_btn2:
-        if st.button("🔄 复位", use_container_width=True, key="reset_minute_chart", help="点击恢复图表到初始视图"):
+        if st.button("🔄 复位", use_container_width=True, key="reset_minute_chart"):
             st.session_state.chart_reset_key += 1
             st.rerun()
     
     if df_minute is not None and not df_minute.empty:
+        # 🌟 分时图使用带放大/缩小按钮的配置 PLOTLY_CONFIG_WITH_BAR
         st.plotly_chart(plot_minute_chart_ths(df_minute, buy_points, sell_points, symbol, prev_close, st.session_state.chart_reset_key), 
-                        use_container_width=True, config=PLOTLY_CONFIG)
-        st.caption("策略说明：在日线趋势向上或震荡且允许做T的前提下，分时价格缩量回踩均价线时提示买入，分时价格放量冲高乖离均价线时提示卖出，趋势向下时不再生成任何信号。图表仅支持拖动（鼠标按住拖动），双击或点击复位按钮可回到初始视图。")
+                        use_container_width=True, config=PLOTLY_CONFIG_WITH_BAR)
+        st.caption("策略说明：在日线趋势向上或震荡且允许做T的前提下，分时价格缩量回踩均价线时提示买入，分时价格放量冲高乖离均价线时提示卖出，趋势向下时不再生成任何信号。图表右上角有放大、缩小和复位按钮。")
     else:
         st.warning("暂无分时数据")
 
