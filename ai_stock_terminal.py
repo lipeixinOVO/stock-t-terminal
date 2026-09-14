@@ -51,8 +51,6 @@ st.markdown("""
     div.stButton > button[kind="secondary"] {
         background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d;
     }
-    
-    /* 右侧悬浮 AI 聊天固定窗 */
     @media (min-width: 992px) {
         div[data-testid="stAppViewBlockContainer"] > div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"]:last-child {
             position: fixed !important;
@@ -83,7 +81,6 @@ st.markdown("""
             padding-right: 1rem !important;
         }
     }
-    /* 顶部均线数值栏 */
     .ma-bar { 
         background-color: #161b22; padding: 8px 15px; border-radius: 6px; 
         font-family: 'Consolas', monospace; font-size: 14px; 
@@ -104,6 +101,7 @@ else:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WATCHLIST_FILE = os.path.join(BASE_DIR, "watchlist.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+DYNAMIC_POOL_FILE = os.path.join(BASE_DIR, "dynamic_pool.json")
 
 def _load_json(path, default):
     try:
@@ -125,6 +123,8 @@ def load_watchlist(): return _load_json(WATCHLIST_FILE, ['515880', '159915'])
 def save_watchlist(lst): _save_json(WATCHLIST_FILE, lst)
 def load_config(): return _load_json(CONFIG_FILE, {})
 def save_config(cfg): _save_json(CONFIG_FILE, cfg)
+def load_dynamic_pool(): return _load_json(DYNAMIC_POOL_FILE, {})
+def save_dynamic_pool(pool_dict): _save_json(DYNAMIC_POOL_FILE, pool_dict)
 
 # ================= 3. 辅助函数 =================
 @st.cache_data(ttl=3600)
@@ -278,12 +278,9 @@ def get_daily_data(code):
 def get_minute_data(code):
     """
     获取分时数据。
-    腾讯分钟接口的4列字段在不同版本下语义可能不同：
-      A. [时间, 价格, 累计成交量, 累计成交额]   ← 官方标准
-      B. [时间, 价格, 分时均价, 累计成交量]
-    本函数通过量级自动识别并统一输出：
+    腾讯分钟接口字段语义可能不同，本函数自动识别并统一输出：
       - Price:     每分钟价格
-      - Volume:    【每分钟成交量增量】（用于分时图柱状 + 策略判断）
+      - Volume:    【每分钟成交量增量】（用于分时图 + 策略判断）
       - CumVolume: 累计成交量
       - AvgPrice:  分时均价 = 累计成交额 / 累计成交量
     """
@@ -311,46 +308,35 @@ def get_minute_data(code):
         f3 = df['F3'].fillna(0) if 'F3' in df.columns else pd.Series([0.0] * len(df))
         f4 = df['F4'].fillna(0) if 'F4' in df.columns else pd.Series([0.0] * len(df))
 
-        # ===== 智能识别字段语义 =====
-        # F3 是否与价格量级接近 → 可能是"分时均价"
         f3_like_price = f3.iloc[-1] > 0 and 0.7 < f3.iloc[-1] / last_price < 1.3
-        # F4 是否单调递增 → 可能是"累计值"
         f4_mono = f4.iloc[-1] > 0 and (f4.diff().dropna() >= -1e-6).all()
 
         if f3_like_price and f4_mono:
-            # 情形B：F3=分时均价, F4=累计成交量
             df['AvgPrice']  = f3
             df['CumVolume'] = f4
         elif f4_mono:
-            # 情形A：F4=累计成交量, F3=累计成交额
             df['CumVolume'] = f4
             ratio = f3.iloc[-1] / f4.iloc[-1] if f4.iloc[-1] > 0 else 0
             if 0.3 * last_price < ratio < 3 * last_price:
-                # F3 元 / F4 股
                 df['AvgPrice'] = f3 / f4.replace(0, np.nan)
             elif 0.3 * last_price * 100 < ratio < 3 * last_price * 100:
-                # F3 元 / F4 手
                 df['AvgPrice'] = f3 / (f4 * 100)
             else:
                 df['AvgPrice'] = np.nan
         else:
-            # 未知情形兜底
             df['CumVolume'] = f4 if f4.iloc[-1] > 0 else f3
             df['AvgPrice']  = np.nan
 
-        # ===== 核心修复：每分钟增量成交量 =====
         df['Volume'] = df['CumVolume'].diff()
         if len(df) > 0:
             df.loc[df.index[0], 'Volume'] = df['CumVolume'].iloc[0]
         df['Volume'] = df['Volume'].fillna(0).clip(lower=0)
 
-        # ===== 均价兜底：用增量重建累计成交额 =====
         if df['AvgPrice'].isna().any() or (df['AvgPrice'] <= 0).any():
             amt = df['Price'] * df['Volume']
             cum_amt = amt.cumsum()
             df['AvgPrice'] = (cum_amt / df['CumVolume'].replace(0, np.nan)).ffill().fillna(df['Price'])
 
-        # ===== 分时 MACD =====
         df['Price_Change'] = df['Price'].diff()
         ema12 = df['Price'].ewm(span=12, adjust=False).mean()
         ema26 = df['Price'].ewm(span=26, adjust=False).mean()
@@ -461,7 +447,6 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     buy_warning = ""
     divergence_info = ""
     
-    # 动态极值预测（基于时间衰减 + 实时波动率）
     intraday_high_predict = 0
     intraday_low_predict = 0
     if not df_minute.empty:
@@ -638,7 +623,752 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     
     return report, ai_advice, t_guide, predict_text, buy_points, sell_points, context, best_buy, best_sell, latest
 
-# ================= 8. 图表绘制（同花顺风格） =================
+# ================= 7.5 AI 前瞻选股模块 =================
+
+EXCLUDE_PREFIXES = ('688', '300', '301', '8', '4', '92')
+
+CANDIDATE_POOL = [
+    '600519', '600036', '601318', '600887', '601166', '600276', '600309',
+    '601012', '600585', '601088', '600030', '601899', '600690', '601601',
+    '600048', '600438', '601668', '600031', '600050', '601857',
+    '000001', '000002', '000333', '000651', '000858', '002415', '002714',
+    '002304', '000568', '000725', '002142', '000063', '002230', '000100',
+    '002027', '000538', '002050', '000876', '002352', '000661',
+    '601398', '601288', '601939', '601988', '600028', '601628', '601336',
+    '600009', '600900', '601138', '600487', '600745', '601728',
+    '002460', '002475', '002821', '000895', '002179', '000625', '002594',
+]
+
+@st.cache_data(ttl=60)
+def get_realtime_batch(symbols_tuple):
+    symbols = list(symbols_tuple)
+    if not symbols:
+        return pd.DataFrame()
+    codes = []
+    for s in symbols:
+        prefix = "sh" if s.startswith(('5', '6', '9')) else "sz"
+        codes.append(f"{prefix}{s}")
+    url = f"https://qt.gtimg.cn/q={','.join(codes)}"
+    try:
+        res = requests.get(url, timeout=5)
+        res.encoding = 'gbk'
+        rows = []
+        for line in res.text.strip().split(';'):
+            if '~' not in line:
+                continue
+            parts = line.split('~')
+            if len(parts) < 50:
+                continue
+            try:
+                rows.append({
+                    'Code': parts[2],
+                    'Name': parts[1],
+                    'Price': float(parts[3]),
+                    'PrevClose': float(parts[4]),
+                    'Open': float(parts[5]),
+                    'Volume': float(parts[6]),
+                    'High': float(parts[33]),
+                    'Low': float(parts[34]),
+                    'ChangePct': float(parts[32]),
+                    'TurnoverRate': float(parts[38]) if parts[38] else 0,
+                    'PE': float(parts[39]) if parts[39] and parts[39] != '0' else 0,
+                    'PB': float(parts[46]) if len(parts) > 46 and parts[46] and parts[46] != '0' else 0,
+                    'TotalMv': float(parts[45]) if parts[45] else 0,
+                    'CircMv': float(parts[44]) if parts[44] else 0,
+                })
+            except (ValueError, IndexError):
+                continue
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=300)
+def get_stock_historical_metrics(symbol):
+    prefix = "sh" if symbol.startswith(('5', '6', '9')) else "sz"
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{symbol},day,,,260,qfq"
+    try:
+        res = requests.get(url, timeout=5).json()
+        if res.get("code") != 0:
+            return None
+        kline = res["data"][f"{prefix}{symbol}"].get("qfqday") or res["data"][f"{prefix}{symbol}"].get("day")
+        if not kline or len(kline) < 60:
+            return None
+        df = pd.DataFrame(kline).iloc[:, :6]
+        df.columns = ['Date', 'Open', 'Close', 'High', 'Low', 'Volume']
+        for col in ['Open', 'Close', 'High', 'Low', 'Volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.sort_values('Date').reset_index(drop=True)
+
+        close = df['Close']
+        vol = df['Volume']
+        current = close.iloc[-1]
+        high_250 = close.tail(250).max()
+        low_250 = close.tail(250).min()
+        if high_250 == low_250:
+            position_pct = 50
+        else:
+            position_pct = (current - low_250) / (high_250 - low_250) * 100
+
+        vol_5 = vol.tail(5).mean()
+        vol_20 = vol.tail(20).mean()
+        vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 1
+
+        ma20 = close.rolling(20).mean().iloc[-1]
+        ma60 = close.rolling(60).mean().iloc[-1]
+        above_ma20 = current > ma20
+        above_ma60 = current > ma60
+
+        recent = close.tail(20)
+        amplitude_20 = (recent.max() - recent.min()) / recent.mean() * 100
+
+        change_5d = (current / close.iloc[-6] - 1) * 100 if len(close) > 6 else 0
+
+        return {
+            'Position250': round(position_pct, 1),
+            'VolRatio': round(vol_ratio, 2),
+            'AboveMA20': above_ma20,
+            'AboveMA60': above_ma60,
+            'Amplitude20': round(amplitude_20, 1),
+            'Change5D': round(change_5d, 2),
+        }
+    except Exception:
+        return None
+
+def screen_low_position_stocks(candidate_pool, max_results=10):
+    filtered = [s for s in candidate_pool if not s.startswith(EXCLUDE_PREFIXES)]
+    if not filtered:
+        return pd.DataFrame()
+
+    df_rt = get_realtime_batch(tuple(filtered))
+    if df_rt.empty:
+        return pd.DataFrame()
+
+    results = []
+    progress = st.progress(0, text="正在扫描候选股票池...")
+    total = len(df_rt)
+
+    for i, (_, row) in enumerate(df_rt.iterrows()):
+        code_ = row['Code']
+        progress.progress((i + 1) / total, text=f"正在分析 {row['Name']}({code_})...")
+
+        metrics = get_stock_historical_metrics(code_)
+        if metrics is None:
+            continue
+
+        score = 0
+        reasons = []
+
+        pos = metrics['Position250']
+        if pos <= 20:
+            score += 25
+            reasons.append(f"极度低位(250日分位{pos}%)")
+        elif pos <= 30:
+            score += 20
+            reasons.append(f"低位区间(250日分位{pos}%)")
+        elif pos <= 45:
+            score += 10
+            reasons.append(f"中低位(250日分位{pos}%)")
+        else:
+            continue
+
+        pe = row['PE']
+        pb = row['PB']
+        if pe > 0 and pe <= 15:
+            score += 12
+            reasons.append(f"低PE({pe:.1f}倍)")
+        elif pe > 0 and pe <= 25:
+            score += 8
+            reasons.append(f"合理PE({pe:.1f}倍)")
+        elif pe <= 0:
+            reasons.append("PE为负(可能亏损)")
+            continue
+
+        if 0 < pb <= 1.5:
+            score += 8
+            reasons.append(f"低PB({pb:.2f})")
+        elif 0 < pb <= 3:
+            score += 4
+            reasons.append(f"PB适中({pb:.2f})")
+
+        vr = metrics['VolRatio']
+        if 1.3 <= vr <= 3.0:
+            score += 20
+            reasons.append(f"温和放量({vr:.1f}倍)")
+        elif 1.1 <= vr < 1.3:
+            score += 12
+            reasons.append(f"微幅放量({vr:.1f}倍)")
+        elif vr > 3.0:
+            score += 5
+            reasons.append(f"急剧放量({vr:.1f}倍,需警惕)")
+
+        if metrics['AboveMA20']:
+            score += 8
+            reasons.append("站上20日线")
+        if metrics['AboveMA60']:
+            score += 7
+            reasons.append("站上60日线")
+
+        amp = metrics['Amplitude20']
+        if amp <= 8:
+            score += 10
+            reasons.append(f"窄幅横盘蓄势(振幅{amp}%)")
+        elif amp <= 15:
+            score += 5
+            reasons.append(f"适度整理(振幅{amp}%)")
+
+        c5d = metrics['Change5D']
+        if -3 <= c5d <= 5:
+            score += 10
+            reasons.append(f"近期企稳(5日{c5d:+.1f}%)")
+        elif c5d < -8:
+            score += 3
+            reasons.append(f"短期超跌(5日{c5d:+.1f}%)")
+
+        results.append({
+            'Code': code_,
+            'Name': row['Name'],
+            'Price': row['Price'],
+            'ChangePct': row['ChangePct'],
+            'PE': pe,
+            'PB': pb,
+            'TotalMv': row['TotalMv'],
+            'Position250': pos,
+            'VolRatio': vr,
+            'Score': score,
+            'Reasons': ' | '.join(reasons),
+        })
+
+    progress.empty()
+
+    if not results:
+        return pd.DataFrame()
+
+    df_result = pd.DataFrame(results)
+    df_result = df_result.sort_values('Score', ascending=False).head(max_results)
+    df_result = df_result.reset_index(drop=True)
+    df_result.index = df_result.index + 1
+    return df_result
+
+def ai_stock_picker_ui():
+    st.markdown("---")
+    st.header("🎯 AI 前瞻选股助手")
+    st.caption("基于低位分位、估值安全、量能信号、均线趋势、蓄势形态五维评分，筛选沪深主板低位潜力股（已排除科创/创业板/北交所）")
+
+    with st.expander("📖 选股逻辑说明", expanded=False):
+        st.markdown("""
+        **筛选条件**：
+        1. **低位判定**：当前价格处于近250日区间的45%分位以下（越低越好）
+        2. **估值安全**：PE(TTM) > 0 且 < 25倍，PB < 3（优先低PE+低PB）
+        3. **量能信号**：近5日均量 / 近20日均量在 1.1~3.0 倍之间（温和放量）
+        4. **均线趋势**：站上20日线 / 60日线（确认趋势转折）
+        5. **蓄势形态**：近20日振幅 < 15%（窄幅横盘，筹码收敛）
+        6. **近期表现**：5日涨跌幅在 -3%~+5% 之间最佳（企稳或温和启动）
+
+        **综合评分满分100分**，65分以上可重点关注。
+
+        ⚠️ 本工具仅为量化初筛，不构成投资建议，请结合基本面深入研究。
+        """)
+
+    col_scan, col_info = st.columns([1, 3])
+    with col_scan:
+        if st.button("🔍 开始扫描", type="primary", use_container_width=True, key="scan_stocks"):
+            with st.spinner("正在扫描候选股票池，请稍候..."):
+                st.session_state.scan_results = screen_low_position_stocks(CANDIDATE_POOL)
+                st.session_state.scan_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            st.rerun()
+    with col_info:
+        if 'scan_time' in st.session_state:
+            st.caption(f"上次扫描时间: {st.session_state.scan_time}")
+
+    if 'scan_results' in st.session_state:
+        df_r = st.session_state.scan_results
+        if df_r is None or df_r.empty:
+            st.warning("当前候选池中未找到符合条件的低位潜力股，可尝试扩大候选池或放宽条件。")
+        else:
+            def score_label(s):
+                if s >= 80: return "⭐⭐⭐ 强烈关注"
+                if s >= 65: return "⭐⭐ 值得研究"
+                if s >= 50: return "⭐ 可跟踪"
+                return "一般"
+
+            for _, r in df_r.iterrows():
+                score_color = "#00cc66" if r['Score'] >= 65 else ("#f9e2af" if r['Score'] >= 50 else "#888")
+                chg_color = "#ff4b4b" if r['ChangePct'] >= 0 else "#00cc66"
+                label = score_label(r['Score'])
+                st.markdown(f"""
+                <div style="background:#1e1e2e; border-radius:10px; padding:14px 18px; margin-bottom:10px; border-left:4px solid {score_color};">
+                    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+                        <div>
+                            <span style="font-size:18px; font-weight:bold; color:#f0f2f6;">{r['Name']}</span>
+                            <span style="color:#89b4fa; font-size:14px; margin-left:8px;">({r['Code']})</span>
+                            <span style="color:{chg_color}; font-size:14px; margin-left:10px;">{r['ChangePct']:+.2f}%</span>
+                        </div>
+                        <div style="text-align:right;">
+                            <span style="color:{score_color}; font-size:20px; font-weight:bold;">{r['Score']}分</span>
+                            <span style="color:#f9e2af; font-size:13px; margin-left:8px;">{label}</span>
+                        </div>
+                    </div>
+                    <div style="margin-top:8px; color:#c9d1d9; font-size:13px; line-height:1.8;">
+                        <span style="color:#89b4fa;">价格:</span> {r['Price']:.2f} |
+                        <span style="color:#89b4fa;">PE:</span> {r['PE']:.1f} |
+                        <span style="color:#89b4fa;">PB:</span> {r['PB']:.2f} |
+                        <span style="color:#89b4fa;">市值:</span> {r['TotalMv']:.0f}亿 |
+                        <span style="color:#89b4fa;">250日分位:</span> {r['Position250']:.0f}%
+                    </div>
+                    <div style="margin-top:6px; color:#f9e2af; font-size:13px;">
+                        📋 {r['Reasons']}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            st.info("💡 如需针对某只股票深入分析，可复制代码到左侧自选股中添加并查看日线/分时。")
+
+# ================= 7.6 动态股票池系统 =================
+
+@st.cache_data(ttl=180)
+def get_market_sentiment():
+    """获取市场情绪综合指标（0-100 情绪温度）"""
+    sentiment = {
+        'score': 50, 'label': '中性',
+        'up_count': 0, 'down_count': 0,
+        'north_flow': 0.0, 'details': []
+    }
+    try:
+        url = "https://qt.gtimg.cn/q=sh000001,sz399001,sz399006"
+        res = requests.get(url, timeout=5)
+        res.encoding = 'gbk'
+        for line in res.text.strip().split(';'):
+            if '~' not in line:
+                continue
+            parts = line.split('~')
+            if len(parts) > 32:
+                try:
+                    change_pct = float(parts[32])
+                    sentiment['details'].append(f"{parts[1]}: {change_pct:+.2f}%")
+                except (ValueError, IndexError):
+                    pass
+
+        try:
+            stat_url = "https://push2.eastmoney.com/api/qt/stock/get"
+            stat_params = {
+                "fltt": "2", "invt": "2",
+                "fields": "f104,f105,f106",
+                "secid": "1.000001",
+            }
+            stat_res = requests.get(stat_url, params=stat_params, timeout=5).json()
+            if stat_res.get("data"):
+                sentiment['up_count'] = stat_res["data"].get("f104", 0) or 0
+                sentiment['down_count'] = stat_res["data"].get("f105", 0) or 0
+        except Exception:
+            pass
+
+        market_score = 50.0
+        for d in sentiment['details']:
+            try:
+                pct = float(d.split(':')[1].strip().replace('%', ''))
+                market_score += pct * 8
+            except Exception:
+                pass
+
+        total = sentiment['up_count'] + sentiment['down_count']
+        if total > 0:
+            up_ratio = sentiment['up_count'] / total
+            market_score += (up_ratio - 0.5) * 30
+
+        sentiment['score'] = max(0, min(100, round(market_score, 1)))
+
+        if sentiment['score'] >= 75:
+            sentiment['label'] = '🔥 极度贪婪'
+        elif sentiment['score'] >= 60:
+            sentiment['label'] = '☀️ 偏乐观'
+        elif sentiment['score'] >= 40:
+            sentiment['label'] = '☁️ 中性'
+        elif sentiment['score'] >= 25:
+            sentiment['label'] = '🌧️ 偏悲观'
+        else:
+            sentiment['label'] = '❄️ 极度恐慌'
+    except Exception:
+        pass
+    return sentiment
+
+@st.cache_data(ttl=600)
+def get_industry_prosperity():
+    """获取行业景气度评分。返回 {行业名: {score, change_pct, main_flow}}"""
+    industries = {}
+    try:
+        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        params = {
+            "pn": "1", "pz": "100", "po": "1", "np": "1",
+            "fltt": "2", "invt": "2",
+            "fid": "f62",
+            "fs": "m:90+t:2",
+            "fields": "f12,f14,f2,f3,f62",
+        }
+        res = requests.get(url, params=params, timeout=8)
+        data = res.json()
+        if data.get("data") and data["data"].get("diff"):
+            for item in data["data"]["diff"]:
+                name = item.get("f14", "")
+                main_flow = item.get("f62", 0) / 1e8
+                change_pct = item.get("f3", 0)
+                score = min(100, max(0, 50 + main_flow * 2 + change_pct * 3))
+                industries[name] = {
+                    'score': round(score, 1),
+                    'change_pct': change_pct,
+                    'main_flow': round(main_flow, 2),
+                }
+    except Exception:
+        pass
+    return industries
+
+@st.cache_data(ttl=900)
+def get_stock_full_data(symbol):
+    """
+    用东财 push2 接口一次拿到个股全字段：
+      PE, PB, ROE, 净利润, 所属行业, 主力净流入, 市值, 换手, 量比
+    """
+    try:
+        prefix = "sh" if symbol.startswith(('5', '6', '9')) else "sz"
+        secid = f"{'1' if prefix == 'sh' else '0'}.{symbol}"
+        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        params = {
+            "fltt": "2", "invt": "2",
+            "fields": "f43,f57,f58,f9,f23,f37,f45,f46,f48,f50,f62,f116,f117,f127,f168",
+            "secid": secid,
+        }
+        res = requests.get(url, params=params, timeout=6).json()
+        d = res.get("data") or {}
+        if not d:
+            return None
+
+        def safe_float(v):
+            if v in (None, "-", ""):
+                return None
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return None
+
+        return {
+            'pe':  safe_float(d.get('f9')),
+            'pb':  safe_float(d.get('f23')),
+            'roe': safe_float(d.get('f37')),
+            'profit': safe_float(d.get('f45')),
+            'industry': d.get('f127') or "",
+            'main_flow': safe_float(d.get('f62')),
+            'total_mv': safe_float(d.get('f116')),
+            'circ_mv':  safe_float(d.get('f117')),
+            'turnover': safe_float(d.get('f168')),
+            'vol_ratio': safe_float(d.get('f50')),
+        }
+    except Exception:
+        return None
+
+@st.cache_data(ttl=1800)
+def get_hot_money_stocks():
+    """获取近期主力资金净流入 TOP50（沪深主板）。返回 {code: {main_flow, change_pct, name}}"""
+    result = {}
+    try:
+        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        params = {
+            "pn": "1", "pz": "50", "po": "1", "np": "1",
+            "fltt": "2", "invt": "2",
+            "fid": "f62",
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+            "fields": "f12,f14,f2,f3,f62",
+        }
+        res = requests.get(url, params=params, timeout=8).json()
+        if res.get("data") and res["data"].get("diff"):
+            for item in res["data"]["diff"]:
+                code_ = item.get("f12", "")
+                if code_ and not code_.startswith(('688', '300', '301', '8', '4', '92')):
+                    result[code_] = {
+                        'main_flow': item.get("f62", 0) / 1e8,
+                        'change_pct': item.get("f3", 0),
+                        'name': item.get("f14", ""),
+                    }
+    except Exception:
+        pass
+    return result
+
+def calculate_dynamic_score(symbol, full_data, industry_data, sentiment, hot_money, hist_metrics):
+    """
+    动态池综合评分（满分100）：
+      - 基本面质量：30分（PE/PB/ROE/净利润）
+      - 行业景气度：25分
+      - 市场情绪适配：15分
+      - 资金面：20分（主力净流入 + 量比/换手）
+      - 技术面位置：10分（250日分位 + 均线）
+    """
+    score = 0
+    reasons = []
+    tags = []
+
+    if full_data:
+        pe = full_data.get('pe')
+        pb = full_data.get('pb')
+        roe = full_data.get('roe')
+        profit = full_data.get('profit')
+
+        if pe is not None and 0 < pe <= 15:
+            score += 10
+            reasons.append(f"低PE({pe:.1f})")
+        elif pe is not None and 0 < pe <= 25:
+            score += 6
+            reasons.append(f"PE合理({pe:.1f})")
+
+        if pb is not None and 0 < pb <= 1.5:
+            score += 8
+            reasons.append(f"低PB({pb:.2f})")
+        elif pb is not None and 0 < pb <= 3:
+            score += 4
+            reasons.append(f"PB适中({pb:.2f})")
+
+        if roe is not None and roe > 15:
+            score += 7
+            reasons.append(f"高ROE({roe:.1f}%)")
+            tags.append("高ROE")
+        elif roe is not None and roe > 8:
+            score += 4
+            reasons.append(f"ROE良好({roe:.1f}%)")
+
+        if profit is not None and profit > 1e8:
+            score += 5
+            reasons.append(f"盈利强({profit/1e8:.1f}亿)")
+            tags.append("盈利强")
+        elif profit is not None and profit > 0:
+            score += 2
+            reasons.append("盈利为正")
+
+    if industry_data:
+        ind_score = industry_data.get('score', 50)
+        ind_flow = industry_data.get('main_flow', 0)
+        score += int(ind_score * 0.20)
+        if ind_score >= 70:
+            reasons.append(f"行业景气({ind_score:.0f}分)")
+            tags.append("行业景气")
+        if ind_flow > 5:
+            score += 5
+            reasons.append(f"行业资金+{ind_flow:.1f}亿")
+        elif ind_flow > 0:
+            score += 2
+    elif full_data and full_data.get('industry'):
+        reasons.append(f"行业:{full_data['industry']}")
+
+    if sentiment:
+        s_score = sentiment.get('score', 50)
+        s_label = sentiment.get('label', '中性')
+        if 40 <= s_score <= 70:
+            score += 12
+            reasons.append(f"情绪适配({s_label})")
+        elif s_score > 70:
+            score += 6
+            reasons.append(f"市场过热({s_label})")
+        else:
+            score += 8
+            reasons.append(f"市场低迷({s_label})")
+            tags.append("逆势")
+
+    if hot_money:
+        mf = hot_money.get('main_flow', 0)
+        if mf > 5:
+            score += 12
+            reasons.append(f"主力+{mf:.1f}亿")
+            tags.append("主力加仓")
+        elif mf > 1:
+            score += 8
+            reasons.append(f"主力+{mf:.1f}亿")
+        elif mf > 0:
+            score += 4
+            reasons.append(f"主力小幅流入")
+
+    if full_data:
+        turnover = full_data.get('turnover')
+        vol_ratio = full_data.get('vol_ratio')
+        if turnover is not None and 2 <= turnover <= 10:
+            score += 4
+            reasons.append(f"换手{turnover:.1f}%")
+        if vol_ratio is not None and 1.2 <= vol_ratio <= 3:
+            score += 4
+            reasons.append(f"量比{vol_ratio:.1f}")
+
+    if hist_metrics:
+        pos = hist_metrics.get('Position250', 50)
+        if pos <= 20:
+            score += 6
+            reasons.append(f"250日分位{pos:.0f}%")
+            tags.append("低位")
+        elif pos <= 40:
+            score += 3
+            reasons.append(f"分位{pos:.0f}%")
+        if hist_metrics.get('AboveMA20'):
+            score += 2
+        if hist_metrics.get('AboveMA60'):
+            score += 2
+    else:
+        score += 3
+
+    return {
+        'score': min(100, score),
+        'reasons': ' | '.join(reasons[:8]),
+        'tags': tags,
+    }
+
+def refresh_dynamic_pool(max_candidates=50):
+    """核心引擎：多数据源拉取候选股，综合评分后更新动态池"""
+    pool = load_dynamic_pool()
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    progress = st.progress(0, text="正在初始化动态池引擎...")
+
+    progress.progress(5, text="正在评估市场情绪...")
+    sentiment = get_market_sentiment()
+
+    progress.progress(12, text="正在分析行业景气度...")
+    industry_all = get_industry_prosperity()
+
+    progress.progress(20, text="正在获取主力资金热度榜...")
+    hot_money = get_hot_money_stocks()
+
+    candidate_set = set(CANDIDATE_POOL)
+    for code_ in list(hot_money.keys())[:30]:
+        if not code_.startswith(EXCLUDE_PREFIXES):
+            candidate_set.add(code_)
+    candidates = list(candidate_set)[:max_candidates]
+
+    progress.progress(30, text=f"候选池共 {len(candidates)} 只，开始深度分析...")
+
+    for i, code_ in enumerate(candidates):
+        progress.progress(
+            30 + int(65 * (i + 1) / len(candidates)),
+            text=f"正在评分 {code_} ({i+1}/{len(candidates)})..."
+        )
+
+        full_data = get_stock_full_data(code_)
+
+        industry_data = None
+        if full_data and full_data.get('industry'):
+            ind_name = full_data['industry']
+            if ind_name in industry_all:
+                industry_data = industry_all[ind_name]
+            else:
+                for k, v in industry_all.items():
+                    if k and (k in ind_name or ind_name in k):
+                        industry_data = v
+                        break
+
+        hm = hot_money.get(code_)
+
+        try:
+            hist = get_stock_historical_metrics(code_)
+        except Exception:
+            hist = None
+
+        result = calculate_dynamic_score(
+            code_, full_data, industry_data,
+            sentiment, hm, hist
+        )
+
+        if code_ not in pool:
+            pool[code_] = {
+                'score': result['score'],
+                'reasons': result['reasons'],
+                'tags': result['tags'],
+                'last_update': now_str,
+                'first_seen': now_str,
+            }
+        else:
+            old_score = pool[code_].get('score', 0)
+            new_score = int(old_score * 0.4 + result['score'] * 0.6)
+            pool[code_]['score'] = new_score
+            pool[code_]['reasons'] = result['reasons']
+            pool[code_]['tags'] = result['tags']
+            pool[code_]['last_update'] = now_str
+
+    pool = {k: v for k, v in pool.items()
+            if v.get('score', 0) >= 40 or k in CANDIDATE_POOL}
+
+    progress.empty()
+    save_dynamic_pool(pool)
+    return pool
+
+def dynamic_pool_ui():
+    """动态股票池管理界面"""
+    st.markdown("---")
+    st.header("🌊 动态股票池")
+
+    col_sent, col_pool_info = st.columns([1, 1])
+    with col_sent:
+        sentiment = get_market_sentiment()
+        s_score = sentiment['score']
+        s_color = "#00cc66" if s_score >= 60 else ("#f9e2af" if s_score >= 40 else "#ff4b4b")
+        st.markdown(f"""
+        <div style="background:#1e1e2e; border-radius:10px; padding:15px; border-left:4px solid {s_color};">
+            <div style="color:#89b4fa; font-size:14px;">📊 市场情绪温度</div>
+            <div style="font-size:32px; font-weight:bold; color:{s_color}; margin:8px 0;">{s_score:.0f}<span style="font-size:16px; color:#888;">/100</span></div>
+            <div style="color:#f9e2af; font-size:16px;">{sentiment['label']}</div>
+            <div style="color:#c9d1d9; font-size:12px; margin-top:8px;">{' '.join(sentiment.get('details', [])[:3])}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col_pool_info:
+        pool = load_dynamic_pool()
+        high_score = sum(1 for v in pool.values() if v.get('score', 0) >= 65)
+        last_upd = max([v.get('last_update', '') for v in pool.values()]) if pool else '从未'
+        st.markdown(f"""
+        <div style="background:#1e1e2e; border-radius:10px; padding:15px; border-left:4px solid #89b4fa;">
+            <div style="color:#89b4fa; font-size:14px;">📦 动态池状态</div>
+            <div style="font-size:28px; font-weight:bold; color:#f0f2f6; margin:8px 0;">{len(pool)}<span style="font-size:16px; color:#888;"> 只</span></div>
+            <div style="color:#00cc66; font-size:14px;">高分股(≥65): {high_score} 只</div>
+            <div style="color:#c9d1d9; font-size:12px; margin-top:8px;">上次更新: {last_upd}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    col_refresh, col_clean = st.columns([1, 1])
+    with col_refresh:
+        if st.button("🔄 刷新动态池", type="primary", use_container_width=True, key="refresh_pool"):
+            with st.spinner("正在从多数据源刷新动态池，约需1-3分钟..."):
+                st.session_state.dynamic_pool = refresh_dynamic_pool()
+            st.rerun()
+    with col_clean:
+        if st.button("🧹 清理低分股", use_container_width=True, key="clean_pool"):
+            pool = load_dynamic_pool()
+            cleaned = {k: v for k, v in pool.items() if v.get('score', 0) >= 50}
+            save_dynamic_pool(cleaned)
+            st.success(f"已清理 {len(pool) - len(cleaned)} 只低分股")
+            st.rerun()
+
+    pool = load_dynamic_pool()
+    if pool:
+        sorted_pool = sorted(pool.items(), key=lambda x: x[1].get('score', 0), reverse=True)
+
+        st.markdown("### 📋 池内股票（按综合评分排序）")
+        for code_, info in sorted_pool[:20]:
+            name = get_stock_name(code_)
+            score = info.get('score', 0)
+            tags = info.get('tags', [])
+            reasons = info.get('reasons', '')
+
+            score_color = "#00cc66" if score >= 65 else ("#f9e2af" if score >= 50 else "#888")
+            tag_html = ' '.join([f'<span style="background:#2b2b3b; padding:2px 8px; border-radius:10px; font-size:12px; color:#89b4fa;">{t}</span>' for t in tags])
+
+            st.markdown(f"""
+            <div style="background:#1e1e2e; border-radius:8px; padding:12px 16px; margin-bottom:8px; border-left:3px solid {score_color};">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
+                    <div>
+                        <span style="font-size:16px; font-weight:bold; color:#f0f2f6;">{name}</span>
+                        <span style="color:#89b4fa; font-size:13px; margin-left:6px;">({code_})</span>
+                        <span style="margin-left:10px;">{tag_html}</span>
+                    </div>
+                    <span style="color:{score_color}; font-size:18px; font-weight:bold;">{score}分</span>
+                </div>
+                <div style="color:#c9d1d9; font-size:12px; margin-top:6px;">{reasons}</div>
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.info("动态池为空，点击上方「刷新动态池」开始构建。")
+
+# ================= 8. 图表绘制 =================
 PLOTLY_CONFIG_CLEAN = {
     'displayModeBar': False,
     'scrollZoom': False,
@@ -647,7 +1377,6 @@ PLOTLY_CONFIG_CLEAN = {
 }
 
 def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
-    """日线图：三面板（K线、成交量、MACD），主图框选放大，副图自动跟随"""
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6, 0.2, 0.2])
     
     fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='日K',
@@ -698,7 +1427,6 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
     return fig
 
 def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, uirevision_key=0):
-    """分时图：双面板（价格线、成交量），完全禁止缩放，当前价格用虚线对齐左侧"""
     df = df[df['Time'] <= "1500"]
     df = df[~((df['Time'] > "1130") & (df['Time'] < "1300"))].reset_index(drop=True)
     if df.empty:
@@ -708,7 +1436,6 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
     latest_price = df['Price'].iloc[-1]
     latest_avg = df['AvgPrice'].iloc[-1]
     
-    # 固定Y轴范围，并确保当前价格在可视范围内
     y_max = prev_close * 1.03
     y_min = prev_close * 0.97
     actual_max = df['Price'].max()
@@ -718,24 +1445,20 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
     
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
     
-    # 分时价格线
     fig.add_trace(go.Scatter(x=df['Datetime'], y=df['Price'], mode='lines', name='分时价格', 
                              line=dict(color='#00ccff', width=2)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['Datetime'], y=df['AvgPrice'], mode='lines', name='分时均价', 
                              line=dict(color='#ffaa00', width=1.5)), row=1, col=1)
     
-    # 昨收虚线
     fig.add_hline(y=prev_close, line_dash="dash", line_color="#888888", line_width=1, row=1, col=1,
                   annotation_text=f"昨收 {prev_close:.3f}", annotation_position="right",
                   annotation_font=dict(color="#f0f2f6", size=12))
     
-    # 当前价格虚线对齐左侧价格轴
     color_price = "#ff3333" if latest_price >= prev_close else "#00cc66"
     fig.add_hline(y=latest_price, line_dash="dot", line_color=color_price, line_width=1.5, row=1, col=1,
                   annotation_text=f"{latest_price:.3f}", annotation_position="left", 
                   annotation_font=dict(color=color_price, size=12))
     
-    # 买卖点
     if not buy_points.empty:
         buy_points = buy_points[buy_points['Time'] <= "1500"]
         if not buy_points.empty:
@@ -756,7 +1479,6 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
                 name='分时卖点', marker=dict(symbol='triangle-down', size=16, color='#00cc66', line=dict(width=2, color='white'))
             ), row=1, col=1)
     
-    # 右上角保留文本（作为补充）
     fig.add_annotation(
         x=0.99, y=0.98, xref="paper", yref="paper",
         text=f"<b>价格:</b> <span style='color:{color_price}'>{latest_price:.3f}</span><br><b>均价:</b> <span style='color:#ffaa00'>{latest_avg:.3f}</span>",
@@ -765,7 +1487,6 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
         font=dict(color="#f0f2f6", size=14)
     )
     
-    # 分时成交量（每分钟增量） + 5分钟均量线
     vol_colors = ['#ff3333' if change >= 0 else '#00cc66' for change in df['Price_Change']]
     fig.add_trace(go.Bar(x=df['Datetime'], y=df['Volume'], name='分时成交量', marker_color=vol_colors, width=1000*60*0.8), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['Datetime'], y=df['Volume'].rolling(5).mean(), mode='lines', name='均量', line=dict(color='#ffaa00', width=1.5)), row=2, col=1)
@@ -808,14 +1529,11 @@ if __name__ == "__main__":
         st.error("数据不足，无法标注。")
         st.stop()
     
-    # ===== 修复：根据日K最后一根是不是今日，正确识别"昨收" =====
     today_norm  = pd.Timestamp.now().normalize()
     last_k_norm = df_daily['Date'].iloc[-1].normalize()
     if len(df_daily) >= 2 and last_k_norm == today_norm:
-        # 最后一根是今日实时K线 → iloc[-2] 才是昨收
         prev_close = df_daily['Close'].iloc[-2]
     else:
-        # 最后一根就是最近交易日收盘（盘前/周末/数据延迟）→ iloc[-1] 即昨收
         prev_close = df_daily['Close'].iloc[-1]
 
     if auto_dev:
@@ -904,6 +1622,13 @@ if __name__ == "__main__":
     else:
         st.warning("暂无分时数据")
 
+    # ===== AI 前瞻选股助手 =====
+    ai_stock_picker_ui()
+
+    # ===== 动态股票池 =====
+    dynamic_pool_ui()
+
+    # ===== AI 聊天区域 =====
     with st.container():
         st.subheader("💬 DeepSeek AI")
         
