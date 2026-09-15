@@ -74,7 +74,7 @@ st.markdown("""
         }
     }
     @media (max-width: 992px) {
-        div[data-testid="appViewBlockContainer"] > div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"]:last-child {
+        div[data-testid="stAppViewBlockContainer"] > div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"]:last-child {
             position: static !important;
             width: 100% !important;
             max-height: none !important;
@@ -100,7 +100,7 @@ if HAS_AUTOREFRESH:
 else:
     st.caption("⚠️ 未安装自动刷新组件，请按 F5 手动刷新网页")
 
-# ================= 2. 本地持久化存储 =================
+# ================= 2. 本地持久化存储 + Secrets 支持 =================
 try:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     if not os.path.isdir(BASE_DIR):
@@ -129,31 +129,74 @@ def _save_json(path, data):
     except Exception:
         pass
 
-def load_watchlist(): return _load_json(WATCHLIST_FILE, ['515880', '159915'])
-def save_watchlist(lst): _save_json(WATCHLIST_FILE, lst)
-def load_config(): return _load_json(CONFIG_FILE, {})
-def save_config(cfg): _save_json(CONFIG_FILE, cfg)
+# ---------- ✅ 改造：watchlist 优先读 Secrets ----------
+def load_watchlist():
+    """优先从 Secrets 读自选股（云端）；本地开发回退到 json 文件"""
+    try:
+        raw = st.secrets.get("WATCHLIST", "")
+        if raw and isinstance(raw, str):
+            codes = [c.strip() for c in raw.split(",") if c.strip()]
+            if codes:
+                return codes
+    except Exception:
+        pass
+    return _load_json(WATCHLIST_FILE, ['515880', '159915'])
+
+def save_watchlist(lst):
+    """云端不覆盖 Secrets；本地仍写入 json"""
+    try:
+        _save_json(WATCHLIST_FILE, lst)
+    except Exception:
+        pass
+
+# ---------- ✅ 改造：config 优先读 Secrets ----------
+def load_config():
+    """优先从 Secrets 读 API Key / SendKey（云端）；本地回退到 json"""
+    cfg = _load_json(CONFIG_FILE, {})
+    try:
+        ak = st.secrets.get("DEEPSEEK_API_KEY", "")
+        if ak and isinstance(ak, str):
+            cfg['api_key'] = ak
+    except Exception:
+        pass
+    try:
+        sk = st.secrets.get("SERVERCHAN_KEY", "")
+        if sk and isinstance(sk, str):
+            cfg['send_key'] = sk
+    except Exception:
+        pass
+    return cfg
+
+def save_config(cfg):
+    """云端不覆盖 Secrets；本地仍写入 json"""
+    try:
+        _save_json(CONFIG_FILE, cfg)
+    except Exception:
+        pass
+
+# ---------- 检测当前配置来源（供侧边栏提示）----------
+def _secrets_has_key(name):
+    try:
+        v = st.secrets.get(name, "")
+        return bool(v and isinstance(v, str))
+    except Exception:
+        return False
+
 def load_dynamic_pool(): return _load_json(DYNAMIC_POOL_FILE, {})
 def save_dynamic_pool(pool_dict): _save_json(DYNAMIC_POOL_FILE, pool_dict)
 
-# ================= 3. 通知去重机制（持久化 + 价格分档） =================
+# ================= 3. 通知去重机制 =================
 def _load_notify_log():
-    """加载通知日志，格式：{"2026-09-14": ["515880_buy_66", ...]}"""
     return _load_json(NOTIFY_LOG_FILE, {})
 
 def _save_notify_log(log):
     _save_json(NOTIFY_LOG_FILE, log)
 
 def _prune_notify_log(log):
-    """只保留今日记录"""
     today = datetime.now().strftime('%Y-%m-%d')
     return {today: log.get(today, [])}
 
 def _price_bucket(price, pct=0.005):
-    """
-    价格按相对比例分档：同一 0.5% 区间内视为同一个点。
-    用对数分档，保证不同价格量级都合理。
-    """
     try:
         if price <= 0:
             return 0
@@ -163,22 +206,16 @@ def _price_bucket(price, pct=0.005):
         return 0
 
 def make_notify_key(symbol, signal_type, price):
-    """
-    生成去重键：symbol + 类型 + 价格档位
-    同一日内，相同 symbol + 类型 + 相近价格（0.5%内）只发一次
-    """
     bucket = _price_bucket(price)
     return f"{symbol}_{signal_type}_{bucket}"
 
 def should_notify(symbol, signal_type, price):
-    """判断是否需要发送通知（不写入，只判断）"""
     log = _prune_notify_log(_load_notify_log())
     key = make_notify_key(symbol, signal_type, price)
     today = datetime.now().strftime('%Y-%m-%d')
     return key not in log.get(today, [])
 
 def mark_notified(symbol, signal_type, price):
-    """标记已通知（写入日志）"""
     log = _prune_notify_log(_load_notify_log())
     key = make_notify_key(symbol, signal_type, price)
     today = datetime.now().strftime('%Y-%m-%d')
@@ -299,8 +336,12 @@ with st.sidebar:
         save_config({**load_config(), 'api_key': st.session_state.api_key})
     st.text_input("DeepSeek API Key", type="password", key="api_key", 
                   on_change=on_api_key_change, help="保存后无需再配置")
-    if st.session_state.api_key:
-        st.success("API Key 已保存")
+    
+    # ✅ 配置来源提示
+    if _secrets_has_key("DEEPSEEK_API_KEY"):
+        st.success("✅ 已从 Streamlit Secrets 读取 API Key（云端永久生效）")
+    elif st.session_state.api_key:
+        st.info("💾 API Key 来自本地文件（云端重启后会丢，建议改用 Secrets）")
     
     st.markdown("---")
     st.header("📱 微信提醒（可选）")
@@ -310,11 +351,19 @@ with st.sidebar:
         save_config({**load_config(), 'send_key': st.session_state.send_key})
     st.text_input("Server酱 SendKey", type="password", key="send_key", 
                   on_change=on_send_key_change, help="去 sct.ftqq.com 免费注册获取")
-    if st.session_state.send_key:
-        st.success("微信提醒已开启")
+    
+    # ✅ 配置来源提示
+    if _secrets_has_key("SERVERCHAN_KEY"):
+        st.success("✅ 已从 Streamlit Secrets 读取 SendKey（云端永久生效）")
+    elif st.session_state.send_key:
+        st.info("💾 SendKey 来自本地文件（云端重启后会丢，建议改用 Secrets）")
     
     st.markdown("---")
     st.caption("💡 系统会自动监控所有自选股，命中买卖点即推送（相近价格只发一次）")
+    
+    # ✅ 自选股来源提示
+    if _secrets_has_key("WATCHLIST"):
+        st.caption("📌 自选股来自 Streamlit Secrets（在 Cloud 设置里修改 WATCHLIST）")
 
 symbol = st.session_state.current_stock
 current_name = get_stock_name(symbol)
@@ -445,16 +494,13 @@ def calculate_daily_indicators(df):
                                      abs(df['Low'] - df['Close'].shift(1))))
     df['ATR14'] = df['TR'].rolling(14).mean()
     
-    # ✅ 收紧后的日线信号：更严格，只保留高置信度信号
     df['Signal'] = 0
-    # 买入：趋势向上 + J 极低 + 跌破布林中轨 + 缩量
     buy_cond = (
         (df['MA20_UP'] == True) 
         & (df['J'] < 10) 
         & (df['Close'] <= df['BOLL_MID'])
         & (df['Volume'] < df['VOL_MA5'] * 1.2)
     )
-    # 卖出：J 极高 + 突破布林上轨 + 放量 + 阴线
     sell_cond = (
         (df['J'] > 110) 
         & (df['Close'] >= df['BOLL_UP'] * 0.98) 
@@ -569,7 +615,6 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
         df_min_buy = df_min[(df_min['Time'] >= "0945") & (df_min['Time'] <= "1445")].copy()
         df_min_sell = df_min[(df_min['Time'] >= "0930") & (df_min['Time'] <= "1455")].copy()
         
-        # MACD 方向（用于确认）
         df_min_buy['MACD_UP'] = df_min_buy['MACD'] > df_min_buy['MACD'].shift(1)
         df_min_sell['MACD_DOWN'] = df_min_sell['MACD'] < df_min_sell['MACD'].shift(1)
         
@@ -593,7 +638,6 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
                 if recent_macd < prev_macd:
                     divergence_info += " 顶背离"
         
-        # ✅ 收紧后的分时信号：加入 MACD 拐头确认 + 更严的量能条件
         buy_cond = (
             (df_min_buy['Price'] < df_min_buy['AvgPrice'] * (1 - deviation)) 
             & (df_min_buy['Volume'] < df_min_buy['Vol_MA5'] * 0.7)
@@ -713,10 +757,6 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
 
 # ================= 9. 全天候监控所有自选股 =================
 def monitor_all_watchlist(send_key, market_change):
-    """
-    遍历所有自选股，检查买卖点并发送微信提醒。
-    使用持久化日志去重：同一 symbol + 类型 + 相近价格（0.5% 内）只发一次。
-    """
     if not send_key:
         return []
     
@@ -749,7 +789,6 @@ def monitor_all_watchlist(send_key, market_change):
             df_min_buy['MACD_UP'] = df_min_buy['MACD'] > df_min_buy['MACD'].shift(1)
             df_min_sell['MACD_DOWN'] = df_min_sell['MACD'] < df_min_sell['MACD'].shift(1)
             
-            # 动态阈值
             high_price = df_min['Price'].max()
             low_price = df_min['Price'].min()
             avg_price = df_min['AvgPrice'].mean()
@@ -775,7 +814,6 @@ def monitor_all_watchlist(send_key, market_change):
             
             sym_name = get_stock_name(sym)
             
-            # 买点提醒（去重）
             if not buy_pts.empty:
                 best_row = buy_pts.loc[buy_pts['Price'].idxmin()]
                 buy_price = float(best_row['Price'])
@@ -790,7 +828,6 @@ def monitor_all_watchlist(send_key, market_change):
                         mark_notified(sym, 'buy', buy_price)
                         fired.append(f"🔴 {sym_name} 买点 {buy_price:.3f}")
             
-            # 卖点提醒（去重）
             if not sell_pts.empty:
                 best_row = sell_pts.loc[sell_pts['Price'].idxmax()]
                 sell_price = float(best_row['Price'])
@@ -1561,16 +1598,9 @@ PLOTLY_CONFIG_CLEAN = {
 }
 
 def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
-    """
-    日K线图（两面板：K线 + 成交量）：
-      - 主图：K线 + 均线 + ✅ 红/绿大箭头买卖点
-      - 副图：成交量柱 + MA5/MA10 线
-      - ✅ 所有白色背景已去除
-    """
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         vertical_spacing=0.05, row_heights=[0.72, 0.28])
     
-    # ========== 主图：K线 + 均线 ==========
     fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'],
                                  low=df['Low'], close=df['Close'], name='日K',
                                  increasing_line_color='#ff3333',
@@ -1587,7 +1617,6 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
     fig.add_trace(go.Scatter(x=df['Date'], y=df['MA250'], mode='lines', name='年线',
                              line=dict(color='#00ccff', width=1.2, dash='dash')), row=1, col=1)
     
-    # ✅ 买卖点改回红/绿大箭头
     buy_s = df[df['Signal'] == 1]
     sell_s = df[df['Signal'] == -1]
     
@@ -1611,7 +1640,6 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
             customdata=sell_s['Close'],
         ), row=1, col=1)
     
-    # ========== 副图：成交量 ==========
     vol_colors = ['#ff3333' if c >= o else '#00cc66' for c, o in zip(df['Close'], df['Open'])]
     fig.add_trace(go.Bar(
         x=df['Date'], y=df['Volume'], name='成交量',
@@ -1630,7 +1658,6 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
             line=dict(color='#ffaa00', width=1.5), showlegend=False,
         ), row=2, col=1)
     
-    # 成交量标题栏（✅ 透明背景）
     cur_vol = latest['Volume']
     vol_ma5 = latest['VOL_MA5'] if not pd.isna(latest.get('VOL_MA5', np.nan)) else 0
     vol_ma10 = latest['VOL_MA10'] if not pd.isna(latest.get('VOL_MA10', np.nan)) else 0
@@ -1639,11 +1666,10 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
         text=f"<b>成交量</b>  {cur_vol/1e6:.2f}M   MA5:{vol_ma5/1e6:.2f}M   MA10:{vol_ma10/1e6:.2f}M",
         showarrow=False, xanchor='left', yanchor='top',
         font=dict(color='#89b4fa', size=11, family='Consolas'),
-        bgcolor='rgba(0,0,0,0)',   # ✅ 全透明
-        bordercolor='rgba(0,0,0,0)',  # ✅ 无边框
+        bgcolor='rgba(0,0,0,0)',
+        bordercolor='rgba(0,0,0,0)',
     )
     
-    # ========== 布局（✅ legend 透明背景）==========
     fig.update_layout(
         template="plotly_dark", height=650,
         xaxis_rangeslider_visible=False, 
@@ -1652,14 +1678,13 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
         legend=dict(
             orientation="h", yanchor="bottom", y=1.02,
             xanchor="right", x=1, font=dict(size=10),
-            bgcolor='rgba(0,0,0,0)',       # ✅ 全透明
-            bordercolor='rgba(0,0,0,0)',   # ✅ 无边框
+            bgcolor='rgba(0,0,0,0)',
+            bordercolor='rgba(0,0,0,0)',
         ),
         margin=dict(t=50, l=10, r=10, b=10),
         uirevision=uirevision_key
     )
     
-    # 主图可框选；副图 X 轴 matches 主图
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], fixedrange=False, row=1, col=1)
     fig.update_xaxes(matches='x', row=2, col=1)
     
@@ -1711,7 +1736,6 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
                   annotation_text=f"{latest_price:.3f}", annotation_position="left", 
                   annotation_font=dict(color=color_price, size=12))
     
-    # ✅ 分时买卖点：红/绿大箭头
     if not buy_points.empty:
         buy_points = buy_points[buy_points['Time'] <= "1500"]
         if not buy_points.empty:
@@ -1736,13 +1760,12 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
                             line=dict(width=2, color='#ffffff'))
             ), row=1, col=1)
     
-    # 右上角价格信息（✅ 透明背景）
     fig.add_annotation(
         x=0.99, y=0.98, xref="paper", yref="paper",
         text=f"<b>价格:</b> <span style='color:{color_price}'>{latest_price:.3f}</span><br><b>均价:</b> <span style='color:#ffaa00'>{latest_avg:.3f}</span>",
         showarrow=False, align="right",
-        bgcolor='rgba(0,0,0,0)',        # ✅ 全透明
-        bordercolor='rgba(0,0,0,0)',    # ✅ 无边框
+        bgcolor='rgba(0,0,0,0)',
+        bordercolor='rgba(0,0,0,0)',
         borderpad=6,
         font=dict(color="#f0f2f6", size=14)
     )
@@ -1759,8 +1782,8 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
         dragmode=False,
         legend=dict(
             orientation="h", yanchor="top", y=1.0, xanchor="left", x=0,
-            bgcolor='rgba(0,0,0,0)',       # ✅ 全透明
-            bordercolor='rgba(0,0,0,0)',   # ✅ 无边框
+            bgcolor='rgba(0,0,0,0)',
+            bordercolor='rgba(0,0,0,0)',
         ),
         margin=dict(t=40, l=10, r=10, b=10),
         uirevision=uirevision_key
@@ -1820,7 +1843,6 @@ try:
         df_daily, df_minute, actual_deviation, market_change
     )
 
-    # ✅ 全天候监控所有自选股（无需点击）
     if is_trading_time() and st.session_state.get('send_key'):
         fired = monitor_all_watchlist(st.session_state.send_key, market_change)
         for f in fired:
