@@ -557,13 +557,25 @@ def get_hot_money_stocks():
     return result
 
 def screen_low_position_stocks(max_results=15):
-    # 1. 动态获取沪深 A 股列表
-    progress = st.progress(0, text="正在获取全市场数据...")
+    # 1. 动态获取沪深 A 股列表（分页拉取，防止单次请求过大被拦截）
+    progress = st.progress(0, text="正在获取全市场数据（分页拉取中）...")
+    all_stocks = []
     try:
         url = "https://push2.eastmoney.com/api/qt/clist/get"
-        params = {"pn": "1", "pz": "3000", "po": "1", "np": "1", "fltt": "2", "invt": "2", "fid": "f3", "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23", "fields": "f12,f14,f2,f3,f5,f8,f9,f10,f20,f62"}
-        res = requests.get(url, params=params, timeout=10).json()
-        all_stocks = res.get("data", {}).get("diff", [])
+        for pn in range(1, 16):  # 拉取前15页，每页200只，共约3000只
+            params = {"pn": str(pn), "pz": "200", "po": "1", "np": "1", "fltt": "2", "invt": "2", "fid": "f3", "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23", "fields": "f12,f14,f2,f3,f5,f8,f9,f10,f20,f62"}
+            try:
+                res = requests.get(url, params=params, timeout=8).json()
+                if res.get("data") and res["data"].get("diff"):
+                    all_stocks.extend(res["data"]["diff"])
+                else:
+                    break  # 如果没有数据了，提前结束
+                _time_module.sleep(0.2)  # 稍微暂停0.2秒，避免被服务器判定为攻击
+            except Exception:
+                continue  # 某一页失败，跳过继续下一页
+        if not all_stocks:
+            st.error("获取全市场数据失败，请稍后重试。")
+            return pd.DataFrame()
     except Exception:
         st.error("获取全市场数据失败"); return pd.DataFrame()
     
