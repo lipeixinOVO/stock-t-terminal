@@ -521,7 +521,7 @@ def get_stock_historical_metrics(symbol):
         recent = close.tail(20); amplitude_20 = (recent.max() - recent.min()) / recent.mean() * 100
         change_5d = (current / close.iloc[-6] - 1) * 100 if len(close) > 6 else 0
         
-        # 新增技术指标：MACD & KDJ
+        # 技术指标：MACD & KDJ
         ema12 = close.ewm(span=12, adjust=False).mean(); ema26 = close.ewm(span=26, adjust=False).mean()
         diff = ema12 - ema26; dea = diff.ewm(span=9, adjust=False).mean(); macd = 2 * (diff - dea)
         macd_up = macd.iloc[-1] > macd.iloc[-2] and diff.iloc[-1] > diff.iloc[-2]
@@ -531,11 +531,13 @@ def get_stock_historical_metrics(symbol):
         rsv = (close - low_9) / (high_9 - low_9) * 100
         k = rsv.ewm(com=2, adjust=False).mean(); d = k.ewm(com=2, adjust=False).mean(); j = 3 * k - 2 * d
         kdj_golden = k.iloc[-1] > d.iloc[-1] and k.iloc[-2] <= d.iloc[-2]
+        kdj_up = k.iloc[-1] > k.iloc[-2] and d.iloc[-1] > d.iloc[-2]
         
         return {
             'Position250': round(position_pct, 1), 'VolRatio': round(vol_ratio, 2),
             'AboveMA20': above_ma20, 'AboveMA60': above_ma60, 'Amplitude20': round(amplitude_20, 1),
-            'Change5D': round(change_5d, 2), 'MACD_UP': macd_up, 'MACD_GOLDEN': macd_golden, 'KDJ_GOLDEN': kdj_golden,
+            'Change5D': round(change_5d, 2), 'MACD_UP': macd_up, 'MACD_GOLDEN': macd_golden, 
+            'KDJ_GOLDEN': kdj_golden, 'KDJ_UP': kdj_up,
         }
     except Exception: return None
 
@@ -591,17 +593,18 @@ def screen_low_position_stocks(max_results=15):
         
         score = 0; reasons = []
         
-        # 维度1：位置（20分）
+        # 维度1：位置（20分）—— 放宽到 50% 分位
         pos = metrics['Position250']
-        if pos <= 20: score += 20; reasons.append(f"极度低位({pos}%)")
-        elif pos <= 35: score += 15; reasons.append(f"低位区间({pos}%)")
-        elif pos <= 45: score += 8; reasons.append(f"中低位({pos}%)")
+        if pos <= 25: score += 20; reasons.append(f"极度低位({pos}%)")
+        elif pos <= 40: score += 15; reasons.append(f"低位区间({pos}%)")
+        elif pos <= 50: score += 8; reasons.append(f"中低位({pos}%)")
         else: continue  # 位置太高，直接跳过
         
-        # 维度2：技术指标（30分）
+        # 维度2：技术指标（30分）—— 放宽到 MACD或KDJ 任一项金叉
         if metrics['MACD_GOLDEN']: score += 15; reasons.append("MACD金叉")
         elif metrics['MACD_UP']: score += 8; reasons.append("MACD向上")
         if metrics['KDJ_GOLDEN']: score += 10; reasons.append("KDJ金叉")
+        elif metrics['KDJ_UP']: score += 5; reasons.append("KDJ向上")
         if metrics['AboveMA20']: score += 5; reasons.append("站上20日线")
         
         # 维度3：资金面（25分）
@@ -615,8 +618,8 @@ def screen_low_position_stocks(max_results=15):
         if metrics['Amplitude20'] <= 12: score += 10; reasons.append(f"窄幅蓄势(振幅{metrics['Amplitude20']}%)")
         elif metrics['Amplitude20'] <= 18: score += 5; reasons.append(f"适度整理")
         
-        # 过滤条件：技术面必须要有金叉，资金面不能是大幅流出
-        if score >= 40 and (metrics['MACD_GOLDEN'] or metrics['KDJ_GOLDEN']):
+        # 过滤条件：分数达到 30 分，且资金没有大幅流出
+        if score >= 30 and row['MainFlow'] > -0.5:
             results.append({
                 'Code': code_, 'Name': row['Name'], 'Price': row['Price'], 'ChangePct': row['ChangePct'],
                 'PE': row['PE'], 'TotalMv': row['TotalMv'], 'Position250': pos, 'VolRatio': metrics['VolRatio'],
@@ -638,11 +641,11 @@ def ai_stock_picker_ui():
         st.markdown("""
         **核心升级**：
         1. **动态全市场选股**：不再依赖硬编码池，从全市场 5000+ 股票中实时筛选。
-        2. **技术指标共振**：必须出现 MACD 金叉或 KDJ 金叉，且站上 20 日线。
+        2. **技术指标共振**：必须出现 MACD 金叉或 KDJ 金叉（或向上拐头），且站上 20 日线。
         3. **主力资金介入**：主力资金净流入 > 0，且优先关注资金热度榜。
         4. **缩量横盘后启动**：近 20 日振幅 < 15%，量能温和放大。
 
-        **综合评分满分 100 分**，70 分以上可重点关注。
+        **综合评分满分 100 分**，50 分以上可重点关注。
 
         ⚠️ 本工具仅为量化初筛，不构成投资建议，请结合基本面深入研究。
         """)
@@ -787,9 +790,12 @@ def refresh_dynamic_pool(max_candidates=30):
     progress.progress(5, text="正在评估市场情绪..."); sentiment = get_market_sentiment()
     progress.progress(12, text="正在分析行业景气度..."); industry_all = get_industry_prosperity()
     progress.progress(20, text="正在获取主力资金热度榜..."); hot_money = get_hot_money_stocks()
-    candidate_set = set(hot_money.keys())[:20] | set([s for s in st.session_state.stock_list if not s.startswith(EXCLUDE_PREFIXES)])
+    
+    # ✅ 修复：把 set 切片错误改正
+    candidate_set = set(list(hot_money.keys())[:20]) | set([s for s in st.session_state.stock_list if not s.startswith(EXCLUDE_PREFIXES)])
     candidates = list(candidate_set)[:max_candidates]
     progress.progress(25, text=f"候选池 {len(candidates)} 只，并发分析中...")
+    
     def fetch_one(code_):
         try: return code_, get_stock_full_data(code_), get_stock_historical_metrics(code_)
         except Exception: return code_, None, None
