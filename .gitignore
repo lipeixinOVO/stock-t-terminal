@@ -29,3 +29,11 @@ notify_log.json
 band_manual_list.json
 kline_cache.json
 kline_cache.json.tmp
+
+# ===== 波段记忆（隐私，绝对禁止进仓库）=====
+# band_memory.json 含用户手写备注（例如买入价、仓位）与入选价，
+# 本仓库是 public，提交即等于公开持仓思路。
+# 巡检需要的脱敏摘要另存为 band_watch.json，那一份才由 Actions 提交。
+band_memory.json
+band_memory.json.tmp
+band_watch.json.tmp
