@@ -172,6 +172,85 @@ def get_minute_data(code):
         print(f"  分时数据异常: {e}")
         return None
 
+# ============ 日线数据（用于波段结束预警）============
+
+def _get_daily_history(symbol):
+    """从腾讯获取日线复权数据。"""
+    prefix = "sh" if symbol.startswith(('5', '6', '9')) else "sz"
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{symbol},day,,,260,qfq"
+    try:
+        res = requests.get(url, timeout=8).json()
+        if res.get("code") != 0:
+            return None
+        node = res["data"].get(f"{prefix}{symbol}", {})
+        kline = node.get("qfqday") or node.get("day")
+        if not kline or len(kline) < 60:
+            return None
+        df = pd.DataFrame(kline).iloc[:, :6]
+        df.columns = ['Date', 'Open', 'Close', 'High', 'Low', 'Volume']
+        for col in ['Open', 'Close', 'High', 'Low', 'Volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        return df.dropna().sort_values('Date').reset_index(drop=True)
+    except Exception:
+        return None
+
+
+def check_band_end(sym, log, today):
+    """检查单只股票的日线波段结束信号，同一股票每天只提醒一次。"""
+    try:
+        df = _get_daily_history(sym)
+        if df is None or len(df) < 60:
+            return False
+        close = df['Close']; high = df['High']
+        current = float(close.iloc[-1])
+        ma20 = float(close.rolling(20).mean().iloc[-1])
+        below_support = current < ma20
+
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        diff = ema12 - ema26
+        dea = diff.ewm(span=9, adjust=False).mean()
+        macd = 2 * (diff - dea)
+
+        recent = df.tail(60).copy()
+        recent['macd'] = macd.tail(60).values
+        recent['local_high'] = (recent['High'] > recent['High'].shift(1)) & (recent['High'] > recent['High'].shift(-1))
+        highs = recent[recent['local_high']].tail(5)
+        top_divergence = False
+        if len(highs) >= 2:
+            h1, h2 = highs.iloc[-2], highs.iloc[-1]
+            if h2['High'] > h1['High'] and h2['macd'] < h1['macd']:
+                top_divergence = True
+
+        if not top_divergence and not below_support:
+            return False
+
+        key = f"{sym}_band_end_{today}"
+        if key in log.get(today, []):
+            return False
+
+        name = get_stock_name(sym)
+        reasons = []
+        if top_divergence:
+            reasons.append("顶背离（股价新高但MACD未新高）")
+        if below_support:
+            reasons.append(f"跌破20日线支撑（{ma20:.2f}）")
+
+        ok = send_wechat(
+            f"【波段结束预警】{name}",
+            f"股票：{name} ({sym})\n日期：{today}\n"
+            f"依据：{' + '.join(reasons)}\n\n"
+            f"该股票波段可能结束，请注意止盈/止损。"
+        )
+        if ok:
+            log.setdefault(today, []).append(key)
+            print(f"  ⚠️ {name}({sym}) 波段结束预警 → 已推送")
+            return True
+    except Exception as e:
+        print(f"  {sym} 波段预警异常: {e}")
+    return False
+
+
 # ============ 主巡检 ============
 
 def check_symbol(sym, market_change, log, today):
@@ -299,8 +378,15 @@ def main():
     for sym in WATCHLIST:
         if check_symbol(sym, market_change, log, today):
             pushed += 1
+
+    # 波段结束预警（日线级别，每天同一股票只提醒一次）
+    band_alert = 0
+    for sym in WATCHLIST:
+        if check_band_end(sym, log, today):
+            band_alert += 1
+
     save_log(log)
-    print(f"===== 巡检结束，共推送 {pushed} 条 =====")
+    print(f"===== 巡检结束，共推送 {pushed} 条日内信号 / {band_alert} 条波段结束预警 =====")
     return 0
 
 
