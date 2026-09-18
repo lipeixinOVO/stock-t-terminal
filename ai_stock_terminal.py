@@ -182,27 +182,224 @@ def mark_notified(symbol, signal_type, price):
     if key not in log[today]: log[today].append(key)
     _save_notify_log(log)
 
+# ================= 3.5 网络请求层 + 代码前缀 + 日线缓存 =================
+# 背景（本次修复）：原先 get_daily_data 用 timeout=3、无 headers、无重试、无备用源，
+# 且 _get_code 前缀规则漏判北交所（43/83/87/88/92 开头）与沪市转债（110/111/113）。
+# 北交所代码被拼成 sz 前缀后，腾讯返回 code=0 但 qfqday 为空数组，
+# pd.DataFrame([]) 抛异常 → 被 except 静默吞掉 → 页面只显示"数据不足，无法标注。"，
+# 用户拿不到任何可排查的信息。以下做统一加固：多 host/多源轮询 + 重试 + 超时放宽
+# + 磁盘缓存兜底 + 失败原因可诊断。
+
+_HTTP_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Referer": "https://gu.qq.com/",
+    "Accept": "*/*",
+}
+
+class DataFetchError(Exception):
+    """数据获取失败。携带逐次尝试的原因链，供页面诊断展示，不再静默返回 None。"""
+    def __init__(self, symbol, attempts):
+        self.symbol = symbol
+        self.attempts = list(attempts)
+        brief = "；".join(f"{s}={e}" for s, e in self.attempts) if self.attempts else "无可用数据源"
+        super().__init__(f"{symbol} 日线获取失败：{brief}")
+
+def _http_get_json(url, timeout=(5, 10), retries=2):
+    """带 UA / 超时 / 重试的 JSON GET。返回 (ok, data, err)。绝不抛异常。"""
+    last_err = "未知错误"
+    for i in range(max(1, retries)):
+        try:
+            r = requests.get(url, headers=_HTTP_HEADERS, timeout=timeout)
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}"
+                continue
+            return True, r.json(), ""
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:120]}"
+            if i < max(1, retries) - 1:
+                _time_module.sleep(0.4 * (i + 1))
+    return False, None, last_err
+
+def _http_get_text(url, encoding='gbk', timeout=(5, 10), retries=2):
+    """带 UA / 超时 / 重试的文本 GET（腾讯 qt.gtimg.cn 返回 GBK）。返回 (ok, text, err)。"""
+    last_err = "未知错误"
+    for i in range(max(1, retries)):
+        try:
+            r = requests.get(url, headers=_HTTP_HEADERS, timeout=timeout)
+            r.encoding = encoding
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}"
+                continue
+            return True, r.text, ""
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:120]}"
+            if i < max(1, retries) - 1:
+                _time_module.sleep(0.4 * (i + 1))
+    return False, "", last_err
+
+def _quote_prefix(symbol):
+    """判定行情代码前缀 sh / sz / bj（修正原规则对北交所、沪市转债的漏判）。"""
+    s = str(symbol).strip()
+    if not re.fullmatch(r'\d{6}', s):
+        return "sz"
+    if s.startswith(('43', '83', '87', '88', '92')):
+        return "bj"                      # 北交所（含 920 新代码段）
+    if s.startswith(('110', '111', '113', '118', '119')):
+        return "sh"                      # 沪市可转债 / 可交换债（原规则误判为 sz）
+    if s.startswith('12'):
+        return "sz"                      # 深市可转债
+    if s.startswith(('5', '6', '9')):
+        return "sh"                      # 沪市股票 / 基金 / B股
+    return "sz"
+
+# 腾讯日线/分时多域名容错
+_QQ_APP_HOSTS = ["https://web.ifzq.gtimg.cn", "https://ifzq.gtimg.cn"]
+
+# 日线磁盘缓存：所有在线源都失败时兜底，避免接口抖动直接让页面瘫痪。
+# 说明：Streamlit Cloud 容器文件系统在应用重启后会清空，但对分钟级的接口抖动足够用；
+# 多会话共享同一文件，写入采用"临时文件 + 原子替换"避免读到半截 JSON。
+KLINE_CACHE_FILE = os.path.join(BASE_DIR, "kline_cache.json")
+KLINE_CACHE_MAX_CODES = 20
+KLINE_CACHE_ROWS = 320
+
+def _cache_kline(code, df):
+    """把成功取到的日线写入磁盘缓存（跨 Streamlit 会话共享，用于接口抖动兜底）。"""
+    try:
+        store = _load_json(KLINE_CACHE_FILE, {})
+        if not isinstance(store, dict):
+            store = {}
+        tail = df[['Date', 'Open', 'Close', 'High', 'Low', 'Volume']].tail(KLINE_CACHE_ROWS).copy()
+        tail['Date'] = tail['Date'].astype(str)
+        store.pop(code, None)                       # 先删再插，刷新 LRU 顺序
+        store[code] = {"ts": now_cn_str(), "rows": tail.values.tolist()}
+        while len(store) > KLINE_CACHE_MAX_CODES:
+            store.pop(next(iter(store)), None)
+        tmp = KLINE_CACHE_FILE + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(store, f, ensure_ascii=False)
+        os.replace(tmp, KLINE_CACHE_FILE)
+    except Exception:
+        pass
+
+def _load_cached_kline(code):
+    """读磁盘缓存，返回 (df 或 None, 缓存时间字符串)。"""
+    try:
+        store = _load_json(KLINE_CACHE_FILE, {})
+        node = store.get(code) if isinstance(store, dict) else None
+        if not node or not node.get("rows"):
+            return None, ""
+        df = pd.DataFrame(node["rows"], columns=['Date', 'Open', 'Close', 'High', 'Low', 'Volume'])
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        for c in ['Open', 'Close', 'High', 'Low', 'Volume']:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        df = df.dropna(subset=['Date', 'Close']).sort_values('Date').reset_index(drop=True)
+        return (df if len(df) else None), str(node.get("ts", ""))
+    except Exception:
+        return None, ""
+
+def _normalize_kline_rows(rows):
+    """把 [date, open, close, high, low, volume] 行数组规范成 DataFrame。
+    关键：空数组返回 None 而不是抛异常（这是本次"数据不足"的直接肇因）。"""
+    if not rows:
+        return None
+    try:
+        df = pd.DataFrame(list(rows))
+        if df.shape[1] < 6:
+            return None
+        df = df.iloc[:, :6]
+        df.columns = ['Date', 'Open', 'Close', 'High', 'Low', 'Volume']
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        for c in ['Open', 'Close', 'High', 'Low', 'Volume']:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        df = df.dropna(subset=['Date', 'Close']).sort_values('Date').reset_index(drop=True)
+        return df if len(df) >= 30 else None
+    except Exception:
+        return None
+
+def _fetch_kline_qq(code, limit=640):
+    """腾讯日线（前复权），主域名失败自动切备用域名。返回 (df|None, 源名, 错误列表)。"""
+    errs = []
+    for host in _QQ_APP_HOSTS:
+        url = f"{host}/appstock/app/fqkline/get?param={code},day,,,{limit},qfq"
+        ok, js, err = _http_get_json(url, timeout=(5, 10), retries=2)
+        if not ok:
+            errs.append((f"腾讯({host.split('//')[1]})", err))
+            continue
+        if not isinstance(js, dict) or js.get("code") != 0:
+            errs.append((f"腾讯({host.split('//')[1]})", f"接口 code={js.get('code') if isinstance(js, dict) else '非JSON'}"))
+            continue
+        node = (js.get("data") or {}).get(code) or {}
+        df = _normalize_kline_rows(node.get("qfqday") or node.get("day"))
+        if df is None:
+            errs.append((f"腾讯({host.split('//')[1]})", "返回空日线（该代码不受支持或无数据）"))
+            continue
+        return df, f"腾讯·{host.split('//')[1]}", errs
+    return None, "", errs
+
+def _fetch_kline_sina(code, limit=640):
+    """新浪日线备用源（不复权）。腾讯对北交所不提供日线，此处是重要兜底。"""
+    url = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           f"CN_MarketData.getKLineData?symbol={code}&scale=240&ma=no&datalen={limit}")
+    ok, js, err = _http_get_json(url, timeout=(5, 10), retries=2)
+    if not ok:
+        return None, "", [("新浪", err)]
+    if not isinstance(js, list) or not js:
+        return None, "", [("新浪", "返回空日线")]
+    rows = []
+    for it in js:
+        if not isinstance(it, dict):
+            continue
+        rows.append([it.get('day'), it.get('open'), it.get('close'),
+                     it.get('high'), it.get('low'), it.get('volume')])
+    df = _normalize_kline_rows(rows)
+    if df is None:
+        return None, "", [("新浪", f"有效数据不足（原始 {len(rows)} 条）")]
+    return df, "新浪(不复权)", []
+
+# 最近一次取数诊断结果：{code: {"source":..., "ts":..., "attempts":[(源, 原因), ...]}}
+LAST_FETCH_DIAG = {}
+
+def _try_fetch_kline(code):
+    """腾讯 → 新浪 → 磁盘缓存。成功返回 (df, 源描述)；全部失败抛 DataFetchError。"""
+    attempts = []
+    for fn in (_fetch_kline_qq, _fetch_kline_sina):
+        try:
+            df, src, errs = fn(code)
+            attempts.extend(errs)
+            if df is not None and not df.empty:
+                _cache_kline(code, df)
+                LAST_FETCH_DIAG[code] = {"source": src, "ts": now_cn_str(), "attempts": attempts}
+                return df, src
+        except Exception as e:
+            attempts.append((fn.__name__, f"未预期异常 {type(e).__name__}: {str(e)[:100]}"))
+    df_cache, ts = _load_cached_kline(code)
+    if df_cache is not None:
+        attempts.append(("本地缓存", f"已回退到 {ts} 的缓存数据"))
+        LAST_FETCH_DIAG[code] = {"source": f"本地缓存({ts})", "ts": ts, "attempts": attempts}
+        return df_cache, f"本地缓存({ts})"
+    LAST_FETCH_DIAG[code] = {"source": "无", "ts": "", "attempts": attempts}
+    raise DataFetchError(code, attempts)
+
 # ================= 4. 辅助函数 =================
 @st.cache_data(ttl=3600)
 def get_stock_name(symbol):
-    prefix = "sh" if symbol.startswith(('5', '6', '9')) else "sz"
-    url = f"https://qt.gtimg.cn/q={prefix}{symbol}"
-    try:
-        res = requests.get(url, timeout=3); res.encoding = 'gbk'
-        if "~" in res.text:
-            parts = res.text.split("~")
-            if len(parts) > 1: return parts[1].strip('"')
-    except Exception: pass
+    prefix = _quote_prefix(symbol)
+    ok, text, _err = _http_get_text(f"https://qt.gtimg.cn/q={prefix}{symbol}", encoding='gbk', timeout=(5, 10), retries=2)
+    if ok and "~" in text:
+        parts = text.split("~")
+        if len(parts) > 1 and parts[1].strip():
+            return parts[1].strip('"')
     return symbol
 
 @st.cache_data(ttl=60)
 def get_market_status():
-    try:
-        res = requests.get("https://qt.gtimg.cn/q=sh000001", timeout=3); res.encoding = 'gbk'
-        if "~" in res.text:
-            parts = res.text.split("~")
-            if len(parts) > 32: return float(parts[32])
-    except Exception: pass
+    ok, text, _err = _http_get_text("https://qt.gtimg.cn/q=sh000001", encoding='gbk', timeout=(5, 10), retries=2)
+    if ok and "~" in text:
+        parts = text.split("~")
+        if len(parts) > 32:
+            try: return float(parts[32])
+            except (TypeError, ValueError): pass
     return 0.0
 
 def is_trading_time():
@@ -302,30 +499,40 @@ current_name = get_stock_name(symbol)
 st.sidebar.success(f"当前标的: {current_name} ({symbol})")
 
 # ================= 6. 数据获取 =================
-def _get_code(symbol): return f"sh{symbol}" if symbol.startswith(('5', '6', '9')) else f"sz{symbol}"
+def _get_code(symbol): return f"{_quote_prefix(symbol)}{str(symbol).strip()}"
 code = _get_code(symbol)
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_daily_data(code):
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,640,qfq"
-    try:
-        res = requests.get(url, timeout=3).json()
-        if res.get("code") == 0:
-            kline = res["data"][code].get("qfqday") or res["data"][code].get("day")
-            df = pd.DataFrame(kline).iloc[:, :6]
-            df.columns = ['Date', 'Open', 'Close', 'High', 'Low', 'Volume']
-            df['Date'] = pd.to_datetime(df['Date'])
-            for col in ['Open', 'Close', 'High', 'Low', 'Volume']: df[col] = pd.to_numeric(df[col], errors='coerce')
-            return df.sort_values('Date').reset_index(drop=True)
-    except Exception: return None
+    """主图日线：腾讯(自动切域名) → 新浪(不复权) → 磁盘缓存 三级容错。
+    全部失败时抛 DataFetchError，由主程序展示逐次失败原因。
+    注意：st.cache_data 不会缓存抛异常的结果，所以网络恢复后无需等 60 秒 TTL。"""
+    df, _src = _try_fetch_kline(code)
+    return df
 
-@st.cache_data(ttl=60)
+def _fetch_minute_raw(code):
+    """拉取腾讯分时原始数据（多域名轮询）。返回 (raw 列表 | None, 错误列表)。"""
+    errs = []
+    for host in _QQ_APP_HOSTS:
+        url = f"{host}/appstock/app/minute/query?code={code}"
+        ok, js, err = _http_get_json(url, timeout=(5, 10), retries=2)
+        tag = f"腾讯分时({host.split('//')[1]})"
+        if not ok:
+            errs.append((tag, err)); continue
+        if not isinstance(js, dict) or js.get("code") != 0:
+            errs.append((tag, f"接口 code={js.get('code') if isinstance(js, dict) else '非JSON'}")); continue
+        node = (js.get("data") or {}).get(code) or {}
+        raw = ((node.get("data") or {}) or {}).get("data")
+        if not raw:
+            errs.append((tag, "返回空分时")); continue
+        return raw, errs
+    return None, errs
+
+@st.cache_data(ttl=60, show_spinner=False)
 def get_minute_data(code):
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={code}"
+    raw, _errs = _fetch_minute_raw(code)
+    if not raw: return None
     try:
-        res = requests.get(url, timeout=3).json()
-        if res.get("code") != 0: return None
-        raw = res["data"][code]["data"]["data"]
         records = [item.split(" ") for item in raw]
         if not records: return None
         ncol = len(records[0])
@@ -621,25 +828,16 @@ def fetch_market_page(pn, pz=100):
     return []
 
 def _get_daily_history(symbol):
-    """从腾讯获取日线复权数据（波段分析用）。"""
-    prefix = "sh" if symbol.startswith(('5', '6', '9')) else "sz"
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{symbol},day,,,260,qfq"
-    try:
-        res = requests.get(url, timeout=8, headers=_REQUEST_HEADERS).json()
-        if res.get("code") != 0:
-            return None
-        node = res["data"].get(f"{prefix}{symbol}", {})
-        kline = node.get("qfqday") or node.get("day")
-        if not kline or len(kline) < 60:
-            return None
-        df = pd.DataFrame(kline).iloc[:, :6]
-        df.columns = ['Date', 'Open', 'Close', 'High', 'Low', 'Volume']
-        for col in ['Open', 'Close', 'High', 'Low', 'Volume']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        df = df.dropna().sort_values('Date').reset_index(drop=True)
-        return df if len(df) >= 60 else None
-    except Exception:
-        return None
+    """波段分析用日线（前复权，至少 60 条）。复用统一容错层：腾讯多域名 → 新浪兜底。"""
+    code = f"{_quote_prefix(symbol)}{str(symbol).strip()}"
+    for fn in (_fetch_kline_qq, _fetch_kline_sina):
+        try:
+            df, _src, _errs = fn(code, limit=300)
+            if df is not None and len(df) >= 60:
+                return df
+        except Exception:
+            continue
+    return None
 
 def _calculate_band_metrics(df):
     """计算波段相关指标：平台区间、突破、均线、MACD、顶背离、跌破支撑。"""
@@ -1289,9 +1487,42 @@ def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, 
 try:
     if 'chart_reset_key' not in st.session_state: st.session_state.chart_reset_key = 0
     if 'notified_keys' not in st.session_state: st.session_state.notified_keys = set()
-    df_daily = get_daily_data(code); df_minute = get_minute_data(code); market_change = get_market_status()
-    if df_daily is not None: df_daily = calculate_daily_indicators(df_daily)
-    else: st.error("数据不足，无法标注。"); st.stop()
+    df_daily = None; df_minute = None; _daily_err = None; _daily_src = ""
+    try:
+        df_daily = get_daily_data(code)
+    except DataFetchError as _e:
+        _daily_err = _e
+    except Exception as _e:
+        _daily_err = DataFetchError(code, [("未知异常", f"{type(_e).__name__}: {str(_e)[:150]}")])
+    df_minute = get_minute_data(code); market_change = get_market_status()
+    _diag = LAST_FETCH_DIAG.get(code, {}); _daily_src = _diag.get("source", "")
+    if df_daily is not None and not df_daily.empty:
+        df_daily = calculate_daily_indicators(df_daily)
+        if _daily_src and not _daily_src.startswith("腾讯"):
+            st.warning(f"⚠️ 腾讯主源不可用，本次日线来自 **{_daily_src}**。价格口径可能与实时行情略有差异，"
+                       f"回踩/压力位判断请以券商行情为准。")
+    else:
+        st.error(f"❌ 无法获取 {current_name}（{symbol}）的日线数据，主图已暂停渲染。")
+        with st.expander("🔍 展开查看失败原因（排查用，可直接截图反馈）", expanded=True):
+            st.markdown(f"- 请求代码：`{code}`（前缀由 `_quote_prefix` 自动判定）")
+            st.markdown(f"- 北京时间：{now_cn_str()}")
+            st.markdown("- 逐次尝试结果：")
+            _attempts = (_daily_err.attempts if _daily_err is not None else _diag.get("attempts", []))
+            if _attempts:
+                for _i, _a in enumerate(_attempts, 1):
+                    _nm, _rs = (_a if isinstance(_a, (tuple, list)) and len(_a) == 2 else ("尝试", str(_a)))
+                    st.markdown(f"    {_i}. **{_nm}** → {_rs}")
+            else:
+                st.markdown("    （无记录）")
+            st.caption("常见原因：① 网络或代理拦截了行情接口；② 代码前缀不被数据源支持"
+                       "（如北交所 43/83/87/88/92 开头，腾讯不提供日线）；③ 该代码已退市或长期停牌。")
+        if st.button("🔄 清除数据缓存并重试", key="retry_daily_fetch"):
+            get_daily_data.clear(); get_minute_data.clear(); st.rerun()
+        st.markdown("---")
+        st.info("📌 下面两个模块不依赖当前标的的日线，仍可正常使用。也可在左侧自选股中切换到其他标的。")
+        ai_band_picker_ui()
+        dynamic_pool_ui()
+        st.stop()
     today_norm  = pd.Timestamp.now().normalize(); last_k_norm = df_daily['Date'].iloc[-1].normalize()
     if len(df_daily) >= 2 and last_k_norm == today_norm: prev_close = df_daily['Close'].iloc[-2]
     else: prev_close = df_daily['Close'].iloc[-1]
