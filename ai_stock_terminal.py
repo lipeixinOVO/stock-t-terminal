@@ -8,6 +8,7 @@ import re
 import json
 import os
 import traceback
+import sys
 import time as _time_module
 from datetime import datetime, time, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,6 +22,17 @@ def now_cn():
 
 def now_cn_str(fmt='%Y-%m-%d %H:%M:%S'):
     return now_cn().strftime(fmt)
+
+def _log(where, err):
+    """统一的可观测性出口：把原本被 except 静默吞掉的异常写到 stderr。
+
+    历史教训：动态池里 get_stock_historical_metrics 未定义，NameError 被
+    `except Exception: return code_, None, None` 吞掉，导致评分静默失效数月无人发现。
+    凡是要吞异常，必须先经过这里留痕。"""
+    try:
+        print(f"[stock-t][{where}] {type(err).__name__}: {str(err)[:200]}", file=sys.stderr)
+    except Exception:
+        pass
 
 # ✅ 打开页面后默认显示的标的：中国巨石 (600176)
 DEFAULT_STOCK = '600176'
@@ -92,7 +104,8 @@ def _load_json(path, default):
 def _save_json(path, data):
     try:
         with open(path, 'w', encoding='utf-8') as f: json.dump(data, f, ensure_ascii=False, indent=4)
-    except Exception: pass
+    except Exception as e:
+        _log("_save_json", e)   # 磁盘只读 / 写满时不再完全无声
 
 def load_watchlist():
     try:
@@ -205,12 +218,12 @@ class DataFetchError(Exception):
         brief = "；".join(f"{s}={e}" for s, e in self.attempts) if self.attempts else "无可用数据源"
         super().__init__(f"{symbol} 日线获取失败：{brief}")
 
-def _http_get_json(url, timeout=(5, 10), retries=2):
+def _http_get_json(url, params=None, timeout=(5, 10), retries=2):
     """带 UA / 超时 / 重试的 JSON GET。返回 (ok, data, err)。绝不抛异常。"""
     last_err = "未知错误"
     for i in range(max(1, retries)):
         try:
-            r = requests.get(url, headers=_HTTP_HEADERS, timeout=timeout)
+            r = requests.get(url, params=params, headers=_HTTP_HEADERS, timeout=timeout)
             if r.status_code != 200:
                 last_err = f"HTTP {r.status_code}"
                 continue
@@ -410,9 +423,11 @@ def is_trading_time():
 def send_wechat_notification(send_key, title, content):
     if not send_key: return False
     try:
-        res = requests.post(f"https://sctapi.ftqq.com/{send_key}.send", data={"title": title, "desp": content}, timeout=5)
+        res = requests.post(f"https://sctapi.ftqq.com/{send_key}.send", data={"title": title, "desp": content}, timeout=(5, 10))
         return res.status_code == 200
-    except Exception: return False
+    except Exception as e:
+        _log("send_wechat_notification", e)
+        return False
 
 # ================= 5. 侧边栏 =================
 with st.sidebar:
@@ -572,7 +587,9 @@ def get_minute_data(code):
         ema26 = df['Price'].ewm(span=26, adjust=False).mean()
         df['DIFF'] = ema12 - ema26; df['DEA'] = df['DIFF'].ewm(span=9, adjust=False).mean(); df['MACD'] = 2 * (df['DIFF'] - df['DEA'])
         return df
-    except Exception: return None
+    except Exception as e:
+        _log("get_minute_data", e)
+        return None
 
 # ================= 7. 指标计算（日线）=================
 def calculate_daily_indicators(df):
@@ -597,6 +614,101 @@ def calculate_daily_indicators(df):
     buy_cond = buy_cond & (df['Signal'].shift(1) != 1); sell_cond = sell_cond & (df['Signal'].shift(1) != -1)
     df.loc[buy_cond, 'Signal'] = 1; df.loc[sell_cond, 'Signal'] = -1
     return df.bfill().ffill()
+
+# ================= 7.5 分时买卖点判定（主图与后台监控共用）=================
+# 历史教训：这段逻辑原先在 generate_report_and_advice 和 monitor_all_watchlist 里
+# 各写了一份，于是「动态偏离阈值系数 0.4→0.5」只改到监控那处，主图仍按 0.4 算，
+# 导致页面上显示的买卖点和微信推送的买卖点对不上。现统一到本函数，只此一份。
+INTRADAY_BUY_WINDOW = ("0935", "1445")    # 买点时间窗口（放宽后早盘急跌也能捕捉）
+INTRADAY_SELL_WINDOW = ("0930", "1455")   # 卖点时间窗口
+DEVIATION_COEF = 0.5                      # 动态偏离阈值系数（主图与监控必须用同一个）
+DEVIATION_MIN, DEVIATION_MAX = 0.003, 0.015
+
+def dynamic_deviation(df_minute):
+    """按当日振幅自适应计算偏离阈值。主图与后台监控共用同一个函数。
+
+    历史问题：该系数曾在两处分别写死（主图 0.4、监控 0.5），改一处漏一处，
+    导致页面显示的买卖点与微信推送的买卖点不一致。"""
+    try:
+        if df_minute is None or df_minute.empty:
+            return 0.008
+        high_price = float(df_minute['Price'].max()); low_price = float(df_minute['Price'].min())
+        avg_price = float(df_minute['AvgPrice'].mean())
+        if avg_price > 0:
+            return max(DEVIATION_MIN,
+                       min(((high_price - low_price) / avg_price) * DEVIATION_COEF, DEVIATION_MAX))
+    except Exception as e:
+        _log("dynamic_deviation", e)
+    return 0.008
+
+def compute_intraday_signals(df_minute, deviation):
+    """统一的分时买卖点判定。
+
+    参数 deviation 为动态偏离阈值（如 0.008 表示 0.8%）。
+
+    返回 dict（数据不足时返回 None）：
+        buy / sell   : 命中的买点 / 卖点 DataFrame，含 AvgPrice、MACD_UP/DOWN、STOP_FALL/RISE 等列
+        df_min       : 截断到 15:00 且已加 Vol_MA5 的分时数据
+        day_high/low : 当日分时最高 / 最低价
+    """
+    if df_minute is None or df_minute.empty:
+        return None
+    try:
+        df_min = df_minute[df_minute['Time'] <= "1500"].copy()
+        if len(df_min) < 10:
+            return None
+        df_min['Vol_MA5'] = df_min['Volume'].rolling(5).mean()
+        day_high = float(df_min['Price'].max()); day_low = float(df_min['Price'].min())
+        day_range = max(day_high - day_low, 0.001)
+
+        buy = df_min[(df_min['Time'] >= INTRADAY_BUY_WINDOW[0]) & (df_min['Time'] <= INTRADAY_BUY_WINDOW[1])].copy()
+        sell = df_min[(df_min['Time'] >= INTRADAY_SELL_WINDOW[0]) & (df_min['Time'] <= INTRADAY_SELL_WINDOW[1])].copy()
+        if buy.empty or sell.empty:
+            return None
+
+        buy['Price_Position'] = (buy['Price'] - day_low) / day_range
+        sell['Price_Position'] = (sell['Price'] - day_low) / day_range
+        buy['MACD_UP'] = buy['MACD'] > buy['MACD'].shift(1)
+        sell['MACD_DOWN'] = sell['MACD'] < sell['MACD'].shift(1)
+        buy['MACD_GOLDEN'] = (buy['DIFF'] > buy['DEA']) & (buy['DIFF'].shift(1) <= buy['DEA'].shift(1))
+        sell['MACD_DEAD'] = (sell['DIFF'] < sell['DEA']) & (sell['DIFF'].shift(1) >= sell['DEA'].shift(1))
+        # 止跌/企稳：当前不再创新低；滞涨：当前不再创新高
+        buy['STOP_FALL'] = (buy['Price'] >= buy['Price'].shift(1)) & (buy['Price'].shift(1) <= buy['Price'].shift(2))
+        sell['STOP_RISE'] = (sell['Price'] <= sell['Price'].shift(1)) & (sell['Price'].shift(1) >= sell['Price'].shift(2))
+
+        # 买点：方案A 回踩均价线+MACD向上；方案B 接近当日低点+止跌+（MACD向上或缩量）
+        buy_cond = ((buy['Price'] < buy['AvgPrice'] * (1 - deviation * 0.7)) & buy['MACD_UP']) | \
+                   ((buy['Price_Position'] <= 0.30) & buy['STOP_FALL'] &
+                    (buy['MACD_UP'] | (buy['Volume'] < buy['Vol_MA5'] * 0.85)))
+        # 卖点：方案A 冲高乖离均价线+MACD向下；方案B 接近当日高点+滞涨+（MACD向下或放量）
+        sell_cond = ((sell['Price'] > sell['AvgPrice'] * (1 + deviation * 0.7)) & sell['MACD_DOWN']) | \
+                    ((sell['Price_Position'] >= 0.70) & sell['STOP_RISE'] &
+                     (sell['MACD_DOWN'] | (sell['Volume'] > sell['Vol_MA5'] * 1.2)))
+
+        return {'buy': buy[buy_cond], 'sell': sell[sell_cond], 'df_min': df_min,
+                'day_high': day_high, 'day_low': day_low,
+                'cur_price': float(df_min['Price'].iloc[-1])}
+    except Exception as e:
+        _log("compute_intraday_signals", e)
+        return None
+
+def _intraday_divergence(df_min):
+    """日内 MACD 背离提示（仅用于主图展示，不参与买卖点判定）。"""
+    info = ""
+    try:
+        low_idx = df_min['Price'].idxmin()
+        if len(df_min.loc[:low_idx]) > 5:
+            recent_low = df_min.loc[low_idx, 'Price']; prev_lows = df_min[df_min['Price'] < recent_low * 1.005]
+            if len(prev_lows) > 0 and df_min.loc[low_idx, 'MACD'] > df_min.loc[prev_lows.index[0], 'MACD']:
+                info += " 底背离"
+        high_idx = df_min['Price'].idxmax()
+        if len(df_min.loc[:high_idx]) > 5:
+            recent_high = df_min.loc[high_idx, 'Price']; prev_highs = df_min[df_min['Price'] > recent_high * 0.995]
+            if len(prev_highs) > 0 and df_min.loc[high_idx, 'MACD'] < df_min.loc[prev_highs.index[-1], 'MACD']:
+                info += " 顶背离"
+    except Exception as e:
+        _log("_intraday_divergence", e)
+    return info
 
 # ================= 8. 核心策略判定 =================
 def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
@@ -625,6 +737,7 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     elif trend == "震荡": direction = "正T" if latest['Close'] < latest['BOLL_MID'] else "反T"
     support = round(min(latest['MA20'], latest['BOLL_LOW']), 3); resistance = round(max(latest['Close'] * 1.02, latest['BOLL_UP']), 3)
     best_buy = "无有效点"; best_sell = "无有效点"; buy_points = pd.DataFrame(); sell_points = pd.DataFrame(); buy_warning = ""; divergence_info = ""
+    best_buy_price = 0.0; best_sell_price = 0.0   # 同时保留数值，避免下游再去 split 自己拼的字符串
     intraday_high_predict = 0; intraday_low_predict = 0
     if not df_minute.empty:
         cur_price = df_minute['Price'].iloc[-1]; day_high = df_minute['Price'].max(); day_low = df_minute['Price'].min()
@@ -641,48 +754,15 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
             else: remaining_range = atr * 0.5
             dynamic_offset = min(remaining_range, atr) * 0.6
             intraday_high_predict = round(max(day_high, cur_price + dynamic_offset), 3); intraday_low_predict = round(min(day_low, cur_price - dynamic_offset), 3)
-    if allow_t == "允许" and df_minute is not None and not df_minute.empty:
-        df_min = df_minute.copy(); df_min = df_min[df_min['Time'] <= "1500"]; df_min['Vol_MA5'] = df_min['Volume'].rolling(5).mean()
-        # 放宽时间窗口：早盘急跌也可捕捉
-        df_min_buy = df_min[(df_min['Time'] >= "0935") & (df_min['Time'] <= "1445")].copy(); df_min_sell = df_min[(df_min['Time'] >= "0930") & (df_min['Time'] <= "1455")].copy()
-
-        # 计算当日高低点及价格位置
-        day_high = df_min['Price'].max(); day_low = df_min['Price'].min(); day_range = max(day_high - day_low, 0.001)
-        df_min_buy['Price_Position'] = (df_min_buy['Price'] - day_low) / day_range
-        df_min_sell['Price_Position'] = (df_min_sell['Price'] - day_low) / day_range
-
-        df_min_buy['MACD_UP'] = df_min_buy['MACD'] > df_min_buy['MACD'].shift(1); df_min_sell['MACD_DOWN'] = df_min_sell['MACD'] < df_min_sell['MACD'].shift(1)
-        df_min_buy['MACD_GOLDEN'] = (df_min_buy['DIFF'] > df_min_buy['DEA']) & (df_min_buy['DIFF'].shift(1) <= df_min_buy['DEA'].shift(1))
-        df_min_sell['MACD_DEAD'] = (df_min_sell['DIFF'] < df_min_sell['DEA']) & (df_min_sell['DIFF'].shift(1) >= df_min_sell['DEA'].shift(1))
-        # 止跌/企稳：当前不再创新低；滞涨：当前不再创新高
-        df_min_buy['STOP_FALL'] = (df_min_buy['Price'] >= df_min_buy['Price'].shift(1)) & (df_min_buy['Price'].shift(1) <= df_min_buy['Price'].shift(2))
-        df_min_sell['STOP_RISE'] = (df_min_sell['Price'] <= df_min_sell['Price'].shift(1)) & (df_min_sell['Price'].shift(1) >= df_min_sell['Price'].shift(2))
-
-        low_idx = df_min['Price'].idxmin()
-        if len(df_min.loc[:low_idx]) > 5:
-            recent_low = df_min.loc[low_idx, 'Price']; recent_macd = df_min.loc[low_idx, 'MACD']; prev_lows = df_min[df_min['Price'] < recent_low * 1.005]
-            if len(prev_lows) > 0:
-                prev_macd = df_min.loc[prev_lows.index[0], 'MACD']
-                if recent_macd > prev_macd: divergence_info += " 底背离"
-        high_idx = df_min['Price'].idxmax()
-        if len(df_min.loc[:high_idx]) > 5:
-            recent_high = df_min.loc[high_idx, 'Price']; recent_macd = df_min.loc[high_idx, 'MACD']; prev_highs = df_min[df_min['Price'] > recent_high * 0.995]
-            if len(prev_highs) > 0:
-                prev_macd = df_min.loc[prev_highs.index[-1], 'MACD']
-                if recent_macd < prev_macd: divergence_info += " 顶背离"
-
-        # 买点：方案A 回踩均价线+MACD向上；方案B 接近当日低点+止跌+（MACD向上或缩量）
-        buy_cond_a = (df_min_buy['Price'] < df_min_buy['AvgPrice'] * (1 - deviation * 0.7)) & df_min_buy['MACD_UP']
-        buy_cond_b = (df_min_buy['Price_Position'] <= 0.30) & df_min_buy['STOP_FALL'] & (df_min_buy['MACD_UP'] | (df_min_buy['Volume'] < df_min_buy['Vol_MA5'] * 0.85))
-        buy_cond = buy_cond_a | buy_cond_b
-        # 卖点：方案A 冲高乖离均价线+MACD向下；方案B 接近当日高点+滞涨+（MACD向下或放量）
-        sell_cond_a = (df_min_sell['Price'] > df_min_sell['AvgPrice'] * (1 + deviation * 0.7)) & df_min_sell['MACD_DOWN']
-        sell_cond_b = (df_min_sell['Price_Position'] >= 0.70) & df_min_sell['STOP_RISE'] & (df_min_sell['MACD_DOWN'] | (df_min_sell['Volume'] > df_min_sell['Vol_MA5'] * 1.2))
-        sell_cond = sell_cond_a | sell_cond_b
-        buy_points = df_min_buy[buy_cond]; sell_points = df_min_sell[sell_cond]
+    sig = compute_intraday_signals(df_minute, deviation) if allow_t == "允许" else None
+    if sig:
+        df_min = sig['df_min']; day_high = sig['day_high']; day_low = sig['day_low']
+        buy_points = sig['buy']; sell_points = sig['sell']
+        divergence_info = _intraday_divergence(df_min)
         if market_change < -1.0: buy_warning = " ⚠️大盘暴跌，低置信度！"
         if not buy_points.empty:
             best_row = buy_points.loc[buy_points['Price'].idxmin()]; time_fmt = f"{best_row['Time'][:2]}:{best_row['Time'][2:]}"
+            best_buy_price = float(best_row['Price'])
             dev_pct = (best_row['AvgPrice'] - best_row['Price']) / best_row['AvgPrice'] if best_row['AvgPrice'] > 0 else 0
             is_scheme_a = bool((best_row['Price'] < best_row['AvgPrice'] * (1 - deviation * 0.7)) and (best_row['MACD_UP'] if 'MACD_UP' in best_row else False))
             conf = "低" if market_change < -1.0 else ("高" if dev_pct > deviation * 1.5 or "底背离" in divergence_info else ("中" if dev_pct > deviation * 0.8 or is_scheme_a else "低"))
@@ -691,6 +771,7 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
             best_buy = f"{time_fmt} | {best_row['Price']:.3f} | {b_type} | {reason}{divergence_info} | 置信度{conf}{buy_warning}"
         if not sell_points.empty:
             best_row = sell_points.loc[sell_points['Price'].idxmax()]; time_fmt = f"{best_row['Time'][:2]}:{best_row['Time'][2:]}"
+            best_sell_price = float(best_row['Price'])
             dev_pct = (best_row['Price'] - best_row['AvgPrice']) / best_row['AvgPrice'] if best_row['AvgPrice'] > 0 else 0
             is_scheme_a = bool((best_row['Price'] > best_row['AvgPrice'] * (1 + deviation * 0.7)) and (best_row['MACD_DOWN'] if 'MACD_DOWN' in best_row else False))
             conf = "高" if dev_pct > deviation * 1.5 or "顶背离" in divergence_info else ("中" if dev_pct > deviation * 0.8 or is_scheme_a else "低")
@@ -713,8 +794,8 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     elif allow_t == "不允许": ai_advice = f"📉 **不允许做T**：日线下降趋势且未企稳，严禁抄底做正T。仅可少量反T减仓。"
     elif direction == "反T": ai_advice = f"🔄 **优先反T**：日线下降趋稳或震荡上沿。先抛后买，冲高乖离均价线减仓，回踩 {support:.3f} 附近回补。"
     else:
-        if best_buy != "无有效点":
-            buy_price = float(best_buy.split('|')[1].strip()); stop_loss = buy_price * 0.995
+        if best_buy_price > 0:
+            stop_loss = best_buy_price * 0.995
             ai_advice = f"🔥 **适合正T低吸**：已触发买点（{best_buy.split('|')[0].strip()}）。仓位≤底仓30%，止损 {stop_loss:.3f}，目标 {resistance:.3f}。"
         else: ai_advice = f"⏳ **等待正T买点**：日线向上且企稳，但分时价格尚未回踩均价线企稳，耐心等待。"
     if allow_t == "不允许": t_guide = f"**今日不做T** —— 日线处于下降趋势且未企稳，风险大于收益。\n\n操作建议：\n1. 空仓观望或仅持底仓不动。\n2. 若盘中有冲高至压力位 {resistance:.3f} 附近，可少量反T减仓。\n3. 等待日线企稳信号（缩量止跌+支撑不破）再考虑重新入场。"
@@ -735,27 +816,10 @@ def monitor_all_watchlist(send_key, market_change):
         try:
             sym_code = _get_code(sym); df_min = get_minute_data(sym_code)
             if df_min is None or df_min.empty: continue
-            df_min = df_min[df_min['Time'] <= "1500"].copy()
-            if len(df_min) < 10: continue
-            df_min['Vol_MA5'] = df_min['Volume'].rolling(5).mean()
-            df_min_buy = df_min[(df_min['Time'] >= "0935") & (df_min['Time'] <= "1445")].copy()
-            df_min_sell = df_min[(df_min['Time'] >= "0930") & (df_min['Time'] <= "1455")].copy()
-            if df_min_buy.empty or df_min_sell.empty: continue
-            df_min_buy['MACD_UP'] = df_min_buy['MACD'] > df_min_buy['MACD'].shift(1)
-            df_min_sell['MACD_DOWN'] = df_min_sell['MACD'] < df_min_sell['MACD'].shift(1)
-            high_price = df_min['Price'].max(); low_price = df_min['Price'].min(); avg_price = df_min['AvgPrice'].mean()
-            dev = max(0.003, min(((high_price - low_price) / avg_price) * 0.5, 0.015)) if avg_price > 0 else 0.008
-            df_min_buy['Price_Position'] = (df_min_buy['Price'] - low_price) / max(high_price - low_price, 0.001)
-            df_min_sell['Price_Position'] = (df_min_sell['Price'] - low_price) / max(high_price - low_price, 0.001)
-            df_min_buy['STOP_FALL'] = (df_min_buy['Price'] >= df_min_buy['Price'].shift(1)) & (df_min_buy['Price'].shift(1) <= df_min_buy['Price'].shift(2))
-            df_min_sell['STOP_RISE'] = (df_min_sell['Price'] <= df_min_sell['Price'].shift(1)) & (df_min_sell['Price'].shift(1) >= df_min_sell['Price'].shift(2))
-            buy_cond_a = (df_min_buy['Price'] < df_min_buy['AvgPrice'] * (1 - dev * 0.7)) & df_min_buy['MACD_UP']
-            buy_cond_b = (df_min_buy['Price_Position'] <= 0.30) & df_min_buy['STOP_FALL'] & (df_min_buy['MACD_UP'] | (df_min_buy['Volume'] < df_min_buy['Vol_MA5'] * 0.85))
-            buy_cond = buy_cond_a | buy_cond_b
-            sell_cond_a = (df_min_sell['Price'] > df_min_sell['AvgPrice'] * (1 + dev * 0.7)) & df_min_sell['MACD_DOWN']
-            sell_cond_b = (df_min_sell['Price_Position'] >= 0.70) & df_min_sell['STOP_RISE'] & (df_min_sell['MACD_DOWN'] | (df_min_sell['Volume'] > df_min_sell['Vol_MA5'] * 1.2))
-            sell_cond = sell_cond_a | sell_cond_b
-            buy_pts = df_min_buy[buy_cond]; sell_pts = df_min_sell[sell_cond]
+            dev = dynamic_deviation(df_min)
+            sig = compute_intraday_signals(df_min, dev)
+            if not sig: continue
+            buy_pts = sig['buy']; sell_pts = sig['sell']
             sym_name = get_stock_name(sym)
             if not buy_pts.empty:
                 best_row = buy_pts.loc[buy_pts['Price'].idxmin()]; buy_price = float(best_row['Price']); buy_time = f"{best_row['Time'][:2]}:{best_row['Time'][2:]}"
@@ -767,7 +831,9 @@ def monitor_all_watchlist(send_key, market_change):
                 if should_notify(sym, 'sell', sell_price):
                     ok = send_wechat_notification(send_key, f"【卖点提醒】{sym_name}", f"股票：{sym_name} ({sym})\n时间：{sell_time}\n价格：{sell_price:.3f}\n依据：冲高乖离均价线放量，MACD 拐头向下")
                     if ok: mark_notified(sym, 'sell', sell_price); fired.append(f"🟢 {sym_name} 卖点 {sell_price:.3f}")
-        except Exception: continue
+        except Exception as e:
+            _log(f"monitor_all_watchlist/{sym}", e)
+            continue
     return fired
 
 # ================= 10. 波段做T选股助手 =================
@@ -780,6 +846,12 @@ _REQUEST_HEADERS = {
     "Referer": "https://quote.eastmoney.com/",
 }
 
+# 东财多 host 轮询池（当前网络环境下 push2delay 通常最稳，其余为兜底）
+# 三处东财调用原先各写了一份同样的列表，已统一到这里，新增调用点请直接复用。
+_EM_HOSTS = ["https://push2delay.eastmoney.com", "https://push2.eastmoney.com",
+             "https://7.push2.eastmoney.com", "https://17.push2.eastmoney.com",
+             "https://29.push2.eastmoney.com", "https://82.push2.eastmoney.com"]
+
 def _safe_float(v, default=0.0):
     """把东方财富接口返回的 '-' / None / NaN / inf 等脏值安全转成 float，绝不抛异常。"""
     try:
@@ -791,6 +863,21 @@ def _safe_float(v, default=0.0):
         return f
     except (TypeError, ValueError):
         return default
+
+def _safe_float_or_none(v):
+    """东财脏值（'-' / None / NaN / inf）→ float 或 None。
+
+    与 _safe_float 的区别：无有效数据时返回 None 而非 0，用于「无数据」和「值为 0」
+    需要区分的场景（如 PE、PB 这类本来就不该为 0 的指标）。"""
+    try:
+        if v is None or v == '' or v == '-':
+            return None
+        f = float(v)
+        if f != f or f == float('inf') or f == float('-inf'):
+            return None
+        return f
+    except (TypeError, ValueError):
+        return None
 
 def _is_st_or_risk(name):
     """剔除 ST、*ST、退市等风险股。"""
@@ -811,11 +898,7 @@ def fetch_market_page(pn, pz=100):
     params = {"pn": str(pn), "pz": str(pz), "po": "1", "np": "1", "fltt": "2", "invt": "2",
               "fid": "f62", "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
               "fields": "f12,f14,f2,f3,f8,f9,f10,f20,f62"}
-    # 多 host 容错：当前网络环境下 push2delay 通常更稳定
-    hosts = ["https://push2delay.eastmoney.com", "https://push2.eastmoney.com",
-             "https://7.push2.eastmoney.com", "https://17.push2.eastmoney.com",
-             "https://29.push2.eastmoney.com", "https://82.push2.eastmoney.com"]
-    for base_url in hosts:
+    for base_url in _EM_HOSTS:
         try:
             res = requests.get(f"{base_url}/api/qt/clist/get", params=params, timeout=8, headers=_REQUEST_HEADERS)
             if res.status_code != 200:
@@ -823,7 +906,8 @@ def fetch_market_page(pn, pz=100):
             data = res.json()
             if data.get("data") and data["data"].get("diff"):
                 return _diff_to_list(data["data"]["diff"])
-        except Exception:
+        except Exception as e:
+            _log(f"fetch_market_page@{base_url}", e)
             continue
     return []
 
@@ -835,7 +919,8 @@ def _get_daily_history(symbol):
             df, _src, _errs = fn(code, limit=300)
             if df is not None and len(df) >= 60:
                 return df
-        except Exception:
+        except Exception as e:
+            _log("_get_daily_history", e)
             continue
     return None
 
@@ -959,7 +1044,8 @@ def _analyze_band(row):
             'MA20': m['ma20'], 'PlatformHigh': m['platform_high'], 'VolRatio': m['vol_ratio'],
             'Position250': round(m['position_pct'], 1), 'Reasons': ' | '.join(reasons)
         }
-    except Exception:
+    except Exception as e:
+        _log(f"_analyze_band/{row.get('Code', '?')}", e)
         return None
 
 def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None):
@@ -976,19 +1062,20 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None):
                 continue
             seen.add(code_)
             name = get_stock_name(code_)
-            prefix = "sh" if code_.startswith(('5', '6', '9')) else "sz"
             try:
-                res = requests.get(f"https://qt.gtimg.cn/q={prefix}{code_}", timeout=3)
-                res.encoding = 'gbk'
-                parts = res.text.split('~')
+                # 复用统一请求层：带 UA / 超时 (5,10) / 重试；前缀交给 _quote_prefix，不再手写判断
+                ok, text, err = _http_get_text(f"https://qt.gtimg.cn/q={_get_code(code_)}",
+                                               encoding='gbk', timeout=(5, 10), retries=2)
+                parts = text.split('~') if ok else []
                 if len(parts) > 45:
-                    price = _safe_float(parts[3])
-                    change_pct = _safe_float(parts[32])
+                    price = _safe_float(parts[3]); change_pct = _safe_float(parts[32])
                     if price > 0:
                         candidates.append({'Code': code_, 'Name': name, 'Price': price, 'ChangePct': change_pct,
                                            'TotalMv': 0.0, 'MainFlow': 0.0})
-            except Exception:
-                pass
+                else:
+                    _log("screen_band_stocks/quote", f"{code_} 行情不可用（{err or '返回字段不足'}）")
+            except Exception as e:
+                _log("screen_band_stocks/quote", e)
         progress.progress(12, text=f"已加载自定义列表 {len(candidates)} 只...")
         all_stocks = custom_codes or []
     else:
@@ -1049,7 +1136,12 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None):
             if done % 20 == 0 or done == len(to_scan):
                 progress.progress(15 + int(80 * done / len(to_scan)),
                                   text=f"深度分析 {done}/{len(to_scan)}（有效 {len(scored)} 只）")
-            r = future.result()
+            try:
+                r = future.result()
+            except Exception as e:
+                _log("screen_band_stocks/future", e)
+                no_data += 1
+                continue
             if r is None:
                 no_data += 1
             else:
@@ -1185,25 +1277,30 @@ def ai_band_picker_ui():
 def get_market_sentiment():
     sentiment = {'score': 50, 'label': '中性', 'up_count': 0, 'down_count': 0, 'north_flow': 0.0, 'details': []}
     try:
-        url = "https://qt.gtimg.cn/q=sh000001,sz399001,sz399006"
-        res = requests.get(url, timeout=5); res.encoding = 'gbk'
-        for line in res.text.strip().split(';'):
+        ok, text, err = _http_get_text("https://qt.gtimg.cn/q=sh000001,sz399001,sz399006",
+                                       encoding='gbk', timeout=(5, 10), retries=2)
+        if not ok:
+            _log("get_market_sentiment/index", err)
+        for line in (text or "").strip().split(';'):
             if '~' not in line: continue
             parts = line.split('~')
             if len(parts) > 32:
                 try: sentiment['details'].append(f"{parts[1]}: {float(parts[32]):+.2f}%")
                 except (ValueError, IndexError): pass
-        try:
-            stat_url = "https://push2.eastmoney.com/api/qt/stock/get"
-            stat_res = requests.get(stat_url, params={"fltt": "2", "invt": "2", "fields": "f104,f105,f106", "secid": "1.000001"}, timeout=5).json()
-            if stat_res.get("data"):
-                sentiment['up_count'] = stat_res["data"].get("f104", 0) or 0
-                sentiment['down_count'] = stat_res["data"].get("f105", 0) or 0
-        except Exception: pass
+        # 涨跌家数：东财多 host 轮询（原先只打 push2 单 host，被拦时这一项会一直为 0）
+        for base_url in _EM_HOSTS:
+            ok2, stat_res, _err2 = _http_get_json(
+                f"{base_url}/api/qt/stock/get",
+                params={"fltt": "2", "invt": "2", "fields": "f104,f105,f106", "secid": "1.000001"},
+                timeout=(5, 8), retries=1)
+            if ok2 and isinstance(stat_res, dict) and stat_res.get("data"):
+                sentiment['up_count'] = int(_safe_float(stat_res["data"].get("f104")))
+                sentiment['down_count'] = int(_safe_float(stat_res["data"].get("f105")))
+                break
         market_score = 50.0
         for d in sentiment['details']:
             try: market_score += float(d.split(':')[1].strip().replace('%', '')) * 8
-            except Exception: pass
+            except (ValueError, IndexError): pass
         total = sentiment['up_count'] + sentiment['down_count']
         if total > 0: market_score += (sentiment['up_count'] / total - 0.5) * 30
         sentiment['score'] = max(0, min(100, round(market_score, 1)))
@@ -1212,7 +1309,8 @@ def get_market_sentiment():
         elif sentiment['score'] >= 40: sentiment['label'] = '☁️ 中性'
         elif sentiment['score'] >= 25: sentiment['label'] = '🌧️ 偏悲观'
         else: sentiment['label'] = '❄️ 极度恐慌'
-    except Exception: pass
+    except Exception as e:
+        _log("get_market_sentiment", e)
     return sentiment
 
 @st.cache_data(ttl=600)
@@ -1220,10 +1318,7 @@ def get_industry_prosperity():
     """获取行业板块景气度，带多 host 容错。"""
     industries = {}
     params = {"pn": "1", "pz": "100", "po": "1", "np": "1", "fltt": "2", "invt": "2", "fid": "f62", "fs": "m:90+t:2", "fields": "f12,f14,f2,f3,f62"}
-    hosts = ["https://push2delay.eastmoney.com", "https://push2.eastmoney.com",
-             "https://7.push2.eastmoney.com", "https://17.push2.eastmoney.com",
-             "https://29.push2.eastmoney.com", "https://82.push2.eastmoney.com"]
-    for base_url in hosts:
+    for base_url in _EM_HOSTS:
         try:
             res = requests.get(f"{base_url}/api/qt/clist/get", params=params, timeout=8, headers=_REQUEST_HEADERS)
             if res.status_code != 200:
@@ -1231,10 +1326,14 @@ def get_industry_prosperity():
             data = res.json()
             if data.get("data") and data["data"].get("diff"):
                 for item in _diff_to_list(data["data"]["diff"]):
-                    name = item.get("f14", ""); main_flow = item.get("f62", 0) / 1e8; change_pct = item.get("f3", 0)
-                    industries[name] = {'score': round(min(100, max(0, 50 + main_flow * 2 + change_pct * 3)), 1), 'change_pct': change_pct, 'main_flow': round(main_flow, 2)}
+                    name = str(item.get("f14") or "")
+                    main_flow = _safe_float(item.get("f62")) / 1e8
+                    change_pct = _safe_float(item.get("f3"))
+                    industries[name] = {'score': round(min(100, max(0, 50 + main_flow * 2 + change_pct * 3)), 1),
+                                        'change_pct': change_pct, 'main_flow': round(main_flow, 2)}
                 break
-        except Exception:
+        except Exception as e:
+            _log("get_industry_prosperity", e)
             continue
     return industries
 
@@ -1253,34 +1352,64 @@ def get_hot_money_stocks(pages=3):
                 mf = _safe_float(item.get("f62")) / 1e8
                 if code_ and mf > 0:
                     hot[code_] = {'main_flow': mf}
-    except Exception:
-        pass
+    except Exception as e:
+        _log("get_hot_money_stocks", e)
     return hot
 
 @st.cache_data(ttl=900)
 def get_stock_full_data(symbol):
     """获取个股完整数据，带多 host 容错。"""
     try:
-        prefix = "sh" if symbol.startswith(('5', '6', '9')) else "sz"
-        secid = f"{'1' if prefix == 'sh' else '0'}.{symbol}"
+        # 前缀统一由 _quote_prefix 判定：东财 secid 沪市用 1.，深市与北交所都用 0.
+        secid = f"{'1' if _quote_prefix(symbol) == 'sh' else '0'}.{symbol}"
         params = {"fltt": "2", "invt": "2", "fields": "f43,f57,f58,f9,f23,f37,f45,f46,f48,f50,f62,f116,f117,f127,f168", "secid": secid}
-        hosts = ["https://push2delay.eastmoney.com", "https://push2.eastmoney.com",
-                 "https://7.push2.eastmoney.com", "https://17.push2.eastmoney.com",
-                 "https://29.push2.eastmoney.com", "https://82.push2.eastmoney.com"]
-        for base_url in hosts:
+        for base_url in _EM_HOSTS:
             try:
-                res = requests.get(f"{base_url}/api/qt/stock/get", params=params, timeout=6, headers=_REQUEST_HEADERS)
-                if res.status_code != 200:
+                ok, js, err = _http_get_json(f"{base_url}/api/qt/stock/get", params=params,
+                                             timeout=(5, 8), retries=1)
+                if not ok:
                     continue
-                d = res.json().get("data") or {}
+                d = (js.get("data") if isinstance(js, dict) else None) or {}
                 if not d:
                     continue
-                def sf(v): return float(v) if v not in (None, "-", "") else None
-                return {'pe': sf(d.get('f9')), 'pb': sf(d.get('f23')), 'roe': sf(d.get('f37')), 'profit': sf(d.get('f45')), 'industry': d.get('f127') or "", 'main_flow': sf(d.get('f62')), 'total_mv': sf(d.get('f116')), 'circ_mv': sf(d.get('f117')), 'turnover': sf(d.get('f168')), 'vol_ratio': sf(d.get('f50'))}
-            except Exception:
+                return {'pe': _safe_float_or_none(d.get('f9')), 'pb': _safe_float_or_none(d.get('f23')),
+                        'roe': _safe_float_or_none(d.get('f37')), 'profit': _safe_float_or_none(d.get('f45')),
+                        'industry': d.get('f127') or "", 'main_flow': _safe_float_or_none(d.get('f62')),
+                        'total_mv': _safe_float_or_none(d.get('f116')), 'circ_mv': _safe_float_or_none(d.get('f117')),
+                        'turnover': _safe_float_or_none(d.get('f168')), 'vol_ratio': _safe_float_or_none(d.get('f50'))}
+            except Exception as e:
+                _log("get_stock_full_data", e)
                 continue
         return None
-    except Exception: return None
+    except Exception as e:
+        _log("get_stock_full_data/outer", e)
+        return None
+
+@st.cache_data(ttl=1800)
+def get_stock_historical_metrics(symbol):
+    """动态池评分用的历史位置指标（250 日分位、是否站上 20/60 日线）。
+
+    ⚠️ 原先这个函数被 refresh_dynamic_pool 调用但**从未定义** —— NameError 被
+    fetch_one 的 `except Exception: return code_, None, None` 吞掉，于是 full_data 和 hist
+    双双为 None，动态池综合评分只能拿到情绪分，实际长期处于失效状态。此处补全。
+    """
+    try:
+        df = _get_daily_history(symbol)
+        if df is None or len(df) < 60:
+            return None
+        close = df['Close']
+        current = float(close.iloc[-1])
+        if current <= 0:
+            return None
+        ma20 = float(close.rolling(20).mean().iloc[-1])
+        ma60 = float(close.rolling(60).mean().iloc[-1])
+        high_250 = float(close.tail(250).max()); low_250 = float(close.tail(250).min())
+        position = 50.0 if high_250 <= low_250 else (current - low_250) / (high_250 - low_250) * 100
+        return {'Position250': round(position, 1), 'AboveMA20': bool(current > ma20),
+                'AboveMA60': bool(current > ma60), 'MA20': ma20, 'MA60': ma60, 'Current': current}
+    except Exception as e:
+        _log("get_stock_historical_metrics", e)
+        return None
 
 def calculate_dynamic_score(symbol, full_data, industry_data, sentiment, hot_money, hist_metrics):
     score = 0; reasons = []; tags = []
@@ -1354,20 +1483,29 @@ def refresh_dynamic_pool(max_candidates=30):
                         add(market_codes[min(int(i * step), len(market_codes) - 1)])
                 else:
                     for c in market_codes: add(c)
-        except Exception: pass
+        except Exception as e:
+            _log("refresh_dynamic_pool/_collect_candidates", e)
         return out[:limit]
 
     candidates = _collect_candidates(max_candidates)
     progress.progress(25, text=f"候选池 {len(candidates)} 只，并发分析中...")
     
     def fetch_one(code_):
-        try: return code_, get_stock_full_data(code_), get_stock_historical_metrics(code_)
-        except Exception: return code_, None, None
+        try:
+            return code_, get_stock_full_data(code_), get_stock_historical_metrics(code_)
+        except Exception as e:
+            _log("refresh_dynamic_pool/fetch_one", e)
+            return code_, None, None
     results = {}; completed = 0; total = len(candidates)
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(fetch_one, c): c for c in candidates}
         for future in as_completed(futures):
-            code_, full_data, hist = future.result(); results[code_] = (full_data, hist)
+            try:
+                code_, full_data, hist = future.result()
+            except Exception as e:
+                _log("refresh_dynamic_pool/future", e)
+                continue
+            results[code_] = (full_data, hist)
             completed += 1; progress.progress(25 + int(65 * completed / total), text=f"分析中 {completed}/{total}...")
     progress.progress(92, text="正在计算综合评分...")
     for code_ in candidates:
@@ -1523,16 +1661,10 @@ try:
         ai_band_picker_ui()
         dynamic_pool_ui()
         st.stop()
-    today_norm  = pd.Timestamp.now().normalize(); last_k_norm = df_daily['Date'].iloc[-1].normalize()
+    today_norm  = pd.Timestamp(now_cn().date()); last_k_norm = df_daily['Date'].iloc[-1].normalize()
     if len(df_daily) >= 2 and last_k_norm == today_norm: prev_close = df_daily['Close'].iloc[-2]
     else: prev_close = df_daily['Close'].iloc[-1]
-    if auto_dev:
-        if df_minute is not None and not df_minute.empty:
-            high_price = df_minute['Price'].max(); low_price = df_minute['Price'].min(); avg_price = df_minute['AvgPrice'].mean()
-            if avg_price > 0: actual_deviation = max(0.003, min(((high_price - low_price) / avg_price) * 0.4, 0.015))
-            else: actual_deviation = 0.008
-        else: actual_deviation = 0.008
-    else: actual_deviation = manual_dev
+    actual_deviation = dynamic_deviation(df_minute) if auto_dev else manual_dev
     report, ai_advice, t_guide, predict_text, buy_points, sell_points, context, best_buy, best_sell, latest = generate_report_and_advice(df_daily, df_minute, actual_deviation, market_change)
     if is_trading_time() and st.session_state.get('send_key') and st.session_state.get('enable_page_monitor', False):
         fired = monitor_all_watchlist(st.session_state.send_key, market_change)
@@ -1599,5 +1731,6 @@ try:
                         message_placeholder.markdown(full_response)
                     st.session_state.messages.append({"role": "assistant", "content": full_response}); st.rerun()
 except Exception as _top_err:
+    _log("main", _top_err)
     st.error("❌ 主程序运行出错，请把下面的错误信息截图反馈：")
     st.code(traceback.format_exc(), language="python")
