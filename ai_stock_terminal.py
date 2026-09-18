@@ -9,8 +9,21 @@ import json
 import os
 import traceback
 import time as _time_module
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ✅ 时区修复：Streamlit Cloud 服务器是 UTC 时区，A股相关判断必须统一用北京时间
+CN_TZ = timezone(timedelta(hours=8))
+
+def now_cn():
+    """返回北京时间 datetime（部署在海外服务器上也能正确判断交易时段）"""
+    return datetime.now(CN_TZ)
+
+def now_cn_str(fmt='%Y-%m-%d %H:%M:%S'):
+    return now_cn().strftime(fmt)
+
+# ✅ 打开页面后默认显示的标的：中国巨石 (600176)
+DEFAULT_STOCK = '600176'
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -87,7 +100,7 @@ def load_watchlist():
             codes = [c.strip() for c in raw.split(",") if c.strip()]
             if codes: return codes
     except Exception: pass
-    return _load_json(WATCHLIST_FILE, ['515880', '159915'])
+    return _load_json(WATCHLIST_FILE, [DEFAULT_STOCK, '515880', '159915'])
 
 def save_watchlist(lst):
     try: _save_json(WATCHLIST_FILE, lst)
@@ -122,7 +135,7 @@ def save_dynamic_pool(pool_dict): _save_json(DYNAMIC_POOL_FILE, pool_dict)
 def _load_notify_log(): return _load_json(NOTIFY_LOG_FILE, {})
 def _save_notify_log(log): _save_json(NOTIFY_LOG_FILE, log)
 def _prune_notify_log(log):
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_cn().strftime('%Y-%m-%d')
     return {today: log.get(today, [])}
 
 def _price_bucket(price, pct=0.005):
@@ -136,12 +149,12 @@ def make_notify_key(symbol, signal_type, price): return f"{symbol}_{signal_type}
 
 def should_notify(symbol, signal_type, price):
     log = _prune_notify_log(_load_notify_log())
-    return make_notify_key(symbol, signal_type, price) not in log.get(datetime.now().strftime('%Y-%m-%d'), [])
+    return make_notify_key(symbol, signal_type, price) not in log.get(now_cn().strftime('%Y-%m-%d'), [])
 
 def mark_notified(symbol, signal_type, price):
     log = _prune_notify_log(_load_notify_log())
     key = make_notify_key(symbol, signal_type, price)
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_cn().strftime('%Y-%m-%d')
     if today not in log: log[today] = []
     if key not in log[today]: log[today].append(key)
     _save_notify_log(log)
@@ -170,8 +183,9 @@ def get_market_status():
     return 0.0
 
 def is_trading_time():
-    now = datetime.now().time()
-    return (time(9, 30) <= now <= time(11, 30)) or (time(13, 0) <= now <= time(15, 0))
+    # ✅ 必须用北京时间判断（云服务器是 UTC）
+    now = now_cn().time()
+    return (time(9, 25) <= now <= time(11, 32)) or (time(12, 58) <= now <= time(15, 2))
 
 def send_wechat_notification(send_key, title, content):
     if not send_key: return False
@@ -184,7 +198,7 @@ def send_wechat_notification(send_key, title, content):
 with st.sidebar:
     st.header("📈 自选股管理")
     if 'stock_list' not in st.session_state: st.session_state.stock_list = load_watchlist()
-    if 'current_stock' not in st.session_state: st.session_state.current_stock = st.session_state.stock_list[0] if st.session_state.stock_list else '515880'
+    if 'current_stock' not in st.session_state: st.session_state.current_stock = DEFAULT_STOCK
 
     with st.form("batch_add_form", clear_on_submit=True):
         new_stocks = st.text_input("批量添加股票代码", placeholder="例如: 512480, 159915 000001", label_visibility="collapsed")
@@ -202,7 +216,7 @@ with st.sidebar:
     st.markdown("---")
     
     if not st.session_state.stock_list:
-        st.info("暂无自选股，请添加"); st.session_state.current_stock = '515880'
+        st.info("暂无自选股，请添加"); st.session_state.current_stock = DEFAULT_STOCK
     else:
         for stock in st.session_state.stock_list:
             col_stock, col_del = st.columns([4, 1])
@@ -215,7 +229,7 @@ with st.sidebar:
                 if st.button("❌", key=f"del_{stock}"):
                     st.session_state.stock_list.remove(stock); save_watchlist(st.session_state.stock_list)
                     if st.session_state.current_stock == stock:
-                        st.session_state.current_stock = st.session_state.stock_list[0] if st.session_state.stock_list else '515880'
+                        st.session_state.current_stock = st.session_state.stock_list[0] if st.session_state.stock_list else DEFAULT_STOCK
                     st.rerun()
     st.markdown("---")
     st.header("⚙️ 参数设置")
@@ -236,6 +250,27 @@ with st.sidebar:
     st.text_input("Server酱 SendKey", type="password", key="send_key", on_change=on_send_key_change, help="去 sct.ftqq.com 免费注册获取")
     if _secrets_has_key("SERVERCHAN_KEY"): st.success("✅ 已从 Streamlit Secrets 读取 SendKey")
     elif st.session_state.send_key: st.info("💾 SendKey 来自本地文件（云端重启后会丢）")
+    st.markdown("---")
+    st.header("🔔 推送自检")
+    st.caption(f"🕐 北京时间 {now_cn().strftime('%Y-%m-%d %H:%M:%S')}")
+    st.caption("☁️ 关页面也能推送：已由 GitHub Actions 每 5 分钟云端巡检，与本页是否打开无关")
+    st.checkbox("本页也参与巡检（容易与云端重复推送，建议关闭）", value=False, key="enable_page_monitor")
+    if is_trading_time():
+        st.success("✅ 当前处于交易时段，监控运行中")
+    else:
+        st.info("⏸ 非交易时段，暂监控不做推送")
+    if st.session_state.get('enable_page_monitor', False):
+        st.success(f"✅ 网页巡检已开启，监控 {len(st.session_state.stock_list)} 只自选股")
+    else:
+        st.info("💡 网页巡检已关闭，推送由云端定时任务负责（无需打开本页）")
+    if st.session_state.get('last_monitor_time'):
+        st.caption(f"上次巡检: {st.session_state.last_monitor_time}（{st.session_state.get('last_monitor_count', 0)} 只）")
+    if st.button("🧪 发送测试推送", use_container_width=True, key="test_notify"):
+        if st.session_state.get('send_key'):
+            ok = send_wechat_notification(st.session_state.send_key, "【测试】做T助手连通性测试", f"北京时间 {now_cn_str('%Y-%m-%d %H:%M:%S')}\n收到这条说明微信推送链路正常。")
+            st.toast("✅ 测试推送已发送" if ok else "❌ 发送失败，检查 SendKey", icon="🔔")
+        else:
+            st.warning("请先填写 SendKey")
     st.markdown("---")
     if _secrets_has_key("WATCHLIST"): st.caption("📌 自选股来自 Streamlit Secrets")
 
@@ -364,11 +399,12 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     if not df_minute.empty:
         cur_price = df_minute['Price'].iloc[-1]; day_high = df_minute['Price'].max(); day_low = df_minute['Price'].min()
         atr = latest['ATR14'] if not pd.isna(latest['ATR14']) else cur_price * 0.02
-        now_time = datetime.now().time()
+        now_time = now_cn().time()
         if now_time < time(9, 30): intraday_high_predict = round(latest['Close'] + atr * 0.5, 3); intraday_low_predict = round(latest['Close'] - atr * 0.5, 3)
         elif now_time > time(15, 0): intraday_high_predict = day_high; intraday_low_predict = day_low
         else:
-            current_dt = datetime.combine(datetime.today(), now_time); start_am = datetime.combine(datetime.today(), time(9, 30)); end_am = datetime.combine(datetime.today(), time(11, 30)); start_pm = datetime.combine(datetime.today(), time(13, 0))
+            _today = now_cn().date()
+            current_dt = datetime.combine(_today, now_time); start_am = datetime.combine(_today, time(9, 30)); end_am = datetime.combine(_today, time(11, 30)); start_pm = datetime.combine(_today, time(13, 0))
             passed_minutes = (current_dt - start_am).total_seconds() / 60 if current_dt <= end_am else 120 + (current_dt - start_pm).total_seconds() / 60
             passed_minutes = max(passed_minutes, 1); remaining_minutes = max(240 - passed_minutes, 0)
             if passed_minutes > 10: realized_volatility_per_min = (day_high - day_low) / passed_minutes; remaining_range = realized_volatility_per_min * remaining_minutes
@@ -407,7 +443,7 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
             if "顶背离" in divergence_info: conf = "高"
             s_type = "正T高抛" if direction == "正T" else "反T减仓"
             best_sell = f"{time_fmt} | {best_row['Price']:.3f} | {s_type} | 冲高乖离均价线放量{divergence_info} | 置信度{conf}"
-    today_str = latest['Date'].strftime('%Y-%m-%d'); time_str = datetime.now().strftime('%H:%M'); market_status = f"上证 {market_change:+.2f}%"
+    today_str = latest['Date'].strftime('%Y-%m-%d'); time_str = now_cn().strftime('%H:%M'); market_status = f"上证 {market_change:+.2f}%"
     market_color = "color-green" if market_change >= 0 else "color-red"
     report = f"""
     <div class="report-row"><span class="color-blue">日期:</span> <span class="color-white">{today_str}</span><span class="color-blue">数据时间:</span> <span class="color-white">{time_str}</span><span class="color-blue">大盘:</span> <span class="{market_color}">{market_status}</span><span class="color-blue">阈值:</span> <span class="color-white">{deviation*100:.2f}%</span></div>
@@ -499,6 +535,14 @@ def _safe_float(v, default=0.0):
     except (TypeError, ValueError):
         return default
 
+def _diff_to_list(diff):
+    """东财接口有时返回列表、有时返回 {'0': {...}, '1': {...}} 字典，统一转成列表。"""
+    if isinstance(diff, dict):
+        try: return list(diff.values())
+        except Exception: return []
+    if isinstance(diff, list): return diff
+    return []
+
 @st.cache_data(ttl=300)
 def fetch_market_page(pn, pz=100):
     """分页拉取沪深 A 股列表（按主力资金流降序），单页失败只损失该页。"""
@@ -510,7 +554,7 @@ def fetch_market_page(pn, pz=100):
         res = requests.get(url, params=params, timeout=10, headers=_REQUEST_HEADERS)
         data = res.json()
         if data.get("data") and data["data"].get("diff"):
-            return data["data"]["diff"]
+            return _diff_to_list(data["data"]["diff"])
     except Exception:
         pass
     return []
@@ -527,7 +571,7 @@ def get_hot_money_stocks():
         res = requests.get(url, params=params, timeout=8, headers=_REQUEST_HEADERS)
         data = res.json()
         if data.get("data") and data["data"].get("diff"):
-            for item in data["data"]["diff"]:
+            for item in _diff_to_list(data["data"]["diff"]):
                 code_ = str(item.get("f12") or "")
                 if code_ and not code_.startswith(EXCLUDE_PREFIXES):
                     result[code_] = {'main_flow': _safe_float(item.get("f62")) / 1e8,
@@ -608,12 +652,13 @@ def _analyze_one(row, hot_money):
             return None
         score = 0; reasons = []
 
-        # 维度1：位置（20分）—— 50% 分位以下才参与
+        # 维度1：位置（最高20分）—— 越低分越高；>65% 分位只标记不淘汰（用于统计与保底展示）
         pos = metrics['Position250']
         if pos <= 25: score += 20; reasons.append(f"极度低位({pos}%)")
         elif pos <= 40: score += 15; reasons.append(f"低位区间({pos}%)")
         elif pos <= 50: score += 8; reasons.append(f"中低位({pos}%)")
-        else: return None  # 位置太高直接淘汰
+        elif pos <= 65: score += 4; reasons.append(f"中高位({pos}%)")
+        else: reasons.append(f"高位({pos}%)")
 
         # 维度2：技术指标（30分）
         if metrics['MACD_GOLDEN']: score += 15; reasons.append("MACD金叉")
@@ -635,16 +680,15 @@ def _analyze_one(row, hot_money):
         if metrics['Amplitude20'] <= 12: score += 10; reasons.append(f"窄幅蓄势(振幅{metrics['Amplitude20']}%)")
         elif metrics['Amplitude20'] <= 18: score += 5; reasons.append("适度整理")
 
-        if score >= 30 and main_flow > -0.5:
-            return {'Code': row['Code'], 'Name': row['Name'], 'Price': row['Price'],
-                    'ChangePct': row['ChangePct'], 'PE': row['PE'], 'TotalMv': row['TotalMv'],
-                    'Position250': pos, 'VolRatio': vr, 'Score': score,
-                    'Reasons': ' | '.join(reasons)}
+        hit = (score >= 25) and (main_flow > -1.0) and (pos <= 65)
+        return {'Code': row['Code'], 'Name': row['Name'], 'Price': row['Price'],
+                'ChangePct': row['ChangePct'], 'PE': row['PE'], 'TotalMv': row['TotalMv'],
+                'Position250': pos, 'VolRatio': vr, 'Score': score, 'MainFlow': main_flow,
+                'Hit': hit, 'Reasons': ' | '.join(reasons)}
     except Exception:
         return None
-    return None
 
-def screen_low_position_stocks(max_results=15, max_deep_scan=400):
+def screen_low_position_stocks(max_results=15, max_deep_scan=800):
     progress = st.progress(0, text="正在获取全市场列表...")
 
     # 1. 分页拉取全市场（按主力资金流降序，最多 60 页 x 100 只，单页失败自动跳过）
@@ -657,6 +701,7 @@ def screen_low_position_stocks(max_results=15, max_deep_scan=400):
         progress.progress(min(int(12 * pn / 60), 12), text=f"已拉取 {len(all_stocks)} 只（第 {pn} 页）...")
     if not all_stocks:
         progress.empty()
+        st.session_state.scan_stats = "❌ 东方财富接口无返回（可能被限流或海外IP拦截），请稍后重试"
         st.error("获取全市场数据失败：东方财富接口无返回（可能被限流，请稍后重试）。")
         return pd.DataFrame()
 
@@ -681,32 +726,58 @@ def screen_low_position_stocks(max_results=15, max_deep_scan=400):
                            'TotalMv': total_mv, 'MainFlow': _safe_float(s.get("f62")) / 1e8})
     if not candidates:
         progress.empty()
+        st.session_state.scan_stats = f"拉取 {len(all_stocks)} 只，但初筛后 0 只（接口数据异常）"
         st.warning("初筛后没有候选股票，请稍后重试。")
         return pd.DataFrame()
 
-    # 3. 并发深度分析（10 线程，约 30~60 秒完成）
+    # 3. 全市场均匀抽样深度分析（不再只扫当天资金榜前列，保证覆盖冷门低位股）
     progress.progress(15, text=f"初筛后候选 {len(candidates)} 只，并发深度分析中...")
     hot_money = get_hot_money_stocks()
-    to_scan = candidates[:max_deep_scan]
-    results = []
+    total_cand = len(candidates)
+    if total_cand <= max_deep_scan:
+        to_scan = candidates
+    else:
+        step = total_cand / max_deep_scan
+        picks = sorted(set(int(i * step) for i in range(max_deep_scan)))
+        to_scan = [candidates[i] for i in picks]
+        hot_part = candidates[:100]  # 资金榜前 100 名一定纳入
+        seen = set(x['Code'] for x in to_scan)
+        to_scan.extend([c for c in hot_part if c['Code'] not in seen])
+
+    scored = []
+    no_data = 0
     done = 0
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=16) as executor:
         futures = {executor.submit(_analyze_one, row, hot_money): row for row in to_scan}
         for future in as_completed(futures):
             done += 1
             if done % 20 == 0 or done == len(to_scan):
                 progress.progress(15 + int(80 * done / len(to_scan)),
-                                  text=f"深度分析 {done}/{len(to_scan)}（已入选 {len(results)} 只）")
+                                  text=f"深度分析 {done}/{len(to_scan)}（已入选 {len(scored)} 只）")
             r = future.result()
-            if r is not None:
-                results.append(r)
+            if r is None:
+                no_data += 1
+            else:
+                scored.append(r)
 
     progress.progress(100, text="✅ 扫描完成")
     progress.empty()
 
-    if not results:
+    high_pos = sum(1 for r in scored if r['Position250'] > 65)
+    hit = [r for r in scored if r['Hit']]
+    ranked = sorted(scored, key=lambda x: x['Score'], reverse=True)
+    relaxed = (len(hit) == 0) and (len(ranked) > 0)
+
+    st.session_state.scan_stats = (f"拉取 {len(all_stocks)} 只 → 初筛 {total_cand} 只 → 深度分析 {len(to_scan)} 只"
+                                   f"（K线失败 {no_data} 只 / 高位>65% {high_pos} 只）"
+                                   f" → 达门槛 {len(hit)} 只"
+                                   + ("　⚠️ 无人达标，已放宽展示全市场评分最高者" if relaxed else ""))
+    st.session_state.scan_relaxed = relaxed
+
+    if not scored:
         return pd.DataFrame()
-    df_result = pd.DataFrame(results).sort_values('Score', ascending=False).head(max_results).reset_index(drop=True)
+    df_source = ranked[:max_results] if relaxed else sorted(hit, key=lambda x: x['Score'], reverse=True)[:max_results]
+    df_result = pd.DataFrame(df_source).drop(columns=['Hit']).reset_index(drop=True)
     df_result.index = df_result.index + 1
     return df_result
 
@@ -728,11 +799,11 @@ def ai_stock_picker_ui():
         ⚠️ 本工具仅为量化初筛，不构成投资建议，请结合基本面深入研究。
         """)
 
-    if st.button("🔍 扫描全市场（约 30~60 秒）", type="primary", use_container_width=True, key="scan_stocks"):
+    if st.button("🔍 扫描全市场（约 1 分钟）", type="primary", use_container_width=True, key="scan_stocks"):
         try:
             with st.spinner("正在拉取全市场行情并进行多维度分析，请稍候..."):
                 st.session_state.scan_results = screen_low_position_stocks()
-                st.session_state.scan_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                st.session_state.scan_time = now_cn_str('%Y-%m-%d %H:%M:%S')
             st.rerun()
         except Exception:
             st.error("选股扫描出错（已自动拦截，不影响页面其他功能），错误详情：")
@@ -741,10 +812,16 @@ def ai_stock_picker_ui():
     if 'scan_results' in st.session_state:
         df_r = st.session_state.scan_results
         if df_r is None or df_r.empty:
+            if 'scan_stats' in st.session_state:
+                st.caption(f"📊 扫描漏斗: {st.session_state.scan_stats}")
             st.warning("本次扫描未找到符合条件的低位潜力股，可稍后（或收盘后）重试。")
         else:
             if 'scan_time' in st.session_state:
                 st.caption(f"上次扫描时间: {st.session_state.scan_time}")
+            if 'scan_stats' in st.session_state:
+                st.caption(f"📊 扫描漏斗: {st.session_state.scan_stats}")
+            if st.session_state.get('scan_relaxed'):
+                st.warning("⚠️ 本轮无人达到推荐门槛，以下为**全市场评分最高的若干只**（放宽展示），仅供参考，请勿据此交易。")
             for _, r in df_r.iterrows():
                 score_color = "#00cc66" if r['Score'] >= 70 else ("#f9e2af" if r['Score'] >= 50 else "#888")
                 chg_color = "#ff4b4b" if r['ChangePct'] >= 0 else "#00cc66"
@@ -869,15 +946,39 @@ def calculate_dynamic_score(symbol, full_data, industry_data, sentiment, hot_mon
     return {'score': min(100, score), 'reasons': ' | '.join(reasons[:8]), 'tags': tags}
 
 def refresh_dynamic_pool(max_candidates=30):
-    pool = load_dynamic_pool(); now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+    pool = load_dynamic_pool(); now_str = now_cn_str('%Y-%m-%d %H:%M')
     progress = st.progress(0, text="正在初始化动态池引擎...")
     progress.progress(5, text="正在评估市场情绪..."); sentiment = get_market_sentiment()
     progress.progress(12, text="正在分析行业景气度..."); industry_all = get_industry_prosperity()
     progress.progress(20, text="正在获取主力资金热度榜..."); hot_money = get_hot_money_stocks()
     
-    # ✅ 修复：把 set 切片错误改正
-    candidate_set = set(list(hot_money.keys())[:20]) | set([s for s in st.session_state.stock_list if not s.startswith(EXCLUDE_PREFIXES)])
-    candidates = list(candidate_set)[:max_candidates]
+    # ✅ 修复：候选来源多元化（自选股 + 资金热度榜前50 + 全市场均匀抽样），不再只剩自选股
+    def _collect_candidates(limit):
+        out, seen = [], set()
+        def add(c):
+            if c and c not in seen and not c.startswith(EXCLUDE_PREFIXES):
+                seen.add(c); out.append(c)
+        for s in st.session_state.stock_list: add(s)          # 自选股优先
+        for c in list(hot_money.keys())[:50]: add(c)          # 资金热度榜
+        try:
+            market_codes = []
+            for pn in range(1, 6):                            # 全市场抽样池
+                pg = fetch_market_page(pn)
+                if not pg: break
+                market_codes.extend([str(x.get("f12") or "") for x in pg])
+            market_codes = [c for c in market_codes if c and not c.startswith(EXCLUDE_PREFIXES)]
+            need = limit - len(out)
+            if need > 0 and market_codes:
+                if len(market_codes) > need:
+                    step = len(market_codes) / need
+                    for i in range(need):
+                        add(market_codes[min(int(i * step), len(market_codes) - 1)])
+                else:
+                    for c in market_codes: add(c)
+        except Exception: pass
+        return out[:limit]
+
+    candidates = _collect_candidates(max_candidates)
     progress.progress(25, text=f"候选池 {len(candidates)} 只，并发分析中...")
     
     def fetch_one(code_):
@@ -962,7 +1063,10 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
     cur_vol = latest['Volume']; vol_ma5 = latest['VOL_MA5'] if not pd.isna(latest.get('VOL_MA5', np.nan)) else 0; vol_ma10 = latest['VOL_MA10'] if not pd.isna(latest.get('VOL_MA10', np.nan)) else 0
     fig.add_annotation(xref="paper", yref="paper", x=0.005, y=0.275, text=f"<b>成交量</b>  {cur_vol/1e6:.2f}M   MA5:{vol_ma5/1e6:.2f}M   MA10:{vol_ma10/1e6:.2f}M", showarrow=False, xanchor='left', yanchor='top', font=dict(color='#89b4fa', size=11, family='Consolas'), bgcolor='rgba(0,0,0,0)', bordercolor='rgba(0,0,0,0)')
     fig.update_layout(template="plotly_dark", height=650, xaxis_rangeslider_visible=False, hovermode="x unified", dragmode='zoom', legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10), bgcolor='rgba(0,0,0,0)', bordercolor='rgba(0,0,0,0)'), margin=dict(t=50, l=10, r=10, b=10), uirevision=uirevision_key)
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], fixedrange=False, row=1, col=1); fig.update_xaxes(matches='x', row=2, col=1)
+    # 主图可自由缩放；成交量副图 X/Y 轴均锁定 → 完全跟随主图联动，不能独立缩放平移
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], fixedrange=False, row=1, col=1)
+    fig.update_xaxes(matches='x', row=2, col=1)
+    fig.update_xaxes(fixedrange=True, row=2, col=1)
     fig.update_yaxes(fixedrange=False, row=1, col=1); fig.update_yaxes(fixedrange=True, row=2, col=1)
     return fig
 
@@ -1018,9 +1122,13 @@ try:
         else: actual_deviation = 0.008
     else: actual_deviation = manual_dev
     report, ai_advice, t_guide, predict_text, buy_points, sell_points, context, best_buy, best_sell, latest = generate_report_and_advice(df_daily, df_minute, actual_deviation, market_change)
-    if is_trading_time() and st.session_state.get('send_key'):
+    if is_trading_time() and st.session_state.get('send_key') and st.session_state.get('enable_page_monitor', False):
         fired = monitor_all_watchlist(st.session_state.send_key, market_change)
+        st.session_state.last_monitor_time = now_cn_str('%H:%M:%S')
+        st.session_state.last_monitor_count = len(st.session_state.get('stock_list', []))
         for f in fired: st.toast(f, icon="🔔")
+    elif st.session_state.get('send_key') and not is_trading_time():
+        st.session_state.last_monitor_count = 0
     st.markdown(f'<div class="report-box">{report}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="ai-advice-box">🤖 <b>AI 实时建议</b><br>{ai_advice}</div>', unsafe_allow_html=True)
     col_g, col_p = st.columns(2)
