@@ -6,6 +6,7 @@ from plotly.subplots import make_subplots
 import requests
 import re
 import json
+import math
 import os
 import traceback
 import sys
@@ -98,7 +99,9 @@ def _load_json(path, default):
     try:
         if os.path.exists(path):
             with open(path, 'r', encoding='utf-8') as f: return json.load(f)
-    except Exception: pass
+    except Exception as e:
+        # 静默返回 default 会造成"配置/自选股莫名恢复出厂"这类无从排查的现象
+        _log(f"_load_json({os.path.basename(path)})", e)
     return default
 
 def _save_json(path, data):
@@ -113,19 +116,18 @@ def load_watchlist():
         if raw and isinstance(raw, str):
             codes = [c.strip() for c in raw.split(",") if c.strip()]
             if codes: return codes
-    except Exception: pass
+    except Exception: pass          # 本地无 secrets.toml 属预期情况，不刷日志
     return _load_json(WATCHLIST_FILE, [DEFAULT_STOCK, '515880', '159915'])
 
 def save_watchlist(lst):
-    try: _save_json(WATCHLIST_FILE, lst)
-    except Exception: pass
+    _save_json(WATCHLIST_FILE, lst)   # _save_json 内部已捕获并留痕，无需再包一层
 
 def load_config():
     cfg = _load_json(CONFIG_FILE, {})
     try:
         ak = st.secrets.get("DEEPSEEK_API_KEY", "")
         if ak and isinstance(ak, str): cfg['api_key'] = ak
-    except Exception: pass
+    except Exception: pass          # 同上：本地无 secrets.toml 属预期情况
     try:
         sk = st.secrets.get("SERVERCHAN_KEY", "")
         if sk and isinstance(sk, str): cfg['send_key'] = sk
@@ -133,8 +135,7 @@ def load_config():
     return cfg
 
 def save_config(cfg):
-    try: _save_json(CONFIG_FILE, cfg)
-    except Exception: pass
+    _save_json(CONFIG_FILE, cfg)      # _save_json 内部已捕获并留痕
 
 def _secrets_has_key(name):
     try:
@@ -177,9 +178,11 @@ def _prune_notify_log(log):
 def _price_bucket(price, pct=0.005):
     try:
         if price <= 0: return 0
-        import math
         return int(math.log(max(price, 0.001)) / math.log(1 + pct))
-    except Exception: return 0
+    except Exception as e:
+        # 坏价格落到 0 号桶会引发去重碰撞（该推的没推 / 重复推），必须留痕
+        _log("_price_bucket", e)
+        return 0
 
 def make_notify_key(symbol, signal_type, price): return f"{symbol}_{signal_type}_{_price_bucket(price)}"
 
@@ -292,8 +295,9 @@ def _cache_kline(code, df):
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(store, f, ensure_ascii=False)
         os.replace(tmp, KLINE_CACHE_FILE)
-    except Exception:
-        pass
+    except Exception as e:
+        # 缓存写失败本身不致命，但会导致"接口抖动时无法兜底"，必须留痕
+        _log("_cache_kline", e)
 
 def _load_cached_kline(code):
     """读磁盘缓存，返回 (df 或 None, 缓存时间字符串)。"""
@@ -308,7 +312,8 @@ def _load_cached_kline(code):
             df[c] = pd.to_numeric(df[c], errors='coerce')
         df = df.dropna(subset=['Date', 'Close']).sort_values('Date').reset_index(drop=True)
         return (df if len(df) else None), str(node.get("ts", ""))
-    except Exception:
+    except Exception as e:
+        _log("_load_cached_kline", e)
         return None, ""
 
 def _normalize_kline_rows(rows):
@@ -319,6 +324,8 @@ def _normalize_kline_rows(rows):
     try:
         df = pd.DataFrame(list(rows))
         if df.shape[1] < 6:
+            # 列数不足说明接口返回体变了（例：风控页/空壳 JSON），必须留痕而非静默"数据不足"
+            _log("_normalize_kline_rows", ValueError(f"列数不足: {df.shape[1]} < 6, 首行={str(rows[0])[:120]}"))
             return None
         df = df.iloc[:, :6]
         df.columns = ['Date', 'Open', 'Close', 'High', 'Low', 'Volume']
@@ -327,7 +334,8 @@ def _normalize_kline_rows(rows):
             df[c] = pd.to_numeric(df[c], errors='coerce')
         df = df.dropna(subset=['Date', 'Close']).sort_values('Date').reset_index(drop=True)
         return df if len(df) >= 30 else None
-    except Exception:
+    except Exception as e:
+        _log("_normalize_kline_rows", e)
         return None
 
 def _fetch_kline_qq(code, limit=640):
@@ -412,7 +420,9 @@ def get_market_status():
         parts = text.split("~")
         if len(parts) > 32:
             try: return float(parts[32])
-            except (TypeError, ValueError): pass
+            except (TypeError, ValueError) as e:
+                # 静默变 0.00% 会让"大盘暴跌时停止推送买点"的保护逻辑失效
+                _log("get_market_status:float(parts[32])", e)
     return 0.0
 
 def is_trading_time():
