@@ -30,6 +30,16 @@ CN_TZ = timezone(timedelta(hours=8))
 def now_cn():
     return datetime.now(CN_TZ)
 
+def _log(where, err):
+    """统一的可观测性出口：把原本被 except 静默吞掉的异常写到 stderr。
+
+    GitHub Actions 会把 stderr 收进运行日志，所以留痕 = 可排查。
+    凡是要吞异常，必须先经过这里留痕，禁止裸 `except: pass`。"""
+    try:
+        print(f"[watcher][{where}] {type(err).__name__}: {str(err)[:200]}", file=sys.stderr)
+    except Exception:
+        pass
+
 SEND_KEY = os.environ.get("SERVERCHAN_KEY", "").strip()
 WATCHLIST = [c.strip() for c in os.environ.get("WATCHLIST", "").replace("，", ",").split(",") if c.strip()]
 LOG_FILE = os.environ.get("NOTIFY_LOG", "notify_log.json")
@@ -120,8 +130,9 @@ def get_market_change():
         if len(parts) > 32:
             try:
                 return float(parts[32])
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as e:
+                # 解析失败会静默变成 0.00%，进而影响"大盘暴跌不推送"的门槛判断
+                _log("get_market_change:float(parts[32])", e)
     return 0.0
 
 def send_wechat(title, content):
@@ -142,7 +153,9 @@ def price_bucket(price, pct=0.005):
         if price <= 0:
             return 0
         return int(math.log(max(price, 0.001)) / math.log(1 + pct))
-    except Exception:
+    except Exception as e:
+        # 坏价格落到 0 号桶会引发去重碰撞（该推的没推 / 重复推），必须留痕
+        _log("price_bucket", e)
         return 0
 
 def load_log():
@@ -150,8 +163,9 @@ def load_log():
         if os.path.exists(LOG_FILE):
             with open(LOG_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
-    except Exception:
-        pass
+    except Exception as e:
+        # 日志损坏会让去重记录整体归零 → 全天重复推送
+        _log("load_log", e)
     return {}
 
 def save_log(log):
