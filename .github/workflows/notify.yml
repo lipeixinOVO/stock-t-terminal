@@ -1,0 +1,65 @@
+name: A股做T信号定时巡检
+
+# 说明：GitHub Actions 的 cron 使用 UTC 时间。
+# 北京时间 9:25-15:05 对应 UTC 1:25-7:05（周一至周五），
+# 所以这里覆盖 UTC 1:00-7:55（即北京 9:00-15:55），
+# 脚本内部还会按北京时间精确校验交易时段，非交易时段会自动跳过。
+on:
+  schedule:
+    - cron: "*/5 1-7 * * 1-5"
+  workflow_dispatch:  # 允许在 Actions 页面手动点「Run workflow」立即测试
+    inputs:
+      force:
+        description: "非交易时段也强制执行（仅用于测试链路是否正常）"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install requests pandas numpy
+
+      - name: 计算今日缓存键（北京日期）
+        id: ckey
+        run: echo "key=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      - name: 恢复去重记录（跨运行保留，避免同一信号重复推送）
+        uses: actions/cache/restore@v4
+        with:
+          path: notify_log.json
+          key: notify-log-${{ steps.ckey.outputs.key }}-${{ github.run_id }}
+          restore-keys: |
+            notify-log-
+
+      - name: 执行巡检推送
+        env:
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          WATCHLIST: ${{ secrets.WATCHLIST }}
+          ALERT_WINDOW_MIN: "10"
+          FORCE_RUN: ${{ github.event.inputs.force == 'true' && '1' || '0' }}
+        run: python watcher.py
+
+      - name: 保证去重记录存在
+        if: always()
+        run: |
+          if [ ! -f notify_log.json ]; then echo '{}' > notify_log.json; fi
+          echo "---- 当前去重记录 ----"
+          cat notify_log.json
+
+      - name: 保存去重记录
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: notify_log.json
+          key: notify-log-${{ steps.ckey.outputs.key }}-${{ github.run_id }}
