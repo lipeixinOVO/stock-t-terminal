@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
 import re
+import base64
 import json
 import math
 import os
@@ -94,6 +95,10 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 DYNAMIC_POOL_FILE = os.path.join(BASE_DIR, "dynamic_pool.json")
 NOTIFY_LOG_FILE = os.path.join(BASE_DIR, "notify_log.json")
 BAND_MANUAL_FILE = os.path.join(BASE_DIR, "band_manual_list.json")
+# 波段记忆：把扫描出的「值得跟踪」的股票持久化，并记录状态变化轨迹。
+# ⚠️ 本文件含隐私（手写备注、入选价），**只留在本地容器，禁止提交**（已加入 .gitignore）。
+#    巡检需要的脱敏摘要另存为仓库里的 band_watch.json，见 _band_memory_digest()。
+BAND_MEMORY_FILE = os.path.join(BASE_DIR, "band_memory.json")
 
 def _load_json(path, default):
     try:
@@ -495,6 +500,21 @@ with st.sidebar:
     st.text_input("Server酱 SendKey", type="password", key="send_key", on_change=on_send_key_change, help="去 sct.ftqq.com 免费注册获取")
     if _secrets_has_key("SERVERCHAN_KEY"): st.success("✅ 已从 Streamlit Secrets 读取 SendKey")
     elif st.session_state.send_key: st.info("💾 SendKey 来自本地文件（云端重启后会丢）")
+
+    st.markdown("---")
+    st.subheader("🧠 波段记忆同步")
+    if 'github_token' not in st.session_state: st.session_state.github_token = config.get('github_token', '')
+    def on_gh_token_change(): save_config({**load_config(), 'github_token': st.session_state.github_token})
+    st.text_input("GitHub Token", type="password", key="github_token", on_change=on_gh_token_change,
+                  help="用于把「波段记忆」同步到仓库，让云端巡检能按记忆里的清单推送微信。"
+                       "建议放到 Streamlit Secrets 的 GITHUB_TOKEN，更安全。")
+    if _secrets_has_key("GITHUB_TOKEN"):
+        st.success("✅ 已从 Streamlit Secrets 读取 GitHub Token")
+    elif st.session_state.github_token:
+        st.info("💾 Token 来自本地文件（云端重启后会丢，建议改用 Streamlit Secrets）")
+    else:
+        st.caption("未配置 → 记忆只存在本容器，关页面后云端不会推送")
+
     st.markdown("---")
     st.header("🔔 推送自检")
     st.caption(f"🕐 北京时间 {now_cn().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1002,58 +1022,79 @@ def _band_status(metrics):
         return '波段进行中', '#f9e2af'
     return '波段未形成', '#888'
 
+def _band_score(m):
+    """波段打分与理由。单一来源：选股排序和记忆跟踪都走这里，避免两套打分漂移。"""
+    score = 0; reasons = []
+    if m['breakout']:
+        score += 35; reasons.append(f"突破{m['lookback']}日平台")
+    elif m['current'] >= m['platform_high'] * 0.97:
+        score += 15; reasons.append("接近平台突破")
+
+    if m['volume_expansion']:
+        score += 25; reasons.append(f"放量({m['vol_ratio']:.1f}倍)")
+    elif m['vol_ratio'] >= 1.2:
+        score += 10; reasons.append(f"量能放大({m['vol_ratio']:.1f}倍)")
+
+    if m['current'] > m['ma20'] > m['ma60']:
+        score += 15; reasons.append("均线多头排列")
+    elif m['current'] > m['ma20']:
+        score += 8; reasons.append("站上20日线")
+
+    if m['macd_golden']:
+        score += 15; reasons.append("MACD金叉")
+    elif m['macd'] > 0:
+        score += 5; reasons.append("MACD红柱")
+
+    if m['position_pct'] <= 50:
+        score += 10; reasons.append(f"低位({m['position_pct']:.0f}%)")
+    elif m['position_pct'] <= 75:
+        score += 5; reasons.append(f"中位({m['position_pct']:.0f}%)")
+
+    if m['top_divergence']:
+        score -= 40; reasons.append("⚠️顶背离")
+    if m['below_support']:
+        score -= 40; reasons.append("⚠️跌破20日线")
+    return score, reasons
+
+def _band_evaluate(code, name='', price=0.0, change_pct=0.0):
+    """核心波段评估：**不做分数过滤**，只要数据够就给结论。
+
+    选股（_analyze_band）和「波段记忆」的状态刷新都复用它。
+    差别只在：选股要过滤掉没有波段特征的票，记忆跟踪则必须拿到真实状态。
+    返回 dict 或 None（数据不足）。"""
+    df = _get_daily_history(code)
+    if df is None or len(df) < 60:
+        return None
+    m = _calculate_band_metrics(df)
+    if m is None:
+        return None
+    score, reasons = _band_score(m)
+    status, color = _band_status(m)
+    return {
+        'Code': str(code), 'Name': name or str(code),
+        # 没有实时行情时（记忆刷新场景）退化为最新收盘价，避免显示成 0
+        'Price': float(price) if float(price or 0) > 0 else m['current'],
+        'ChangePct': float(change_pct or 0.0),
+        'Score': max(0, score), 'Status': status, 'StatusColor': color,
+        'MA20': m['ma20'], 'MA60': m['ma60'],
+        'PlatformHigh': m['platform_high'], 'PlatformLow': m['platform_low'],
+        'VolRatio': m['vol_ratio'], 'Position250': round(m['position_pct'], 1),
+        'Reasons': ' | '.join(reasons), 'LastClose': m['current'],
+        'Breakout': bool(m['breakout']), 'VolumeExpansion': bool(m['volume_expansion']),
+        'TopDivergence': bool(m['top_divergence']), 'BelowSupport': bool(m['below_support']),
+    }
+
 def _analyze_band(row):
-    """单只股票的波段分析，异常只丢该股票。"""
+    """单只股票的波段分析（带筛选，供选股用）。异常只丢该股票。"""
     try:
-        df = _get_daily_history(row['Code'])
-        if df is None or len(df) < 60:
+        r = _band_evaluate(row.get('Code'), row.get('Name', ''),
+                           row.get('Price', 0.0), row.get('ChangePct', 0.0))
+        if r is None:
             return None
-        m = _calculate_band_metrics(df)
-        if m is None:
-            return None
-
-        score = 0; reasons = []
-        if m['breakout']:
-            score += 35; reasons.append(f"突破{m['lookback']}日平台")
-        elif m['current'] >= m['platform_high'] * 0.97:
-            score += 15; reasons.append("接近平台突破")
-
-        if m['volume_expansion']:
-            score += 25; reasons.append(f"放量({m['vol_ratio']:.1f}倍)")
-        elif m['vol_ratio'] >= 1.2:
-            score += 10; reasons.append(f"量能放大({m['vol_ratio']:.1f}倍)")
-
-        if m['current'] > m['ma20'] > m['ma60']:
-            score += 15; reasons.append("均线多头排列")
-        elif m['current'] > m['ma20']:
-            score += 8; reasons.append("站上20日线")
-
-        if m['macd_golden']:
-            score += 15; reasons.append("MACD金叉")
-        elif m['macd'] > 0:
-            score += 5; reasons.append("MACD红柱")
-
-        if m['position_pct'] <= 50:
-            score += 10; reasons.append(f"低位({m['position_pct']:.0f}%)")
-        elif m['position_pct'] <= 75:
-            score += 5; reasons.append(f"中位({m['position_pct']:.0f}%)")
-
-        if m['top_divergence']:
-            score -= 40; reasons.append("⚠️顶背离")
-        if m['below_support']:
-            score -= 40; reasons.append("⚠️跌破20日线")
-
         # 只保留有明显波段特征的股票：启动确认、进行中、或出现结束预警
-        if score < 20 and not m['breakout'] and not m['top_divergence'] and not m['below_support']:
+        if r['Score'] < 20 and not r['Breakout'] and not r['TopDivergence'] and not r['BelowSupport']:
             return None
-
-        status, color = _band_status(m)
-        return {
-            'Code': row['Code'], 'Name': row['Name'], 'Price': row['Price'], 'ChangePct': row['ChangePct'],
-            'Score': max(0, score), 'Status': status, 'StatusColor': color,
-            'MA20': m['ma20'], 'PlatformHigh': m['platform_high'], 'VolRatio': m['vol_ratio'],
-            'Position250': round(m['position_pct'], 1), 'Reasons': ' | '.join(reasons)
-        }
+        return r
     except Exception as e:
         _log(f"_analyze_band/{row.get('Code', '?')}", e)
         return None
@@ -1061,6 +1102,8 @@ def _analyze_band(row):
 def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None):
     """波段选股主函数：全市场扫描或基于自定义股票列表，筛选突破平台+放量的波段启动股，并预警结束信号。"""
     progress = st.progress(0, text="正在获取股票列表...")
+    # 原始结果（list[dict]）留给「波段记忆」做自动入册；DataFrame 只用于展示
+    st.session_state.band_last_raw = []
 
     candidates = []; all_stocks = []
     if custom_codes:
@@ -1171,7 +1214,686 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None):
                                    f"深度分析 {len(to_scan)} 只（K线失败 {no_data} 只）→ 有效 {len(scored)} 只")
     df = pd.DataFrame(scored_sorted).head(max_results).reset_index(drop=True)
     df.index = df.index + 1
+    st.session_state.band_last_raw = scored_sorted   # 供记忆层自动入册（不受 max_results 截断影响）
     return df
+
+# ============ 波段记忆（Band Memory）============
+# 解决的问题：波段扫描结果原本只活在 st.session_state 里，刷新即丢，
+# 而且 Streamlit Cloud 容器重启后文件也会清空 —— 「过几天就不知道是哪个了」。
+# 方案：扫描时自动把值得跟踪的股票记入 band_memory.json，记录状态变化轨迹，
+#       并同步到 GitHub 仓库，让云端巡检脚本（watcher.py）能在你关掉页面时也推送微信。
+#
+# ⚠️ 下列状态常量必须与 watcher.py 中的同名常量保持一致。
+BAND_MEMORY_VERSION = 1
+BAND_ALERT_STATUSES = ('顶背离预警', '跌破支撑')        # 波段结束预警：需要止盈/止损
+BAND_ENTRY_STATUSES = ('波段启动确认',)                 # 波段启动：值得关注/参与
+BAND_AUTO_MEMO_STATUSES = BAND_ENTRY_STATUSES + BAND_ALERT_STATUSES
+# 状态层级：用于判断是「变好」还是「恶化」，从而决定要不要打扰用户
+BAND_STATUS_LEVEL = {'波段未形成': 0, '波段进行中': 1, '波段启动确认': 2,
+                     '跌破支撑': 3, '顶背离预警': 4}
+BAND_MEMORY_HISTORY_MAX = 40    # 每只股票最多保留的轨迹条数，防止文件无限膨胀
+
+GITHUB_REPO = "lipeixinOVO/stock-t-terminal"
+# 提交到仓库的是「脱敏摘要」；完整记忆（含备注/入选价）只留在本地容器。
+# ⚠️ 本仓库是 public，所以两个文件职责必须严格区分，不要把 band_memory.json 提交上去。
+GITHUB_WATCH_PATH = "band_watch.json"
+
+
+def _band_memory_empty():
+    return {"version": BAND_MEMORY_VERSION, "updated_at": now_cn_str(), "stocks": {}}
+
+def load_band_memory():
+    """读记忆文件；结构异常时重置而不是抛异常。"""
+    mem = _load_json(BAND_MEMORY_FILE, _band_memory_empty())
+    if not isinstance(mem, dict) or not isinstance(mem.get("stocks"), dict):
+        _log("load_band_memory", ValueError("band_memory.json 结构异常，已重置"))
+        return _band_memory_empty()
+    mem.setdefault("version", BAND_MEMORY_VERSION)
+    mem.setdefault("stocks", {})
+    return mem
+
+def save_band_memory(mem):
+    mem["updated_at"] = now_cn_str()
+    mem["version"] = BAND_MEMORY_VERSION
+    _save_json(BAND_MEMORY_FILE, mem)
+
+def _band_memory_trim(node):
+    """轨迹裁剪：只留最近的若干条，长期使用不会把文件撑大。"""
+    h = node.get("history")
+    if isinstance(h, list) and len(h) > BAND_MEMORY_HISTORY_MAX:
+        node["history"] = h[-BAND_MEMORY_HISTORY_MAX:]
+
+def _band_memory_apply(node, r, event):
+    """把一次评估结果写进记忆节点。状态变化时追加轨迹。返回是否发生状态变化。"""
+    new_status = r.get('Status')
+    if not new_status:
+        return False
+    node['name'] = r.get('Name') or node.get('name') or node.get('code')
+    node['price'] = float(r.get('Price') or node.get('price') or 0.0)
+    node['score'] = r.get('Score', node.get('score', 0))
+    node['ma20'] = r.get('MA20', node.get('ma20', 0.0))
+    node['reasons'] = r.get('Reasons', node.get('reasons', ''))
+    node['last_check'] = now_cn_str()
+    old_status = node.get('status')
+    if new_status == old_status:
+        return False
+    node['status'] = new_status
+    node['status_ts'] = now_cn_str()
+    node.setdefault('history', []).append({
+        "ts": node['status_ts'], "status": new_status,
+        "price": node.get('price', 0.0), "score": node.get('score', 0),
+        "ma20": node.get('ma20', 0.0), "reasons": node.get('reasons', ''),
+        "event": event,
+    })
+    _band_memory_trim(node)
+    return True
+
+def _band_alert_decision(old_status, new_status):
+    """状态变化要不要打扰用户？返回 'end'（波段结束预警）/ 'start'（波段启动）/ None。
+
+    只对这两类变化高亮/推送，其余仅记录，否则天天刷屏。
+    ⚠️ 必须与 watcher.py 的同名函数保持同一规则（有跨文件一致性测试守着）。"""
+    if new_status in BAND_ALERT_STATUSES and old_status not in BAND_ALERT_STATUSES:
+        return "end"
+    if old_status == '波段未形成' and new_status == '波段启动确认':
+        return "start"
+    return None
+
+
+def band_memory_record(mem, rows, source):
+    """把本次扫描结果中「值得跟踪」的股票写入记忆。返回新增代码列表。
+
+    只记 BAND_AUTO_MEMO_STATUSES（波段启动确认 / 顶背离预警 / 跌破支撑），
+    其余状态不进记忆 —— 否则每扫一次就堆十几只，很快变成噪音。"""
+    added = []
+    for r in (rows or []):
+        code = str(r.get('Code') or '').strip()
+        if not code or r.get('Status') not in BAND_AUTO_MEMO_STATUSES:
+            continue
+        node = mem['stocks'].get(code)
+        if node is None:
+            node = {
+                "code": code, "name": r.get('Name') or code,
+                "added_at": now_cn_str(), "added_price": float(r.get('Price') or 0.0),
+                "added_status": r.get('Status'), "added_source": source,
+                "snapshot": {
+                    "score": r.get('Score', 0), "ma20": r.get('MA20', 0.0),
+                    "platform_high": r.get('PlatformHigh', 0.0),
+                    "vol_ratio": r.get('VolRatio', 0.0),
+                    "position250": r.get('Position250', 0.0),
+                    "reasons": r.get('Reasons', ''),
+                },
+                "note": "", "closed": False, "alerts": {}, "history": [],
+            }
+            mem['stocks'][code] = node
+            added.append(code)
+            _band_memory_apply(node, r, event=f"入选记忆（{source}）")
+        else:
+            # 已记住的：后续扫描发现状态变化（例如 启动确认 → 跌破支撑）也要记下来
+            _band_memory_apply(node, r, event=f"扫描刷新（{source}）")
+    return added
+
+def band_memory_refresh(mem, codes=None):
+    """重新拉取记忆内股票的当前波段状态（并发）。返回 (mem, changes)。
+
+    changes 只包含**状态发生变化**的条目，供页面高亮提醒。"""
+    targets = [c for c in (codes or list(mem['stocks'].keys()))
+               if c in mem['stocks'] and not mem['stocks'][c].get('closed')]
+    changes = []
+    if not targets:
+        return mem, changes
+    def _one(code):
+        try:
+            node = mem['stocks'].get(code) or {}
+            return code, _band_evaluate(code, node.get('name') or code)
+        except Exception as e:
+            _log(f"band_memory_refresh/{code}", e)
+            return code, None
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(_one, c) for c in targets]
+        for fut in as_completed(futures):
+            try:
+                code, r = fut.result()
+            except Exception as e:
+                _log("band_memory_refresh/future", e)
+                continue
+            node = mem['stocks'].get(code)
+            if r is None or node is None:
+                if node is not None:
+                    node['last_check'] = now_cn_str()
+                continue
+            old_status = node.get('status')
+            if _band_memory_apply(node, r, event="状态刷新"):
+                changes.append({
+                    "code": code, "name": node.get('name'),
+                    "from": old_status, "to": r.get('Status'),
+                    "price": r.get('Price', 0.0), "reasons": r.get('Reasons', ''),
+                    "alert": _band_alert_decision(old_status, r.get('Status')),
+                    "worsened": BAND_STATUS_LEVEL.get(r.get('Status'), 0)
+                                > BAND_STATUS_LEVEL.get(old_status, 0),
+                })
+    save_band_memory(mem)
+    return mem, changes
+
+def band_memory_stats(mem):
+    stocks = (mem or {}).get('stocks', {}) or {}
+    active = [n for n in stocks.values() if not n.get('closed')]
+    return {
+        "total": len(stocks),
+        "active": len(active),
+        "alert": sum(1 for n in active if n.get('status') in BAND_ALERT_STATUSES),
+        "entry": sum(1 for n in active if n.get('status') in BAND_ENTRY_STATUSES),
+    }
+
+def _github_token():
+    """GitHub Token 的三级读取：环境变量 → 本地 config.json → Streamlit Secrets。"""
+    for env_key in ("GITHUB_TOKEN", "GH_TOKEN"):
+        v = os.environ.get(env_key)
+        if v and v.strip():
+            return v.strip()
+    v = (load_config() or {}).get("github_token")
+    if v and str(v).strip():
+        return str(v).strip()
+    try:
+        v = st.secrets.get("GITHUB_TOKEN", "")
+        if v and str(v).strip():
+            return str(v).strip()
+    except Exception:
+        pass
+    return ""
+
+def _github_headers(token):
+    return {"Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "stock-t-terminal"}
+
+def _band_memory_digest(mem):
+    """从完整记忆里提取「可公开」的最小摘要，用于提交到仓库。
+
+    ⚠️ 为什么必须脱敏：本项目的 GitHub 仓库是 **public** 的。完整记忆里包含
+    用户手写的备注（例如「14.20 买了2成」这一类的持仓信息）和入选价、扫描快照，
+    这些东西一旦提交就等于公开自己的持仓思路。所以只同步巡检真正需要的字段：
+    代码、名称、当前状态、状态时间、轨迹（时间/状态/当时市价）、去重记录。
+    市价是公开行情数据，不涉及隐私；备注与入选价永远留在本地容器。"""
+    digest = {"version": BAND_MEMORY_VERSION, "updated_at": now_cn_str(), "stocks": {}}
+    for code, node in (mem.get('stocks') or {}).items():
+        if not isinstance(node, dict):
+            continue
+        hist = []
+        for h in (node.get('history') or []):
+            if not isinstance(h, dict):
+                continue
+            hist.append({k: h.get(k) for k in ("ts", "status", "price", "ma20", "event")
+                         if h.get(k) is not None})
+        digest["stocks"][code] = {
+            "code": node.get("code", code),
+            "name": node.get("name", ""),
+            "status": node.get("status", ""),
+            "status_ts": node.get("status_ts", ""),
+            "last_check": node.get("last_check", ""),
+            "closed": bool(node.get("closed")),
+            "alerts": dict(node.get("alerts") or {}),
+            "history": hist,
+        }
+    return digest
+
+def band_memory_merge_digest(local, digest):
+    """把仓库里的摘要合并回本地完整记忆。
+
+    只吸收「状态 / 状态时间 / 轨迹 / 归档」这些巡检能产出的信息；
+    **备注、入选价、扫描快照一律保留本地值**，绝不被云端覆盖。
+    """
+    out = _band_memory_empty()
+    local_stocks = dict((local or {}).get('stocks') or {})
+    remote_stocks = (digest or {}).get('stocks') or {}
+    out['stocks'] = local_stocks
+
+    for code, r_node in remote_stocks.items():
+        if not isinstance(r_node, dict):
+            continue
+        l_node = local_stocks.get(code)
+        if l_node is None:
+            # 云端有、本地没有（一般是容器重启后本地丢过）：按摘要重建一条最小记录
+            node = {
+                "code": code, "name": r_node.get("name") or code,
+                "added_at": r_node.get("status_ts") or "",
+                "added_price": None, "added_status": r_node.get("status") or "",
+                "added_source": "云端巡检", "snapshot": {}, "note": "",
+                "closed": bool(r_node.get("closed")),
+                "status": r_node.get("status") or "", "status_ts": r_node.get("status_ts") or "",
+                "price": None, "history": [],
+            }
+            for h in (r_node.get("history") or []):
+                if isinstance(h, dict):
+                    node["history"].append(dict(h))
+            out['stocks'][code] = node
+            continue
+
+        # 两边都有：状态取 status_ts 较新的一方
+        if str(r_node.get("status_ts") or "") > str(l_node.get("status_ts") or ""):
+            l_node["status"] = r_node.get("status") or l_node.get("status")
+            l_node["status_ts"] = r_node.get("status_ts") or l_node.get("status_ts")
+        if r_node.get("last_check"):
+            l_node["last_check"] = r_node["last_check"]
+        if not l_node.get("name"):
+            l_node["name"] = r_node.get("name") or code
+        # 轨迹并集（按 时间+状态 去重；云端条目缺价格时保留本地已有的价格）
+        seen = {(str(h.get("ts", "")), str(h.get("status", "")))
+                for h in (l_node.get("history") or []) if isinstance(h, dict)}
+        for h in (r_node.get("history") or []):
+            if not isinstance(h, dict):
+                continue
+            key = (str(h.get("ts", "")), str(h.get("status", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            l_node.setdefault("history", []).append(dict(h))
+        l_node["history"] = sorted((l_node.get("history") or []),
+                                   key=lambda x: str(x.get("ts", "")))[-BAND_MEMORY_HISTORY_MAX:]
+        # 各告警的最近推送时间去重合并，避免两端各推一次
+        alerts = dict(l_node.get("alerts") or {})
+        for k, v in (r_node.get("alerts") or {}).items():
+            if k not in alerts or str(v) > str(alerts[k]):
+                alerts[k] = v
+        l_node["alerts"] = alerts
+        # closed 以本地为准（用户手动归档的意图不能被云端覆盖）
+    return out
+
+def _fetch_remote_memory():
+    """拉取仓库里的「波段摘要」。返回 (ok, msg, digest 或 None)。"""
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_WATCH_PATH}"
+    try:
+        r = requests.get(url, headers=_github_headers(_github_token()),
+                         params={"ref": "main"}, timeout=(5, 15))
+        if r.status_code == 404:
+            return False, f"仓库里还没有 {GITHUB_WATCH_PATH}（首次同步时创建）", None
+        if r.status_code != 200:
+            return False, f"拉取失败 HTTP {r.status_code}: {r.text[:120]}", None
+        raw = base64.b64decode(r.json().get("content") or "").decode("utf-8", errors="replace")
+        digest = json.loads(raw)
+        if not isinstance(digest, dict) or not isinstance(digest.get("stocks"), dict):
+            return False, "仓库里的波段摘要结构异常，已忽略", None
+        return True, f"{len(digest.get('stocks', {}))} 只", digest
+    except Exception as e:
+        _log("_fetch_remote_memory", e)
+        return False, f"拉取异常：{type(e).__name__}: {str(e)[:100]}", None
+
+def band_memory_pull_github():
+    """从仓库拉取波段摘要并合并进本地记忆。返回 (ok, msg, merged_local_mem 或 None)。"""
+    if not _github_token():
+        return False, "未配置 GitHub Token", None
+    ok, msg, digest = _fetch_remote_memory()
+    if not ok or digest is None:
+        return ok, msg, None
+    return True, f"已拉取云端摘要（{msg}）", band_memory_merge_digest(load_band_memory(), digest)
+
+def band_memory_push_github(mem, merge_remote=True):
+    """把「脱敏摘要」提交到仓库。返回 (ok, msg)。
+
+    merge_remote=True 时先拉取云端摘要并合并（原地更新 mem），这样巡检脚本写入的
+    状态变化不会被网页端覆盖。冲突（409/422）时重取 sha 再试一次。
+
+    ⚠️ 提交的是 _band_memory_digest(mem)，**不含备注/入选价**（仓库是 public 的）。"""
+    token = _github_token()
+    if not token:
+        return False, "未配置 GitHub Token（在 Streamlit Secrets 加 GITHUB_TOKEN 即可自动同步）"
+    if merge_remote:
+        ok, _msg, digest = _fetch_remote_memory()
+        if ok and digest is not None:
+            merged = band_memory_merge_digest(mem, digest)
+            mem.clear(); mem.update(merged)      # 原地更新，保持调用方引用有效
+            _save_json(BAND_MEMORY_FILE, mem)
+    payload_obj = _band_memory_digest(mem)
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_WATCH_PATH}"
+    content = base64.b64encode(json.dumps(payload_obj, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii")
+    n = len(payload_obj.get('stocks', {}))
+    for attempt in (1, 2):
+        try:
+            sha = None
+            r = requests.get(url, headers=_github_headers(token),
+                             params={"ref": "main"}, timeout=(5, 15))
+            if r.status_code == 200:
+                sha = r.json().get("sha")
+            body = {"message": f"更新波段记忆（{n} 只）",
+                    "content": content, "branch": "main"}
+            if sha:
+                body["sha"] = sha
+            r = requests.put(url, headers=_github_headers(token), json=body, timeout=(5, 25))
+            if r.status_code in (200, 201):
+                return True, f"已同步到仓库（{n} 只），云端巡检将按此清单监控"
+            if r.status_code in (409, 422) and attempt == 1:
+                continue    # sha 过期（云端巡检刚提交过），重取后再试一次
+            return False, f"同步失败 HTTP {r.status_code}: {r.text[:150]}"
+        except Exception as e:
+            _log("band_memory_push_github", e)
+            if attempt == 2:
+                return False, f"同步异常：{type(e).__name__}: {str(e)[:100]}"
+    return False, "同步失败"
+
+
+def band_memory_merge(local, remote):
+    """合并本地与云端的记忆：并集；同一只股票取 status_ts 较新者为主体，
+    再补上对方的轨迹条数，备注/归档状态以本地（用户手动操作）为准。"""
+    out = _band_memory_empty()
+    local_stocks = (local or {}).get('stocks', {}) or {}
+    remote_stocks = (remote or {}).get('stocks', {}) or {}
+    for code in set(local_stocks) | set(remote_stocks):
+        l_node, r_node = local_stocks.get(code), remote_stocks.get(code)
+        if l_node and not r_node:
+            out['stocks'][code] = l_node; continue
+        if r_node and not l_node:
+            out['stocks'][code] = r_node; continue
+        # 两边都有：以 status_ts 较新的为主体
+        base = l_node if str(l_node.get('status_ts', '')) >= str(r_node.get('status_ts', '')) else r_node
+        other = r_node if base is l_node else l_node
+        merged = dict(base)
+        # 轨迹取并集（按时间+状态去重后排序）
+        seen, hist = set(), []
+        for item in list(l_node.get('history') or []) + list(r_node.get('history') or []):
+            if not isinstance(item, dict):
+                continue
+            k = (str(item.get('ts', '')), str(item.get('status', '')))
+            if k in seen:
+                continue
+            seen.add(k); hist.append(item)
+        hist.sort(key=lambda x: str(x.get('ts', '')))
+        merged['history'] = hist[-BAND_MEMORY_HISTORY_MAX:]
+        # 用户手动维护的字段以本地为准
+        merged['note'] = l_node.get('note') or r_node.get('note') or ""
+        merged['closed'] = bool(l_node.get('closed'))
+        merged['added_at'] = l_node.get('added_at') or r_node.get('added_at')
+        merged['added_price'] = l_node.get('added_price', r_node.get('added_price', 0.0))
+        merged['added_status'] = l_node.get('added_status') or r_node.get('added_status')
+        merged['added_source'] = l_node.get('added_source') or r_node.get('added_source')
+        merged['snapshot'] = l_node.get('snapshot') or r_node.get('snapshot') or {}
+        # 各告警的最近推送时间去重合并，避免两端各推一次
+        alerts = dict(r_node.get('alerts') or {})
+        for k, v in (l_node.get('alerts') or {}).items():
+            if k not in alerts or str(v) > str(alerts[k]):
+                alerts[k] = v
+        merged['alerts'] = alerts
+        merged['name'] = l_node.get('name') or r_node.get('name') or other.get('name')
+        out['stocks'][code] = merged
+    return out
+
+
+def _fmt_price(v, digits=2):
+    """价格格式化：缺失/为 0 时显示「—」而不是误导性的 0.00。
+
+    云端摘要里可能没有价格（例如只从仓库读到了状态），这种情况下 0.00 会让人以为
+    股价归零。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{f:.{digits}f}" if f > 0 else "—"
+
+
+def _band_status_badge(status):
+    """状态 → (颜色, 图标)，与 _band_status 的取色保持一致。"""
+    return {
+        '顶背离预警': ('#ff4b4b', '🔴'),
+        '跌破支撑': ('#ff3333', '🔻'),
+        '波段启动确认': ('#00cc66', '🚀'),
+        '波段进行中': ('#f9e2af', '📈'),
+        '波段未形成': ('#888', '⬜'),
+    }.get(status, ('#888', '❔'))
+
+def band_memory_ui():
+    """波段记忆面板：记住选过的票、跟踪状态变化、并同步到云端巡检。"""
+    st.markdown("---")
+    st.header("🧠 波段记忆")
+    st.caption("扫描到「波段启动确认 / 顶背离预警 / 跌破支撑」会自动记在这里；"
+               "记录入选时间、入选价和之后每一次状态变化。")
+    st.caption("🔒 备注与入选价**只存在本地容器**；同步到仓库的只是「代码 + 状态」摘要"
+               "（你的仓库是公开的，所以隐私字段一律不上传）。")
+
+    # ---- 首次进入本会话时静默拉取云端记忆，避免本地文件被容器重启清空后一无所知 ----
+    if not st.session_state.get('band_memory_pulled_once'):
+        st.session_state.band_memory_pulled_once = True
+        ok_pull, msg_pull, merged = band_memory_pull_github()
+        if ok_pull and merged is not None:
+            before = band_memory_stats(load_band_memory())['total']
+            save_band_memory(merged)
+            after = band_memory_stats(merged)['total']
+            if after != before:
+                st.session_state.band_memory_sync_msg = f"{msg_pull}；已并入本地（{before} → {after} 只）"
+
+    mem = load_band_memory()
+    stats = band_memory_stats(mem)
+
+    if not _github_token():
+        st.info("ℹ️ 还没配置 GitHub Token —— 记忆只保存在本页容器里（重启会丢），"
+                "云端也不会推送微信。配置方法见下方「☁️ 云端推送」说明。")
+
+    # ---- 概览 ----
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("记住的股票", f"{stats['active']} 只", help="不含已标记结束的")
+    c2.metric("结束预警", f"{stats['alert']} 只", help="顶背离预警 / 跌破支撑，需要处理")
+    c3.metric("波段启动", f"{stats['entry']} 只")
+    c4.metric("累计记录", f"{stats['total']} 只", help="含已归档")
+
+    # ---- 本次新增提示 ----
+    _newly = st.session_state.pop('band_memory_new', None)
+    if _newly:
+        st.success(f"✅ 本次扫描新记入 {len(_newly)} 只：{', '.join(_newly)}")
+
+    # ---- 状态变化提醒（这是「提醒我」的核心）----
+    changes = st.session_state.get('band_memory_changes') or []
+    if changes:
+        ended = [c for c in changes if c.get('alert') == 'end']
+        started = [c for c in changes if c.get('alert') == 'start']
+        if ended:
+            st.error("⚠️ 以下股票**波段结束信号**出现，建议优先处理：\n\n" + "\n".join(
+                f"- **{c['name']}（{c['code']}）**：{c['from']} → **{c['to']}**"
+                f"　现价 {c['price']:.2f}" + (f"　📋 {c['reasons']}" if c.get('reasons') else "")
+                for c in ended))
+        if started:
+            st.success("🚀 以下股票出现**波段启动**：\n\n" + "\n".join(
+                f"- **{c['name']}（{c['code']}）**：{c['from']} → **{c['to']}**"
+                f"　现价 {c['price']:.2f}" for c in started))
+        others = [c for c in changes if not c.get('alert')]
+        if others:
+            st.info("ℹ️ 另有状态变化（已记录，未推送）：\n\n" + "\n".join(
+                f"- **{c['name']}（{c['code']}）**：{c['from']} → **{c['to']}**"
+                f"　现价 {c['price']:.2f}" for c in others))
+
+    if not mem['stocks']:
+        st.caption("（还没有记录。点上方按钮扫描一次，或在这里手动记入。）")
+
+    # ---- 操作区 ----
+    b1, b2, b3, b4 = st.columns(4)
+    if b1.button("🔄 刷新全部状态", use_container_width=True, key="bandmem_refresh",
+                 help="重新拉取记忆里所有股票的最新波段状态，并标出变化"):
+        if not mem['stocks']:
+            st.warning("记忆里还没有股票。")
+        else:
+            with st.spinner(f"正在重新分析 {stats['active']} 只股票..."):
+                _mem, _changes = band_memory_refresh(mem)
+                _pushed_msg = ""
+                if _github_token():
+                    _ok_p, _msg_p = band_memory_push_github(_mem)
+                    _pushed_msg = f"；{_msg_p}"
+            st.session_state.band_memory_changes = _changes
+            st.session_state.band_memory_sync_msg = f"已刷新，{len(_changes)} 只状态发生变化{_pushed_msg}"
+            st.rerun()
+    if b2.button("☁️ 同步到云端", use_container_width=True, key="bandmem_push",
+                 help="把记忆提交到 GitHub 仓库，云端巡检脚本据此推送微信"):
+        with st.spinner("正在同步..."):
+            _ok, _msg = band_memory_push_github(mem)
+        st.session_state.band_memory_sync_msg = _msg
+        st.rerun()
+    if b3.button("⬇️ 从云端拉取", use_container_width=True, key="bandmem_pull",
+                 help="把云端记录（含巡检脚本发现的状态变化）合并到本地"):
+        with st.spinner("正在拉取..."):
+            _ok, _msg, _merged = band_memory_pull_github()
+        if _ok and _merged is not None:
+            save_band_memory(_merged)
+        st.session_state.band_memory_sync_msg = _msg
+        st.rerun()
+    b4.download_button("📥 下载备份", use_container_width=True,
+                       data=json.dumps(mem, ensure_ascii=False, indent=2),
+                       file_name=f"band_memory_{now_cn().strftime('%Y%m%d_%H%M')}.json",
+                       mime="application/json", key="bandmem_download")
+
+    if st.session_state.get('band_memory_sync_msg'):
+        st.caption(f"☁️ {st.session_state.band_memory_sync_msg}")
+
+    with st.expander("📤 从备份恢复 / 手动记入代码", expanded=False):
+        up = st.file_uploader("上传之前下载的 band_memory.json（会与当前记录合并）",
+                              type=["json"], key="bandmem_upload")
+        if up is not None:
+            try:
+                remote = json.loads(up.getvalue().decode("utf-8", errors="replace"))
+                if isinstance(remote, dict) and isinstance(remote.get("stocks"), dict):
+                    save_band_memory(band_memory_merge(mem, remote))
+                    st.success(f"已合并导入（{len(remote.get('stocks', {}))} 只）")
+                    st.rerun()
+                else:
+                    st.error("文件结构不对，应该是由本页「下载备份」导出的 JSON。")
+            except Exception as e:
+                _log("band_memory_ui/upload", e)
+                st.error(f"解析失败：{e}")
+        st.caption("—— 手动记入（自动入册只收「启动确认 / 结束预警」，其他状态想跟踪就手动加）——")
+        with st.form("bandmem_manual_form", clear_on_submit=True):
+            manual = st.text_input("股票代码（多个用空格/逗号分隔）", placeholder="例如: 600176,000001")
+            if st.form_submit_button("➕ 记入并分析", use_container_width=True) and manual.strip():
+                codes = [c.strip() for c in re.split(r'[,，\s]+', manual) if c.strip()]
+                codes = [c for c in codes if len(c) == 6 and c.isdigit() and not c.startswith(EXCLUDE_PREFIXES)]
+                if not codes:
+                    st.warning("没有有效的 6 位代码（科创/创业板/北交所会被排除）。")
+                else:
+                    rows = []
+                    for code in codes:
+                        try:
+                            r = _band_evaluate(code, get_stock_name(code))
+                            if r:
+                                rows.append(r)
+                            else:
+                                st.warning(f"{code} 日线数据不足，未能记入。")
+                        except Exception as e:
+                            _log(f"band_memory_ui/manual/{code}", e)
+                            st.warning(f"{code} 分析失败：{e}")
+                    if rows:
+                        added = band_memory_record(mem, rows, source="手动记入")
+                        # 手动记入的票不分状态一律收下（用户明确想跟踪）
+                        for r in rows:
+                            code = str(r['Code'])
+                            if code not in mem['stocks']:
+                                mem['stocks'][code] = {
+                                    "code": code, "name": r.get('Name') or code,
+                                    "added_at": now_cn_str(), "added_price": r.get('Price', 0.0),
+                                    "added_status": r.get('Status'), "added_source": "手动记入",
+                                    "snapshot": {}, "note": "", "closed": False,
+                                    "alerts": {}, "history": [],
+                                }
+                                _band_memory_apply(mem['stocks'][code], r, event="手动记入")
+                                added.append(code)
+                        save_band_memory(mem)
+                        st.session_state.band_memory_sync_msg = f"已记入 {len(added)} 只"
+                        band_memory_push_github(mem)
+                        st.rerun()
+
+    if not mem['stocks']:
+        return
+
+    # ---- 记忆清单 ----
+    st.markdown("#### 📋 记忆清单")
+    order = sorted(mem['stocks'].values(),
+                   key=lambda n: (bool(n.get('closed')),
+                                  -BAND_STATUS_LEVEL.get(n.get('status'), 0),
+                                  str(n.get('added_at', ''))))
+    for node in order:
+        code = node.get('code') or '?'
+        cur = node.get('status') or '未知'
+        col, icon = _band_status_badge(cur)
+        add_col, add_icon = _band_status_badge(node.get('added_status'))
+        changed = bool(node.get('added_status')) and node.get('added_status') != cur
+        title = (f"{icon} {node.get('name')}（{code}）　{cur}"
+                 + ("　⚠️ 状态已变化" if changed else "")
+                 + ("　🗄️ 已归档" if node.get('closed') else ""))
+        with st.expander(title, expanded=(cur in BAND_ALERT_STATUSES and not node.get('closed'))):
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("当前状态", cur)
+            m2.metric("入选时", f"{add_icon} {node.get('added_status') or '—'}")
+            m3.metric("现价", _fmt_price(node.get('price')))
+            m4.metric("入选价", _fmt_price(node.get('added_price')))
+            st.caption(
+                f"入选时间：{node.get('added_at') or '—'}　|　来源：{node.get('added_source') or '—'}"
+                f"　|　最近检查：{node.get('last_check') or '未检查'}"
+                f"　|　20日线：{_fmt_price(node.get('ma20'))}")
+            if node.get('reasons'):
+                st.caption(f"📋 最近依据：{node['reasons']}")
+
+            # 轨迹：一眼看清「什么时候变成什么的」
+            hist = node.get('history') or []
+            if hist:
+                st.markdown("**状态轨迹**（新→旧）")
+                for h in reversed(hist[-10:]):
+                    _hc, _hi = _band_status_badge(h.get('status'))
+                    st.markdown(
+                        f"- `{h.get('ts', '')}`　{_hi} **{h.get('status')}**"
+                        f"　价格 {_fmt_price(h.get('price'))}"
+                        f"　<span style='color:{_hc};font-size:12px;'>{h.get('event', '')}</span>",
+                        unsafe_allow_html=True)
+
+            note_key = f"bandmem_note_{code}"
+            note = st.text_input("备注（买入价 / 仓位 / 想法，本地与云端都会保存）",
+                                 value=node.get('note') or '', key=note_key)
+            n1, n2, n3 = st.columns([1, 1, 2])
+            if n1.button("💾 保存备注", use_container_width=True, key=f"bandmem_savenote_{code}"):
+                node['note'] = note
+                save_band_memory(mem)
+                band_memory_push_github(mem)
+                st.session_state.band_memory_sync_msg = f"{node.get('name')} 备注已保存"
+                st.rerun()
+            if n2.button("🗄️ 归档" if not node.get('closed') else "♻️ 取消归档",
+                         use_container_width=True, key=f"bandmem_close_{code}",
+                         help="归档后不再参与状态刷新和云端推送，但记录保留"):
+                node['closed'] = not node.get('closed')
+                save_band_memory(mem)
+                band_memory_push_github(mem)
+                st.rerun()
+            if n3.button("🗑️ 从记忆中删除", use_container_width=True, key=f"bandmem_del_{code}"):
+                mem['stocks'].pop(code, None)
+                save_band_memory(mem)
+                band_memory_push_github(mem)
+                st.session_state.band_memory_sync_msg = f"已删除 {node.get('name')}（{code}）"
+                st.rerun()
+
+    with st.expander("☁️ 云端推送（微信）怎么配", expanded=False):
+        st.markdown("""
+        记忆里「代码 + 当前状态」的摘要会被提交到仓库，GitHub Actions 上的巡检脚本
+        每 5 分钟读一次，发现状态**变差**（→ 顶背离预警 / 跌破支撑）就推送微信，
+        你关掉本页也能收到。
+
+        **隐私说明（重要）**：本仓库是 **public**，所以提交上去的只有
+        代码、名称、当前状态、状态时间和轨迹，**不含**你写的备注、入选价和扫描快照。
+        如果你连「关注了哪些股票」也不想公开，可以把仓库改成 Private
+        （Settings → 最下方 Danger Zone → Change visibility → Private），
+        改完功能完全不受影响。
+
+        **需要你做一次配置**（只需一次）：
+
+        1. 打开 GitHub → 右上头像 → Settings → Developer settings →
+           Personal access tokens → **Fine-grained tokens** → Generate new token。
+        2. Repository access 选 **Only select repositories** → 选 `stock-t-terminal`。
+        3. Permissions → Repository permissions → **Contents** 设为 **Read and write**。
+        4. 生成后复制 token（形如 `github_pat_...`）。
+        5. 打开 Streamlit Cloud → 你的 app → Settings → Secrets，加上一行：
+
+        ```toml
+        GITHUB_TOKEN = "github_pat_xxxxx"
+        ```
+
+        6. 回到本页，点一次「☁️ 同步到云端」，看到「已同步到仓库」即成功。
+
+        没配也能用：记忆照常记录、页面照常提醒，只是关掉页面后收不到微信。
+        也可以改用 GitHub Secrets 里的 `BAND_WATCHLIST`（逗号分隔代码）作为替代方案，
+        那样连代码列表都不需要提交。
+        """)
+
 
 def ai_band_picker_ui():
     st.markdown("---")
@@ -1246,6 +1968,15 @@ def ai_band_picker_ui():
             with st.spinner("正在拉取行情并分析波段状态..."):
                 st.session_state.scan_results = screen_band_stocks(custom_codes=custom_codes)
                 st.session_state.scan_time = now_cn_str('%Y-%m-%d %H:%M:%S')
+                # 自动入册：本次扫描中「波段启动确认 / 顶背离预警 / 跌破支撑」的股票写进记忆，
+                # 这样你关掉页面之后再回来，仍然知道当初是哪些票、后来变成了什么状态。
+                _mem = load_band_memory()
+                _added = band_memory_record(_mem, st.session_state.get('band_last_raw'), scan_scope)
+                if _added:
+                    save_band_memory(_mem)
+                    st.session_state.band_memory_new = _added
+                    _ok, _msg = band_memory_push_github(_mem)      # 没配 Token 会返回提示，不算失败
+                    st.session_state.band_memory_sync_msg = _msg
             st.rerun()
         except Exception:
             st.error("选股扫描出错（已自动拦截，不影响页面其他功能）：")
@@ -1281,6 +2012,15 @@ def ai_band_picker_ui():
                     <div style="margin-top:6px; color:#f9e2af; font-size:13px;">📋 {r['Reasons']}</div>
                 </div>
                 """, unsafe_allow_html=True)
+
+    # 波段记忆面板（记住选过的票 + 跟踪状态变化 + 云端推送）
+    try:
+        band_memory_ui()
+    except Exception as e:
+        _log("band_memory_ui", e)
+        st.warning("波段记忆面板渲染出错（已拦截，不影响上方选股功能）")
+        with st.expander("查看错误详情"):
+            st.code(traceback.format_exc(), language="python")
 
 # ================= 11. 动态股票池系统 =================
 @st.cache_data(ttl=180)
