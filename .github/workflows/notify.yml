@@ -80,7 +80,9 @@ jobs:
         run: |
           echo "---- 当前波段摘要 ----"
           if [ -f band_watch.json ]; then cat band_watch.json; else echo "(文件不存在)"; fi
-          if [ -f band_watch.json ] && ! git diff --quiet -- band_watch.json; then
+          # ⚠️ 不能用 `git diff --quiet` 判断：对「未跟踪的新文件」它也返回无变化，
+          #    首次创建时会被跳过。git status --porcelain 对新增(??)与修改(M)都会输出。
+          if [ -f band_watch.json ] && [ -n "$(git status --porcelain -- band_watch.json)" ]; then
             git config user.name  "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add band_watch.json
