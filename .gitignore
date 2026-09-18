@@ -19,3 +19,13 @@ ENV/
 *~
 .DS_Store
 Thumbs.db
+
+# ===== 运行时数据文件（含本地配置与缓存，禁止进仓库）=====
+# 注意：config.json 内含 DeepSeek API Key / Server酱 SendKey，泄露即等于密钥外泄
+config.json
+watchlist.json
+dynamic_pool.json
+notify_log.json
+band_manual_list.json
+kline_cache.json
+kline_cache.json.tmp
