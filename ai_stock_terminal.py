@@ -768,7 +768,7 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None):
     """波段选股主函数：全市场扫描或基于自定义股票列表，筛选突破平台+放量的波段启动股，并预警结束信号。"""
     progress = st.progress(0, text="正在获取股票列表...")
 
-    candidates = []
+    candidates = []; all_stocks = []
     if custom_codes:
         # 自定义模式：仅分析用户指定的股票
         seen = set()
@@ -792,6 +792,7 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None):
             except Exception:
                 pass
         progress.progress(12, text=f"已加载自定义列表 {len(candidates)} 只...")
+        all_stocks = custom_codes or []
     else:
         # 全市场扫描
         all_stocks = []
@@ -801,12 +802,11 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None):
                 break
             all_stocks.extend(page)
             progress.progress(min(int(12 * pn // 40), 12), text=f"已拉取 {len(all_stocks)} 只（第 {pn} 页）...")
-    if not all_stocks:
-        progress.empty()
-        st.session_state.scan_stats = "❌ 全市场接口暂不可用（非交易时间/网络限制）"
-        st.error("获取全市场数据失败。可切换到上方「仅手动自选」或「指定板块」模式重试，交易时段全市场接口通常更稳定。")
-        return pd.DataFrame()
-
+        if not all_stocks:
+            progress.empty()
+            st.session_state.scan_stats = "❌ 全市场接口暂不可用（非交易时间/网络限制）"
+            st.error("获取全市场数据失败。可切换到上方「仅手动自选」或「指定板块」模式重试，交易时段全市场接口通常更稳定。")
+            return pd.DataFrame()
         for s in all_stocks:
             code_ = str(s.get("f12") or "")
             name = str(s.get("f14") or "")
