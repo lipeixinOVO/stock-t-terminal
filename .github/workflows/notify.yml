@@ -15,6 +15,15 @@ on:
         default: false
         type: boolean
 
+# 需要写权限：把波段记忆的状态变化提交回仓库，让网页端下次打开就能看到
+permissions:
+  contents: write
+
+# 串行化，避免两次巡检同时提交 band_watch.json 产生冲突
+concurrency:
+  group: watcher-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   watch:
     runs-on: ubuntu-latest
@@ -46,6 +55,8 @@ jobs:
         env:
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           WATCHLIST: ${{ secrets.WATCHLIST }}
+          # 可选：额外的波段监控名单（不依赖网页端「波段记忆」，逗号分隔 6 位代码）
+          BAND_WATCHLIST: ${{ secrets.BAND_WATCHLIST }}
           ALERT_WINDOW_MIN: "10"
           FORCE_RUN: ${{ github.event.inputs.force == 'true' && '1' || '0' }}
         run: python watcher.py
@@ -63,3 +74,23 @@ jobs:
         with:
           path: notify_log.json
           key: notify-log-${{ steps.ckey.outputs.key }}-${{ github.run_id }}
+
+      - name: 回写波段状态（有变化时）
+        if: always()
+        run: |
+          echo "---- 当前波段摘要 ----"
+          if [ -f band_watch.json ]; then cat band_watch.json; else echo "(文件不存在)"; fi
+          if [ -f band_watch.json ] && ! git diff --quiet -- band_watch.json; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add band_watch.json
+            git commit -m "chore: 巡检回写波段状态 [skip ci]"
+            # 并发场景下远端可能刚更新过，先 rebase 再推，最多重试 3 次
+            for i in 1 2 3; do
+              if git push; then echo "✅ 波段状态已提交回仓库"; exit 0; fi
+              echo "推送失败，拉取远端后重试（第 $i 次）..."; git pull --rebase --autostash || true
+            done
+            echo "⚠️ 波段状态提交失败（已达最大重试次数），下次巡检会继续尝试"
+          else
+            echo "band_watch.json 无变化，跳过提交"
+          fi
