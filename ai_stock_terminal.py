@@ -80,6 +80,7 @@ WATCHLIST_FILE = os.path.join(BASE_DIR, "watchlist.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 DYNAMIC_POOL_FILE = os.path.join(BASE_DIR, "dynamic_pool.json")
 NOTIFY_LOG_FILE = os.path.join(BASE_DIR, "notify_log.json")
+BAND_MANUAL_FILE = os.path.join(BASE_DIR, "band_manual_list.json")
 
 def _load_json(path, default):
     try:
@@ -130,6 +131,28 @@ def _secrets_has_key(name):
 
 def load_dynamic_pool(): return _load_json(DYNAMIC_POOL_FILE, {})
 def save_dynamic_pool(pool_dict): _save_json(DYNAMIC_POOL_FILE, pool_dict)
+
+def load_band_manual(): return _load_json(BAND_MANUAL_FILE, [])
+def save_band_manual(lst): _save_json(BAND_MANUAL_FILE, lst)
+
+# 预定义常见板块（用代表性成分股列表，避免实时板块接口不稳定）
+BAND_BOARD_MAP = {
+    "半导体": ["600584", "002049", "603501", "600745", "002371", "603986", "600460", "002156"],
+    "人工智能": ["000938", "002230", "600728", "000977", "002236", "600570", "603019", "600100"],
+    "新能源": ["002594", "600438", "601012", "603659", "300014", "002074", "002812", "600884"],
+    "银行": ["600000", "601398", "601288", "601939", "600036", "601166", "601988", "601328"],
+    "白酒": ["600519", "000858", "002304", "600809", "000568", "600702", "600779", "603369"],
+    "医药": ["600276", "000538", "600436", "600196", "002001", "600079", "603259", "000963"],
+    "券商": ["600030", "601688", "600837", "601211", "600999", "000776", "601377", "002500"],
+    "军工": ["600893", "600372", "002179", "600760", "000768", "600391", "002025", "600482"],
+    "消费电子": ["002475", "601138", "002600", "000100", "002241", "603501", "688036", "300433"],
+    "汽车": ["601127", "000625", "601633", "600660", "002048", "600104", "000951", "600066"],
+    "光伏": ["600438", "601012", "603806", "002129", "600732", "002459", "601865", "688599"],
+    "地产": ["000002", "600048", "600606", "001979", "600383", "600340", "000069", "600657"],
+    "电力": ["600900", "600011", "600886", "601985", "600795", "600027", "601991", "000027"],
+    "有色": ["601899", "603993", "600362", "002460", "000630", "600497", "600111", "601600"],
+    "通信": ["600941", "600498", "000063", "600487", "601728", "600522", "002281", "300308"],
+}
 
 # ================= 3. 通知去重机制 =================
 def _load_notify_log(): return _load_json(NOTIFY_LOG_FILE, {})
@@ -413,8 +436,21 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
             intraday_high_predict = round(max(day_high, cur_price + dynamic_offset), 3); intraday_low_predict = round(min(day_low, cur_price - dynamic_offset), 3)
     if allow_t == "允许" and df_minute is not None and not df_minute.empty:
         df_min = df_minute.copy(); df_min = df_min[df_min['Time'] <= "1500"]; df_min['Vol_MA5'] = df_min['Volume'].rolling(5).mean()
-        df_min_buy = df_min[(df_min['Time'] >= "0945") & (df_min['Time'] <= "1445")].copy(); df_min_sell = df_min[(df_min['Time'] >= "0930") & (df_min['Time'] <= "1455")].copy()
+        # 放宽时间窗口：早盘急跌也可捕捉
+        df_min_buy = df_min[(df_min['Time'] >= "0935") & (df_min['Time'] <= "1445")].copy(); df_min_sell = df_min[(df_min['Time'] >= "0930") & (df_min['Time'] <= "1455")].copy()
+
+        # 计算当日高低点及价格位置
+        day_high = df_min['Price'].max(); day_low = df_min['Price'].min(); day_range = max(day_high - day_low, 0.001)
+        df_min_buy['Price_Position'] = (df_min_buy['Price'] - day_low) / day_range
+        df_min_sell['Price_Position'] = (df_min_sell['Price'] - day_low) / day_range
+
         df_min_buy['MACD_UP'] = df_min_buy['MACD'] > df_min_buy['MACD'].shift(1); df_min_sell['MACD_DOWN'] = df_min_sell['MACD'] < df_min_sell['MACD'].shift(1)
+        df_min_buy['MACD_GOLDEN'] = (df_min_buy['DIFF'] > df_min_buy['DEA']) & (df_min_buy['DIFF'].shift(1) <= df_min_buy['DEA'].shift(1))
+        df_min_sell['MACD_DEAD'] = (df_min_sell['DIFF'] < df_min_sell['DEA']) & (df_min_sell['DIFF'].shift(1) >= df_min_sell['DEA'].shift(1))
+        # 止跌/企稳：当前不再创新低；滞涨：当前不再创新高
+        df_min_buy['STOP_FALL'] = (df_min_buy['Price'] >= df_min_buy['Price'].shift(1)) & (df_min_buy['Price'].shift(1) <= df_min_buy['Price'].shift(2))
+        df_min_sell['STOP_RISE'] = (df_min_sell['Price'] <= df_min_sell['Price'].shift(1)) & (df_min_sell['Price'].shift(1) >= df_min_sell['Price'].shift(2))
+
         low_idx = df_min['Price'].idxmin()
         if len(df_min.loc[:low_idx]) > 5:
             recent_low = df_min.loc[low_idx, 'Price']; recent_macd = df_min.loc[low_idx, 'MACD']; prev_lows = df_min[df_min['Price'] < recent_low * 1.005]
@@ -427,22 +463,33 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
             if len(prev_highs) > 0:
                 prev_macd = df_min.loc[prev_highs.index[-1], 'MACD']
                 if recent_macd < prev_macd: divergence_info += " 顶背离"
-        buy_cond = (df_min_buy['Price'] < df_min_buy['AvgPrice'] * (1 - deviation)) & (df_min_buy['Volume'] < df_min_buy['Vol_MA5'] * 0.7) & (df_min_buy['MACD_UP'] == True)
-        sell_cond = (df_min_sell['Price'] > df_min_sell['AvgPrice'] * (1 + deviation)) & (df_min_sell['Volume'] > df_min_sell['Vol_MA5'] * 1.5) & (df_min_sell['MACD_DOWN'] == True)
+
+        # 买点：方案A 回踩均价线+MACD向上；方案B 接近当日低点+止跌+（MACD向上或缩量）
+        buy_cond_a = (df_min_buy['Price'] < df_min_buy['AvgPrice'] * (1 - deviation * 0.7)) & df_min_buy['MACD_UP']
+        buy_cond_b = (df_min_buy['Price_Position'] <= 0.30) & df_min_buy['STOP_FALL'] & (df_min_buy['MACD_UP'] | (df_min_buy['Volume'] < df_min_buy['Vol_MA5'] * 0.85))
+        buy_cond = buy_cond_a | buy_cond_b
+        # 卖点：方案A 冲高乖离均价线+MACD向下；方案B 接近当日高点+滞涨+（MACD向下或放量）
+        sell_cond_a = (df_min_sell['Price'] > df_min_sell['AvgPrice'] * (1 + deviation * 0.7)) & df_min_sell['MACD_DOWN']
+        sell_cond_b = (df_min_sell['Price_Position'] >= 0.70) & df_min_sell['STOP_RISE'] & (df_min_sell['MACD_DOWN'] | (df_min_sell['Volume'] > df_min_sell['Vol_MA5'] * 1.2))
+        sell_cond = sell_cond_a | sell_cond_b
         buy_points = df_min_buy[buy_cond]; sell_points = df_min_sell[sell_cond]
         if market_change < -1.0: buy_warning = " ⚠️大盘暴跌，低置信度！"
         if not buy_points.empty:
-            best_row = buy_points.loc[buy_points['Price'].idxmin()]; time_fmt = f"{best_row['Time'][:2]}:{best_row['Time'][2:]}"; dev_pct = (best_row['AvgPrice'] - best_row['Price']) / best_row['AvgPrice']
-            conf = "低" if market_change < -1.0 else ("高" if dev_pct > deviation * 2 else ("中" if dev_pct > deviation * 1.2 else "低"))
-            if "底背离" in divergence_info: conf = "高"
+            best_row = buy_points.loc[buy_points['Price'].idxmin()]; time_fmt = f"{best_row['Time'][:2]}:{best_row['Time'][2:]}"
+            dev_pct = (best_row['AvgPrice'] - best_row['Price']) / best_row['AvgPrice'] if best_row['AvgPrice'] > 0 else 0
+            is_scheme_a = bool((best_row['Price'] < best_row['AvgPrice'] * (1 - deviation * 0.7)) and (best_row['MACD_UP'] if 'MACD_UP' in best_row else False))
+            conf = "低" if market_change < -1.0 else ("高" if dev_pct > deviation * 1.5 or "底背离" in divergence_info else ("中" if dev_pct > deviation * 0.8 or is_scheme_a else "低"))
             b_type = "正T低吸" if direction == "正T" else "反T回补"
-            best_buy = f"{time_fmt} | {best_row['Price']:.3f} | {b_type} | 回踩均价线缩量{divergence_info} | 置信度{conf}{buy_warning}"
+            reason = "回踩均价线" if is_scheme_a else "接近日内低点止跌"
+            best_buy = f"{time_fmt} | {best_row['Price']:.3f} | {b_type} | {reason}{divergence_info} | 置信度{conf}{buy_warning}"
         if not sell_points.empty:
-            best_row = sell_points.loc[sell_points['Price'].idxmax()]; time_fmt = f"{best_row['Time'][:2]}:{best_row['Time'][2:]}"; dev_pct = (best_row['Price'] - best_row['AvgPrice']) / best_row['AvgPrice']
-            conf = "高" if dev_pct > deviation * 2 else ("中" if dev_pct > deviation * 1.2 else "低")
-            if "顶背离" in divergence_info: conf = "高"
+            best_row = sell_points.loc[sell_points['Price'].idxmax()]; time_fmt = f"{best_row['Time'][:2]}:{best_row['Time'][2:]}"
+            dev_pct = (best_row['Price'] - best_row['AvgPrice']) / best_row['AvgPrice'] if best_row['AvgPrice'] > 0 else 0
+            is_scheme_a = bool((best_row['Price'] > best_row['AvgPrice'] * (1 + deviation * 0.7)) and (best_row['MACD_DOWN'] if 'MACD_DOWN' in best_row else False))
+            conf = "高" if dev_pct > deviation * 1.5 or "顶背离" in divergence_info else ("中" if dev_pct > deviation * 0.8 or is_scheme_a else "低")
             s_type = "正T高抛" if direction == "正T" else "反T减仓"
-            best_sell = f"{time_fmt} | {best_row['Price']:.3f} | {s_type} | 冲高乖离均价线放量{divergence_info} | 置信度{conf}"
+            reason = "冲高乖离均价线" if is_scheme_a else "接近日内高点滞涨"
+            best_sell = f"{time_fmt} | {best_row['Price']:.3f} | {s_type} | {reason}{divergence_info} | 置信度{conf}"
     today_str = latest['Date'].strftime('%Y-%m-%d'); time_str = now_cn().strftime('%H:%M'); market_status = f"上证 {market_change:+.2f}%"
     market_color = "color-green" if market_change >= 0 else "color-red"
     report = f"""
@@ -484,15 +531,23 @@ def monitor_all_watchlist(send_key, market_change):
             df_min = df_min[df_min['Time'] <= "1500"].copy()
             if len(df_min) < 10: continue
             df_min['Vol_MA5'] = df_min['Volume'].rolling(5).mean()
-            df_min_buy = df_min[(df_min['Time'] >= "0945") & (df_min['Time'] <= "1445")].copy()
+            df_min_buy = df_min[(df_min['Time'] >= "0935") & (df_min['Time'] <= "1445")].copy()
             df_min_sell = df_min[(df_min['Time'] >= "0930") & (df_min['Time'] <= "1455")].copy()
             if df_min_buy.empty or df_min_sell.empty: continue
             df_min_buy['MACD_UP'] = df_min_buy['MACD'] > df_min_buy['MACD'].shift(1)
             df_min_sell['MACD_DOWN'] = df_min_sell['MACD'] < df_min_sell['MACD'].shift(1)
             high_price = df_min['Price'].max(); low_price = df_min['Price'].min(); avg_price = df_min['AvgPrice'].mean()
-            dev = max(0.003, min(((high_price - low_price) / avg_price) * 0.4, 0.015)) if avg_price > 0 else 0.008
-            buy_cond = (df_min_buy['Price'] < df_min_buy['AvgPrice'] * (1 - dev)) & (df_min_buy['Volume'] < df_min_buy['Vol_MA5'] * 0.7) & (df_min_buy['MACD_UP'] == True)
-            sell_cond = (df_min_sell['Price'] > df_min_sell['AvgPrice'] * (1 + dev)) & (df_min_sell['Volume'] > df_min_sell['Vol_MA5'] * 1.5) & (df_min_sell['MACD_DOWN'] == True)
+            dev = max(0.003, min(((high_price - low_price) / avg_price) * 0.5, 0.015)) if avg_price > 0 else 0.008
+            df_min_buy['Price_Position'] = (df_min_buy['Price'] - low_price) / max(high_price - low_price, 0.001)
+            df_min_sell['Price_Position'] = (df_min_sell['Price'] - low_price) / max(high_price - low_price, 0.001)
+            df_min_buy['STOP_FALL'] = (df_min_buy['Price'] >= df_min_buy['Price'].shift(1)) & (df_min_buy['Price'].shift(1) <= df_min_buy['Price'].shift(2))
+            df_min_sell['STOP_RISE'] = (df_min_sell['Price'] <= df_min_sell['Price'].shift(1)) & (df_min_sell['Price'].shift(1) >= df_min_sell['Price'].shift(2))
+            buy_cond_a = (df_min_buy['Price'] < df_min_buy['AvgPrice'] * (1 - dev * 0.7)) & df_min_buy['MACD_UP']
+            buy_cond_b = (df_min_buy['Price_Position'] <= 0.30) & df_min_buy['STOP_FALL'] & (df_min_buy['MACD_UP'] | (df_min_buy['Volume'] < df_min_buy['Vol_MA5'] * 0.85))
+            buy_cond = buy_cond_a | buy_cond_b
+            sell_cond_a = (df_min_sell['Price'] > df_min_sell['AvgPrice'] * (1 + dev * 0.7)) & df_min_sell['MACD_DOWN']
+            sell_cond_b = (df_min_sell['Price_Position'] >= 0.70) & df_min_sell['STOP_RISE'] & (df_min_sell['MACD_DOWN'] | (df_min_sell['Volume'] > df_min_sell['Vol_MA5'] * 1.2))
+            sell_cond = sell_cond_a | sell_cond_b
             buy_pts = df_min_buy[buy_cond]; sell_pts = df_min_sell[sell_cond]
             sym_name = get_stock_name(sym)
             if not buy_pts.empty:
@@ -545,18 +600,24 @@ def _diff_to_list(diff):
 
 @st.cache_data(ttl=300)
 def fetch_market_page(pn, pz=100):
-    """分页拉取沪深 A 股列表（按主力资金流降序），单页失败只损失该页。"""
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    """分页拉取沪深 A 股列表（按主力资金流降序），自动切换可用 host，单页失败只损失该页。"""
     params = {"pn": str(pn), "pz": str(pz), "po": "1", "np": "1", "fltt": "2", "invt": "2",
               "fid": "f62", "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
               "fields": "f12,f14,f2,f3,f8,f9,f10,f20,f62"}
-    try:
-        res = requests.get(url, params=params, timeout=10, headers=_REQUEST_HEADERS)
-        data = res.json()
-        if data.get("data") and data["data"].get("diff"):
-            return _diff_to_list(data["data"]["diff"])
-    except Exception:
-        pass
+    # 多 host 容错：当前网络环境下 push2delay 通常更稳定
+    hosts = ["https://push2delay.eastmoney.com", "https://push2.eastmoney.com",
+             "https://7.push2.eastmoney.com", "https://17.push2.eastmoney.com",
+             "https://29.push2.eastmoney.com", "https://82.push2.eastmoney.com"]
+    for base_url in hosts:
+        try:
+            res = requests.get(f"{base_url}/api/qt/clist/get", params=params, timeout=8, headers=_REQUEST_HEADERS)
+            if res.status_code != 200:
+                continue
+            data = res.json()
+            if data.get("data") and data["data"].get("diff"):
+                return _diff_to_list(data["data"]["diff"])
+        except Exception:
+            continue
     return []
 
 def _get_daily_history(symbol):
@@ -633,7 +694,7 @@ def _calculate_band_metrics(df):
         'vol_ratio': vol_ratio, 'volume_expansion': volume_expansion,
         'macd': float(macd.iloc[-1]), 'macd_golden': bool(diff.iloc[-1] > dea.iloc[-1] and diff.iloc[-2] <= dea.iloc[-2]),
         'top_divergence': top_divergence, 'below_support': below_support,
-        'position_pct': position_pct,
+        'position_pct': position_pct, 'lookback': lookback,
     }
 
 def _band_status(metrics):
@@ -660,7 +721,7 @@ def _analyze_band(row):
 
         score = 0; reasons = []
         if m['breakout']:
-            score += 35; reasons.append(f"突破{lookback}日平台")
+            score += 35; reasons.append(f"突破{m['lookback']}日平台")
         elif m['current'] >= m['platform_high'] * 0.97:
             score += 15; reasons.append("接近平台突破")
 
@@ -703,44 +764,69 @@ def _analyze_band(row):
     except Exception:
         return None
 
-def screen_band_stocks(max_results=20, max_deep_scan=600):
-    """波段选股主函数：全市场扫描突破平台+放量的波段启动股，并预警结束信号。"""
-    progress = st.progress(0, text="正在获取全市场列表...")
-
-    all_stocks = []
-    for pn in range(1, 41):
-        page = fetch_market_page(pn)
-        if not page:
-            break
-        all_stocks.extend(page)
-        progress.progress(min(int(12 * pn // 40), 12), text=f"已拉取 {len(all_stocks)} 只（第 {pn} 页）...")
-    if not all_stocks:
-        progress.empty()
-        st.session_state.scan_stats = "❌ 东方财富接口无返回，请稍后重试"
-        st.error("获取全市场数据失败：东方财富接口无返回。")
-        return pd.DataFrame()
+def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None):
+    """波段选股主函数：全市场扫描或基于自定义股票列表，筛选突破平台+放量的波段启动股，并预警结束信号。"""
+    progress = st.progress(0, text="正在获取股票列表...")
 
     candidates = []
-    for s in all_stocks:
-        code_ = str(s.get("f12") or "")
-        name = str(s.get("f14") or "")
-        if not code_ or code_.startswith(EXCLUDE_PREFIXES) or _is_st_or_risk(name):
-            continue
-        price = _safe_float(s.get("f2"))
-        total_mv = _safe_float(s.get("f20")) / 1e8
-        if price <= 0 or total_mv <= 10:
-            continue
-        change_pct = _safe_float(s.get("f3"))
-        if abs(change_pct) >= 9.5:
-            continue
-        candidates.append({'Code': code_, 'Name': name, 'Price': price, 'ChangePct': change_pct,
-                           'TotalMv': total_mv, 'MainFlow': _safe_float(s.get("f62")) / 1e8})
+    if custom_codes:
+        # 自定义模式：仅分析用户指定的股票
+        seen = set()
+        for code_ in custom_codes:
+            code_ = str(code_).strip()
+            if not code_ or len(code_) != 6 or code_.startswith(EXCLUDE_PREFIXES) or code_ in seen:
+                continue
+            seen.add(code_)
+            name = get_stock_name(code_)
+            prefix = "sh" if code_.startswith(('5', '6', '9')) else "sz"
+            try:
+                res = requests.get(f"https://qt.gtimg.cn/q={prefix}{code_}", timeout=3)
+                res.encoding = 'gbk'
+                parts = res.text.split('~')
+                if len(parts) > 45:
+                    price = _safe_float(parts[3])
+                    change_pct = _safe_float(parts[32])
+                    if price > 0:
+                        candidates.append({'Code': code_, 'Name': name, 'Price': price, 'ChangePct': change_pct,
+                                           'TotalMv': 0.0, 'MainFlow': 0.0})
+            except Exception:
+                pass
+        progress.progress(12, text=f"已加载自定义列表 {len(candidates)} 只...")
+    else:
+        # 全市场扫描
+        all_stocks = []
+        for pn in range(1, 41):
+            page = fetch_market_page(pn)
+            if not page:
+                break
+            all_stocks.extend(page)
+            progress.progress(min(int(12 * pn // 40), 12), text=f"已拉取 {len(all_stocks)} 只（第 {pn} 页）...")
+    if not all_stocks:
+        progress.empty()
+        st.session_state.scan_stats = "❌ 全市场接口暂不可用（非交易时间/网络限制）"
+        st.error("获取全市场数据失败。可切换到上方「仅手动自选」或「指定板块」模式重试，交易时段全市场接口通常更稳定。")
+        return pd.DataFrame()
+
+        for s in all_stocks:
+            code_ = str(s.get("f12") or "")
+            name = str(s.get("f14") or "")
+            if not code_ or code_.startswith(EXCLUDE_PREFIXES) or _is_st_or_risk(name):
+                continue
+            price = _safe_float(s.get("f2"))
+            total_mv = _safe_float(s.get("f20")) / 1e8
+            if price <= 0 or total_mv <= 10:
+                continue
+            change_pct = _safe_float(s.get("f3"))
+            if abs(change_pct) >= 9.5:
+                continue
+            candidates.append({'Code': code_, 'Name': name, 'Price': price, 'ChangePct': change_pct,
+                               'TotalMv': total_mv, 'MainFlow': _safe_float(s.get("f62")) / 1e8})
 
     total_cand = len(candidates)
     if not candidates:
         progress.empty()
-        st.session_state.scan_stats = f"拉取 {len(all_stocks)} 只，初筛后 0 只"
-        st.warning("初筛后没有候选股票，请稍后重试。")
+        st.session_state.scan_stats = "未获取到候选股票，请检查输入或稍后重试"
+        st.warning("未获取到候选股票，请检查输入或稍后重试。")
         return pd.DataFrame()
 
     progress.progress(15, text=f"初筛后候选 {total_cand} 只，并发深度分析中...")
@@ -807,10 +893,58 @@ def ai_band_picker_ui():
         ⚠️ 本工具仅为量化初筛，不构成投资建议。
         """)
 
-    if st.button("🔍 扫描波段启动股（约 1 分钟）", type="primary", use_container_width=True, key="scan_stocks"):
+    # 扫描范围与手动股票管理
+    if 'band_manual_codes' not in st.session_state:
+        st.session_state.band_manual_codes = load_band_manual()
+
+    scan_scope = st.radio("扫描范围", ["全市场扫描", "仅手动自选", "指定板块"], horizontal=True, key="band_scan_scope")
+
+    custom_codes = None
+    if scan_scope == "仅手动自选":
+        with st.form("band_manual_form", clear_on_submit=True):
+            manual_input = st.text_input("手动添加股票代码（多个用空格/逗号分隔）", placeholder="例如: 600176,000001,512480")
+            submitted = st.form_submit_button("➕ 添加并保存", use_container_width=True)
+            if submitted and manual_input.strip():
+                new_codes = [c.strip() for c in re.split(r'[,，\s]+', manual_input) if c.strip()]
+                valid_codes = [c for c in new_codes if len(c) == 6 and c.isdigit() and not c.startswith(EXCLUDE_PREFIXES)]
+                added = []
+                for c in valid_codes:
+                    if c not in st.session_state.band_manual_codes:
+                        st.session_state.band_manual_codes.append(c); added.append(c)
+                if added:
+                    save_band_manual(st.session_state.band_manual_codes)
+                    st.success(f"已添加 {len(added)} 只：{', '.join(added)}")
+                else:
+                    st.warning("没有新的有效代码（请检查是否为6位、非科创/创业板/北交所）")
+        if st.session_state.band_manual_codes:
+            st.caption(f"当前手动列表（{len(st.session_state.band_manual_codes)} 只）：{', '.join(st.session_state.band_manual_codes)}")
+            col_clear, col_remove = st.columns([1, 1])
+            with col_clear:
+                if st.button("🧹 清空手动列表", use_container_width=True, key="clear_band_manual"):
+                    st.session_state.band_manual_codes = []; save_band_manual([]); st.rerun()
+            with col_remove:
+                if st.button("❌ 删除最后一只", use_container_width=True, key="pop_band_manual"):
+                    if st.session_state.band_manual_codes:
+                        st.session_state.band_manual_codes.pop(); save_band_manual(st.session_state.band_manual_codes); st.rerun()
+        custom_codes = st.session_state.band_manual_codes
+    elif scan_scope == "指定板块":
+        board_name = st.selectbox("选择板块", list(BAND_BOARD_MAP.keys()), key="band_board_select")
+        board_codes = BAND_BOARD_MAP.get(board_name, [])
+        if board_codes:
+            st.caption(f"已加载「{board_name}」板块 {len(board_codes)} 只成分股（预定义列表）")
+            custom_codes = board_codes
+        else:
+            st.warning(f"未能加载「{board_name}」板块成分股，将回退到全市场扫描")
+
+    scan_label = "🔍 扫描波段启动股"
+    if scan_scope == "仅手动自选":
+        scan_label = "🔍 扫描手动自选"
+    elif scan_scope == "指定板块":
+        scan_label = "🔍 扫描指定板块"
+    if st.button(scan_label, type="primary", use_container_width=True, key="scan_stocks"):
         try:
-            with st.spinner("正在拉取全市场行情并分析波段状态..."):
-                st.session_state.scan_results = screen_band_stocks()
+            with st.spinner("正在拉取行情并分析波段状态..."):
+                st.session_state.scan_results = screen_band_stocks(custom_codes=custom_codes)
                 st.session_state.scan_time = now_cn_str('%Y-%m-%d %H:%M:%S')
             st.rerun()
         except Exception:
@@ -822,7 +956,10 @@ def ai_band_picker_ui():
         if df_r is None or df_r.empty:
             if 'scan_stats' in st.session_state:
                 st.caption(f"📊 扫描漏斗: {st.session_state.scan_stats}")
-            st.warning("本次扫描未找到符合条件的波段股，可稍后（或收盘后）重试。")
+            if scan_scope == "全市场扫描" and st.session_state.get('scan_stats', '').startswith("❌ 全市场接口"):
+                st.info("💡 提示：全市场接口受网络/时段影响较大，可尝试「仅手动自选」输入几只股票，或选择「指定板块」进行扫描。")
+            else:
+                st.warning("本次扫描未找到符合条件的波段股，可稍后（或收盘后）重试。")
         else:
             if 'scan_time' in st.session_state:
                 st.caption(f"上次扫描时间: {st.session_state.scan_time}")
@@ -882,29 +1019,69 @@ def get_market_sentiment():
 
 @st.cache_data(ttl=600)
 def get_industry_prosperity():
+    """获取行业板块景气度，带多 host 容错。"""
     industries = {}
-    try:
-        url = "https://push2.eastmoney.com/api/qt/clist/get"
-        params = {"pn": "1", "pz": "100", "po": "1", "np": "1", "fltt": "2", "invt": "2", "fid": "f62", "fs": "m:90+t:2", "fields": "f12,f14,f2,f3,f62"}
-        res = requests.get(url, params=params, timeout=8); data = res.json()
-        if data.get("data") and data["data"].get("diff"):
-            for item in data["data"]["diff"]:
-                name = item.get("f14", ""); main_flow = item.get("f62", 0) / 1e8; change_pct = item.get("f3", 0)
-                industries[name] = {'score': round(min(100, max(0, 50 + main_flow * 2 + change_pct * 3)), 1), 'change_pct': change_pct, 'main_flow': round(main_flow, 2)}
-    except Exception: pass
+    params = {"pn": "1", "pz": "100", "po": "1", "np": "1", "fltt": "2", "invt": "2", "fid": "f62", "fs": "m:90+t:2", "fields": "f12,f14,f2,f3,f62"}
+    hosts = ["https://push2delay.eastmoney.com", "https://push2.eastmoney.com",
+             "https://7.push2.eastmoney.com", "https://17.push2.eastmoney.com",
+             "https://29.push2.eastmoney.com", "https://82.push2.eastmoney.com"]
+    for base_url in hosts:
+        try:
+            res = requests.get(f"{base_url}/api/qt/clist/get", params=params, timeout=8, headers=_REQUEST_HEADERS)
+            if res.status_code != 200:
+                continue
+            data = res.json()
+            if data.get("data") and data["data"].get("diff"):
+                for item in _diff_to_list(data["data"]["diff"]):
+                    name = item.get("f14", ""); main_flow = item.get("f62", 0) / 1e8; change_pct = item.get("f3", 0)
+                    industries[name] = {'score': round(min(100, max(0, 50 + main_flow * 2 + change_pct * 3)), 1), 'change_pct': change_pct, 'main_flow': round(main_flow, 2)}
+                break
+        except Exception:
+            continue
     return industries
+
+@st.cache_data(ttl=300)
+def get_hot_money_stocks(pages=3):
+    """获取主力资金热度榜（按主力净流入降序），返回 {code: {'main_flow': 亿元}}。
+    复用 fetch_market_page 的多 host 容错能力，避免单点接口失败。"""
+    hot = {}
+    try:
+        for pn in range(1, pages + 1):
+            page = fetch_market_page(pn, pz=100)
+            if not page:
+                break
+            for item in page:
+                code_ = str(item.get("f12") or "")
+                mf = _safe_float(item.get("f62")) / 1e8
+                if code_ and mf > 0:
+                    hot[code_] = {'main_flow': mf}
+    except Exception:
+        pass
+    return hot
 
 @st.cache_data(ttl=900)
 def get_stock_full_data(symbol):
+    """获取个股完整数据，带多 host 容错。"""
     try:
         prefix = "sh" if symbol.startswith(('5', '6', '9')) else "sz"
         secid = f"{'1' if prefix == 'sh' else '0'}.{symbol}"
-        url = "https://push2.eastmoney.com/api/qt/stock/get"
-        res = requests.get(url, params={"fltt": "2", "invt": "2", "fields": "f43,f57,f58,f9,f23,f37,f45,f46,f48,f50,f62,f116,f117,f127,f168", "secid": secid}, timeout=6).json()
-        d = res.get("data") or {}
-        if not d: return None
-        def sf(v): return float(v) if v not in (None, "-", "") else None
-        return {'pe': sf(d.get('f9')), 'pb': sf(d.get('f23')), 'roe': sf(d.get('f37')), 'profit': sf(d.get('f45')), 'industry': d.get('f127') or "", 'main_flow': sf(d.get('f62')), 'total_mv': sf(d.get('f116')), 'circ_mv': sf(d.get('f117')), 'turnover': sf(d.get('f168')), 'vol_ratio': sf(d.get('f50'))}
+        params = {"fltt": "2", "invt": "2", "fields": "f43,f57,f58,f9,f23,f37,f45,f46,f48,f50,f62,f116,f117,f127,f168", "secid": secid}
+        hosts = ["https://push2delay.eastmoney.com", "https://push2.eastmoney.com",
+                 "https://7.push2.eastmoney.com", "https://17.push2.eastmoney.com",
+                 "https://29.push2.eastmoney.com", "https://82.push2.eastmoney.com"]
+        for base_url in hosts:
+            try:
+                res = requests.get(f"{base_url}/api/qt/stock/get", params=params, timeout=6, headers=_REQUEST_HEADERS)
+                if res.status_code != 200:
+                    continue
+                d = res.json().get("data") or {}
+                if not d:
+                    continue
+                def sf(v): return float(v) if v not in (None, "-", "") else None
+                return {'pe': sf(d.get('f9')), 'pb': sf(d.get('f23')), 'roe': sf(d.get('f37')), 'profit': sf(d.get('f45')), 'industry': d.get('f127') or "", 'main_flow': sf(d.get('f62')), 'total_mv': sf(d.get('f116')), 'circ_mv': sf(d.get('f117')), 'turnover': sf(d.get('f168')), 'vol_ratio': sf(d.get('f50'))}
+            except Exception:
+                continue
+        return None
     except Exception: return None
 
 def calculate_dynamic_score(symbol, full_data, industry_data, sentiment, hot_money, hist_metrics):

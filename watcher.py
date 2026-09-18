@@ -265,7 +265,7 @@ def check_symbol(sym, market_change, log, today):
             return False
         df['Vol_MA5'] = df['Volume'].rolling(5).mean()
 
-        buy_df = df[(df['Time'] >= "0945") & (df['Time'] <= "1445")].copy()
+        buy_df = df[(df['Time'] >= "0935") & (df['Time'] <= "1445")].copy()
         sell_df = df[(df['Time'] >= "0930") & (df['Time'] <= "1455")].copy()
         if buy_df.empty or sell_df.empty:
             return False
@@ -275,14 +275,23 @@ def check_symbol(sym, market_change, log, today):
         high = df['Price'].max()
         low = df['Price'].min()
         avg = df['AvgPrice'].mean()
-        dev = max(0.003, min(((high - low) / avg) * 0.4, 0.015)) if avg > 0 else 0.008
+        day_range = max(high - low, 0.001)
+        dev = max(0.003, min(((high - low) / avg) * 0.5, 0.015)) if avg > 0 else 0.008
 
-        buy_pts = buy_df[(buy_df['Price'] < buy_df['AvgPrice'] * (1 - dev)) &
-                         (buy_df['Volume'] < buy_df['Vol_MA5'] * 0.7) &
-                         (buy_df['MACD_UP'] == True)]
-        sell_pts = sell_df[(sell_df['Price'] > sell_df['AvgPrice'] * (1 + dev)) &
-                           (sell_df['Volume'] > sell_df['Vol_MA5'] * 1.5) &
-                           (sell_df['MACD_DOWN'] == True)]
+        # 价格位置、止跌/滞涨结构
+        buy_df['Price_Position'] = (buy_df['Price'] - low) / day_range
+        sell_df['Price_Position'] = (sell_df['Price'] - low) / day_range
+        buy_df['STOP_FALL'] = (buy_df['Price'] >= buy_df['Price'].shift(1)) & (buy_df['Price'].shift(1) <= buy_df['Price'].shift(2))
+        sell_df['STOP_RISE'] = (sell_df['Price'] <= sell_df['Price'].shift(1)) & (sell_df['Price'].shift(1) >= sell_df['Price'].shift(2))
+
+        # 买点：回踩均价线+MACD向上，或接近日内低点止跌+（MACD向上或缩量）
+        buy_cond_a = (buy_df['Price'] < buy_df['AvgPrice'] * (1 - dev * 0.7)) & buy_df['MACD_UP']
+        buy_cond_b = (buy_df['Price_Position'] <= 0.30) & buy_df['STOP_FALL'] & (buy_df['MACD_UP'] | (buy_df['Volume'] < buy_df['Vol_MA5'] * 0.85))
+        buy_pts = buy_df[buy_cond_a | buy_cond_b]
+        # 卖点：冲高乖离均价线+MACD向下，或接近日内高点滞涨+（MACD向下或放量）
+        sell_cond_a = (sell_df['Price'] > sell_df['AvgPrice'] * (1 + dev * 0.7)) & sell_df['MACD_DOWN']
+        sell_cond_b = (sell_df['Price_Position'] >= 0.70) & sell_df['STOP_RISE'] & (sell_df['MACD_DOWN'] | (sell_df['Volume'] > sell_df['Vol_MA5'] * 1.2))
+        sell_pts = sell_df[sell_cond_a | sell_cond_b]
 
         # 只推送"最近 WINDOW_MIN 分钟内刚形成"的信号，且在本批新信号里取最优价位
         now_min = now_cn().hour * 60 + now_cn().minute
@@ -337,7 +346,7 @@ def check_symbol(sym, market_change, log, today):
                     ok = send_wechat(
                         f"【卖点】{name}",
                         f"股票：{name} ({sym})\n时间：{t_str}（北京时间）\n"
-                        f"价格：{price:.3f}\n依据：冲高乖离均价线放量 + MACD 拐头向下\n"
+                        f"价格：{price:.3f}\n依据：分时卖点触发（冲高乖离或日内高点滞涨）\n"
                         f"偏离均价：{(price / float(row['AvgPrice']) - 1) * 100:+.2f}%\n\n"
                         f"仅做参考，请自行判断。"
                     )
