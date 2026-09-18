@@ -15,7 +15,9 @@
 import os
 import json
 import math
+import re
 import sys
+import time as _time_module
 from datetime import datetime, time, timedelta, timezone
 
 import requests
@@ -40,33 +42,86 @@ def is_trading_time():
     t = now_cn().time()
     return (time(9, 25) <= t <= time(11, 32)) or (time(12, 58) <= t <= time(15, 2))
 
+# ---- 统一 HTTP 层（容错策略与 ai_stock_terminal.py 保持一致）----
+_HTTP_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Referer": "https://gu.qq.com/",
+    "Accept": "*/*",
+}
+_QQ_HOSTS = ["https://web.ifzq.gtimg.cn", "https://ifzq.gtimg.cn"]   # 腾讯主/备域名
+
+def http_get(url, timeout=(5, 10), retries=2, encoding=None):
+    """带 UA / 超时 / 重试的 GET。返回 (ok, text, err)，绝不抛异常。
+
+    原先各处 requests.get(timeout=5) 无重试、无 UA，GitHub Actions 跑在海外节点，
+    跨境访问腾讯接口偶发超时就整轮巡检失效。"""
+    last = "未知错误"
+    for i in range(max(1, retries)):
+        try:
+            r = requests.get(url, headers=_HTTP_HEADERS, timeout=timeout)
+            if encoding:
+                r.encoding = encoding
+            if r.status_code != 200:
+                last = f"HTTP {r.status_code}"
+                continue
+            return True, r.text, ""
+        except Exception as e:
+            last = f"{type(e).__name__}: {str(e)[:120]}"
+            if i < max(1, retries) - 1:
+                _time_module.sleep(0.4 * (i + 1))
+    return False, "", last
+
+def http_get_json(url, timeout=(5, 10), retries=2):
+    ok, text, err = http_get(url, timeout=timeout, retries=retries)
+    if not ok:
+        return False, None, err
+    try:
+        return True, json.loads(text), ""
+    except Exception as e:
+        return False, None, f"JSON 解析失败: {str(e)[:80]}"
+
+# 行情代码前缀判定。⚠️ 必须与 ai_stock_terminal.py 的 _quote_prefix 保持完全一致，
+# 改动时请同步两处：北交所（43/83/87/88/92）和沪市转债（110/111/113/118/119）
+# 若被误判成 sz 前缀，接口会返回空数据，监控将静默跳过该股票。
+_BJ_PREFIXES = ('43', '83', '87', '88', '92')
+_SH_BOND_PREFIXES = ('110', '111', '113', '118', '119')
+
+def quote_prefix(symbol):
+    s = str(symbol).strip()
+    if not re.fullmatch(r'\d{6}', s):
+        return "sz"
+    if s.startswith(_BJ_PREFIXES):
+        return "bj"
+    if s.startswith(_SH_BOND_PREFIXES):
+        return "sh"
+    if s.startswith('12'):
+        return "sz"
+    if s.startswith(('5', '6', '9')):
+        return "sh"
+    return "sz"
+
 def get_code(symbol):
-    return f"sh{symbol}" if symbol.startswith(('5', '6', '9')) else f"sz{symbol}"
+    return f"{quote_prefix(symbol)}{str(symbol).strip()}"
 
 def get_stock_name(symbol):
-    url = f"https://qt.gtimg.cn/q={get_code(symbol)}"
-    try:
-        res = requests.get(url, timeout=5)
-        res.encoding = 'gbk'
-        if "~" in res.text:
-            parts = res.text.split("~")
-            if len(parts) > 1:
-                return parts[1].strip('"')
-    except Exception:
-        pass
+    ok, text, _err = http_get(f"https://qt.gtimg.cn/q={get_code(symbol)}", encoding='gbk')
+    if ok and "~" in text:
+        parts = text.split("~")
+        if len(parts) > 1 and parts[1].strip():
+            return parts[1].strip('"')
     return symbol
 
 def get_market_change():
     """上证指数涨跌幅(%)"""
-    try:
-        res = requests.get("https://qt.gtimg.cn/q=sh000001", timeout=5)
-        res.encoding = 'gbk'
-        if "~" in res.text:
-            parts = res.text.split("~")
-            if len(parts) > 32:
+    ok, text, _err = http_get("https://qt.gtimg.cn/q=sh000001", encoding='gbk')
+    if ok and "~" in text:
+        parts = text.split("~")
+        if len(parts) > 32:
+            try:
                 return float(parts[32])
-    except Exception:
-        pass
+            except (TypeError, ValueError):
+                pass
     return 0.0
 
 def send_wechat(title, content):
@@ -111,12 +166,22 @@ def save_log(log):
 # ============ 分时数据（与网页端同逻辑）============
 
 def get_minute_data(code):
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={code}"
+    raw = None
+    for host in _QQ_HOSTS:
+        ok, js, err = http_get_json(f"{host}/appstock/app/minute/query?code={code}")
+        if not ok:
+            print(f"  分时接口不可用 {host}: {err}")
+            continue
+        if not isinstance(js, dict) or js.get("code") != 0:
+            print(f"  分时接口返回异常 {host}: code={js.get('code') if isinstance(js, dict) else '非JSON'}")
+            continue
+        node = (js.get("data") or {}).get(code) or {}
+        raw = ((node.get("data") or {}) or {}).get("data")
+        if raw:
+            break
+    if not raw:
+        return None
     try:
-        res = requests.get(url, timeout=6).json()
-        if res.get("code") != 0:
-            return None
-        raw = res["data"][code]["data"]["data"]
         records = [item.split(" ") for item in raw]
         if not records:
             return None
@@ -175,24 +240,38 @@ def get_minute_data(code):
 # ============ 日线数据（用于波段结束预警）============
 
 def _get_daily_history(symbol):
-    """从腾讯获取日线复权数据。"""
-    prefix = "sh" if symbol.startswith(('5', '6', '9')) else "sz"
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{symbol},day,,,260,qfq"
-    try:
-        res = requests.get(url, timeout=8).json()
-        if res.get("code") != 0:
-            return None
-        node = res["data"].get(f"{prefix}{symbol}", {})
+    """获取日线前复权数据（波段结束预警用）。腾讯主/备域名轮询，返回至少 60 条。
+
+    原先只打单个域名且 prefix 用 startswith 硬判，北交所/沪市转债会拿不到数据。"""
+    code = get_code(symbol)
+    for host in _QQ_HOSTS:
+        ok, js, err = http_get_json(f"{host}/appstock/app/fqkline/get?param={code},day,,,260,qfq")
+        if not ok:
+            print(f"  日线接口不可用 {host}: {err}")
+            continue
+        if not isinstance(js, dict) or js.get("code") != 0:
+            continue
+        node = (js.get("data") or {}).get(code) or {}
         kline = node.get("qfqday") or node.get("day")
-        if not kline or len(kline) < 60:
-            return None
-        df = pd.DataFrame(kline).iloc[:, :6]
-        df.columns = ['Date', 'Open', 'Close', 'High', 'Low', 'Volume']
-        for col in ['Open', 'Close', 'High', 'Low', 'Volume']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        return df.dropna().sort_values('Date').reset_index(drop=True)
-    except Exception:
-        return None
+        if not kline:
+            print(f"  日线为空 {code}（该代码可能不受腾讯支持）")
+            continue
+        try:
+            df = pd.DataFrame(kline)
+            if df.shape[1] < 6:
+                continue
+            df = df.iloc[:, :6]
+            df.columns = ['Date', 'Open', 'Close', 'High', 'Low', 'Volume']
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            for col in ['Open', 'Close', 'High', 'Low', 'Volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            df = df.dropna(subset=['Date', 'Close']).sort_values('Date').reset_index(drop=True)
+        except Exception as e:
+            print(f"  日线解析失败 {code}: {e}")
+            continue
+        if len(df) >= 60:
+            return df
+    return None
 
 
 def check_band_end(sym, log, today):
@@ -381,16 +460,22 @@ def main():
     log = load_log()
     today = now_cn().strftime('%Y-%m-%d')
     market_change = get_market_change()
-    print(f"上证 {market_change:+.2f}% | 监控 {len(WATCHLIST)} 只：{', '.join(WATCHLIST)}")
+    # 北交所标的：腾讯接口不提供分时/日线，这里显式提示并跳过，
+    # 避免「配置了却没任何输出」这种最难排查的静默失效。
+    bj_syms = [s for s in WATCHLIST if quote_prefix(s) == 'bj']
+    if bj_syms:
+        print(f"⚠️ 北交所标的 {len(bj_syms)} 只（腾讯不提供行情，本次跳过）：{', '.join(bj_syms)}")
+    tradeable = [s for s in WATCHLIST if quote_prefix(s) != 'bj']
+    print(f"上证 {market_change:+.2f}% | 监控 {len(tradeable)} 只：{', '.join(tradeable) if tradeable else '（无）'}")
 
     pushed = 0
-    for sym in WATCHLIST:
+    for sym in tradeable:
         if check_symbol(sym, market_change, log, today):
             pushed += 1
 
     # 波段结束预警（日线级别，每天同一股票只提醒一次）
     band_alert = 0
-    for sym in WATCHLIST:
+    for sym in tradeable:
         if check_band_end(sym, log, today):
             band_alert += 1
 
