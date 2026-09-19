@@ -2213,15 +2213,17 @@ def band_memory_push_github(mem, merge_remote=True):
     if encrypted_remote and not band_crypto_enabled():
         return False, ("仓库里的摘要是加密的，但本端没配 BAND_KEY，已中止同步"
                        "（否则会把密文覆盖成明文，等于加密白做）")
-    payload_obj = _band_memory_digest(mem)
+    digest_obj = _band_memory_digest(mem)
+    # ★ 条数必须在**加密前**统计：密文对象只有 {v, enc} 两个键，加密后再取 'stocks'
+    #   恒为 0，提交信息会永远显示「更新波段记忆（0 只）」，看着像清单是空的（实测踩过）。
+    n = len(digest_obj.get('stocks', {}))
     try:
-        payload_obj = band_encrypt_obj(payload_obj)
+        payload_obj = band_encrypt_obj(digest_obj)
     except Exception as e:
         _log("band_memory_push_github:encrypt", e)
         return False, f"加密失败，已中止同步（不会以明文提交）：{str(e)[:120]}"
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_WATCH_PATH}"
     content = base64.b64encode(json.dumps(payload_obj, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii")
-    n = len(payload_obj.get('stocks', {}))
     for attempt in (1, 2):
         try:
             sha = None
