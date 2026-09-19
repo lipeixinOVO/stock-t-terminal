@@ -2138,6 +2138,60 @@ def band_memory_pull_github():
         return ok, msg, None
     return True, f"已拉取云端摘要（{msg}）", band_memory_merge_digest(load_band_memory(), digest)
 
+
+def _remote_memory_state():
+    """远端 band_watch.json 是否已存在：'missing' / 'present' / 'unknown'（取不到，无法判断）。
+
+    为什么要单独探一下：`_fetch_remote_memory()` 把「文件不存在」与「文件在但读不出来
+    （网络挂了 / 密钥不对）」**都**归成 digest=None，可这两种情况的处置必须相反 ——
+    前者要自动创建，后者**绝不能**自动覆盖（否则会把别人密钥加密的数据冲掉）。"""
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_WATCH_PATH}"
+    try:
+        r = requests.get(url, headers=_github_headers(_github_token()),
+                         params={"ref": "main"}, timeout=(5, 15))
+    except Exception as e:
+        _log("_remote_memory_state", e)
+        return "unknown"
+    if r.status_code == 404:
+        return "missing"
+    return "present" if r.status_code == 200 else "unknown"
+
+
+def band_memory_autosync(mem):
+    """静默把本地记忆「保底」同步到仓库 —— 免得每次都得手动点「同步到云端」。
+
+    只在**确实有事可做**时才提交，绝不刷提交：
+      ① 远端还没有 band_watch.json（首次点火，让云端巡检知道要盯哪些票）；或
+      ② 远端已存在且能正常读出，但缺少本地已记住的某些股票代码。
+
+    ★ 刻意**不**拿 status_ts / last_check 当「有变化？」的判据：云端巡检每 5 分钟就会
+      改写这些字段，用它判断会让网页端与巡检**互相刷提交**。本仓库是 public，
+      提交历史会被刷爆。状态新鲜度归云端巡检管，这边只负责「名单别丢」。
+    ★ 远端存在但读不出来时一律不动，绝不自动覆盖。
+
+    异常全部吞掉并记日志，绝不影响页面渲染。返回 (是否推送成功, 提示语)。"""
+    try:
+        if not _github_token():
+            return False, ""
+        codes = set((mem.get('stocks') or {}).keys())
+        if not codes:
+            return False, ""            # 本地空 → 不推，免得把云端清单清空
+        state = _remote_memory_state()
+        if state == "unknown":
+            return False, ""            # 判断不了就别动，下次再说
+        if state == "present":
+            ok, _msg, digest, _enc = _fetch_remote_memory()
+            if not ok or digest is None:
+                return False, ""        # 读不出来 → 保守不动，避免覆盖
+            if not (codes - set((digest.get('stocks') or {}).keys())):
+                return False, ""        # 远端已覆盖本地全部条目 → 无事可做
+        ok, m = band_memory_push_github(mem)
+        return ok, (f"已自动同步到云端（{len(codes)} 只）" if ok else f"自动同步失败：{m}")
+    except Exception as e:
+        _log("band_memory_autosync", e)
+        return False, ""
+
+
 def band_memory_push_github(mem, merge_remote=True):
     """把「脱敏摘要」提交到仓库。返回 (ok, msg)。
 
@@ -3279,6 +3333,17 @@ def band_memory_ui():
                 st.session_state.band_memory_sync_msg = f"{msg_pull}；已并入本地（{before} → {after} 只）"
 
     mem = load_band_memory()
+
+    # ---- 静默「保底」自动保存到云端 ----
+    # 远端还没有 band_watch.json、或远端缺本地某些票时，自动补推一次；其余情况一律不提交
+    # （见 band_memory_autosync 的注释：绝不能让网页端与云端巡检互相刷提交）。
+    # 每个会话只跑一次；之后任何改动（记入/备注/归档/删除）本来就会各自即时推送。
+    if _github_token() and not st.session_state.get('band_memory_autosync_done'):
+        st.session_state.band_memory_autosync_done = True
+        _auto_ok, _auto_msg = band_memory_autosync(mem)
+        if _auto_msg:
+            st.session_state.band_memory_sync_msg = _auto_msg
+
     stats = band_memory_stats(mem)
 
     if not _github_token():
