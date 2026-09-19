@@ -1,0 +1,120 @@
+name: 全市场样本自动采集（逻辑验证语料）
+
+# 这个 workflow 的定位：让「样本语料」在**没人打开网页、也没开电脑**的情况下继续长。
+# 采集口径与网页端「🧪 逻辑有效性验证 → 采集今日全市场样本」完全同一份代码
+# （都走 sample_harvest.py → AST 抽取 ai_stock_terminal.py 里的真实函数），
+# 所以云端采的样本和你本机采的样本逐字段同构。
+#
+# ★ 为什么不把语料提交回仓库（对比 notify.yml 回写 band_watch.json）：
+#   ① 体积：几十万行、数 MB，每天提交一次二进制会把仓库历史压垮；
+#   ② 隐私：本仓库是 public，语料 = 完整的「策略特征表 + 成绩单」，公开等于送人。
+#   所以这里走 actions/cache（跨运行保留、不进仓库树）+ 加密产物（BAND_KEY）。
+#   本机要拿云端采的样本：下载 Artifact 后
+#     python sample_harvest.py --pull band_samples.enc
+
+on:
+  workflow_dispatch:            # 允许在 Actions 页面手动点「Run workflow」
+    inputs:
+      mode:
+        description: "forward=只采今天 / backfill=历史回填 / merge=合并分片 / stats=看报表"
+        required: false
+        default: forward
+        type: choice
+        options: [forward, backfill, merge, stats]
+      lookback:
+        description: "仅 backfill 用：回看多少个交易日"
+        required: false
+        default: "450"
+        type: string
+  schedule:
+    # 北京 15:40 = UTC 07:40，收盘后半小时（周一至周五）
+    # 未配置 BAND_KEY 时这一步会自动跳过（不会报红），配好即自动开始积累。
+    - cron: "40 7 * * 1-5"
+
+# ★ 只读权限：刻意不给 contents: write —— 从机制上保证语料不可能被提交进仓库
+permissions:
+  contents: read
+
+# 串行化，避免两次运行同时写同一份缓存
+concurrency:
+  group: sample-harvest
+  cancel-in-progress: false
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install requests pandas numpy cryptography
+
+      - name: 计算缓存键（北京日期）
+        id: ckey
+        run: echo "key=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      - name: 恢复语料缓存（承接上一次采集的结果）
+        uses: actions/cache/restore@v4
+        with:
+          path: band_samples.enc
+          key: band-samples-${{ steps.ckey.outputs.key }}-${{ github.run_id }}
+          restore-keys: |
+            band-samples-
+
+      - name: 采集今日全市场样本
+        env:
+          BAND_KEY: ${{ secrets.BAND_KEY }}
+          # 采集口径：全市场、不限板块、不限数量（给机器验证逻辑用，不给你看的那份名单）
+        run: |
+          if [ -z "$BAND_KEY" ]; then
+            echo "::warning::未配置 BAND_KEY：已跳过本次采集。语料里含完整策略特征与收益率，"
+            echo "::warning::绝不允许以明文落进 public 仓库的缓存 —— 所以这里 fail-closed 而不是退回明文。"
+            echo "::warning::配置路径：本仓库 Settings → Secrets and variables → Actions → New secret，"
+            echo "::warning::名称 BAND_KEY，值与 Streamlit Secrets 里的 BAND_KEY 完全一致。"
+            exit 0
+          fi
+          MODE="${{ github.event.inputs.mode || 'forward' }}"
+          LOOKBACK="${{ github.event.inputs.lookback || '450' }}"
+          echo "===== 模式：$MODE ｜ 回看：$LOOKBACK ====="
+          if [ "$MODE" = "forward" ]; then
+            python sample_harvest.py --forward --store enc --file band_samples.enc
+          elif [ "$MODE" = "backfill" ]; then
+            python sample_harvest.py --backfill "$LOOKBACK" --store enc --file band_samples.enc
+          elif [ "$MODE" = "merge" ]; then
+            python sample_harvest.py --merge --store enc --file band_samples.enc
+          else
+            python sample_harvest.py --stats --store enc --file band_samples.enc
+          fi
+
+      - name: 确认产物存在
+        if: always()
+        run: |
+          if [ -f band_samples.enc ]; then
+            echo "---- 加密语料 ----"
+            ls -la band_samples.enc
+          else
+            echo "(没有 band_samples.enc：首次运行或本次跳过时属正常)"
+          fi
+
+      - name: 保存语料缓存（供下一次运行承接）
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: band_samples.enc
+          key: band-samples-${{ steps.ckey.outputs.key }}-${{ github.run_id }}
+
+      - name: 上传加密语料（供本机 --pull 拉回）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: band-samples-${{ steps.ckey.outputs.key }}
+          path: band_samples.enc
+          if-no-files-found: ignore
+          retention-days: 30
