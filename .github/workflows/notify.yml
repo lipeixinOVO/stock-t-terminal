@@ -37,7 +37,7 @@ jobs:
           python-version: "3.11"
 
       - name: 安装依赖
-        run: pip install requests pandas numpy
+        run: pip install requests pandas numpy cryptography
 
       - name: 计算今日缓存键（北京日期）
         id: ckey
@@ -57,6 +57,10 @@ jobs:
           WATCHLIST: ${{ secrets.WATCHLIST }}
           # 可选：额外的波段监控名单（不依赖网页端「波段记忆」，逗号分隔 6 位代码）
           BAND_WATCHLIST: ${{ secrets.BAND_WATCHLIST }}
+          # 可选：波段摘要的加密密钥。配了它之后 band_watch.json 会以密文提交，
+          # 连「关注了哪些股票」也不公开。⚠️ 必须与 Streamlit Secrets 里的 BAND_KEY 完全一致，
+          # 否则摘要解不开，巡检会打印醒目告警并停止按记忆清单监控。
+          BAND_KEY: ${{ secrets.BAND_KEY }}
           ALERT_WINDOW_MIN: "10"
           FORCE_RUN: ${{ github.event.inputs.force == 'true' && '1' || '0' }}
         run: python watcher.py
