@@ -14,6 +14,7 @@ import sys
 import gzip
 import hashlib
 import time as _time_module
+import threading
 from datetime import datetime, time, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -88,12 +89,16 @@ st.title("🤖 日内做T信号标注助手")
 # 那一次运行里为 True——于是活停在一半、结果也没落盘，用户只能再点一次。
 # 因为是**全局**计时器，所以几乎所有的长任务都是这个毛病，不是单个按钮写错了。
 # 修法：把"点击"和"执行"拆成两次运行。点击那次只登记待办 + 立刻 rerun；下一次运行发现有待办
-# 就把自动刷新间隔放宽到 30 分钟（组件照旧渲染 → 组件自带的 debounce 会 clearInterval 掉那根
+# 就把自动刷新间隔放宽到 60 分钟（组件照旧渲染 → 组件自带的 debounce 会 clearInterval 掉那根
 # 60 秒的定时器，不会出现"自动刷新被永久关掉"），这一次运行就砍不到了，可以安心把活干完。
+# ★ 这个窗口必须**大于最长任务的耗时**，否则等于换了个时间点再砍一次：全市场采集改造前
+#   要 100 分钟以上，原来的 30 分钟窗口根本不够（实测就发生了）。现已把取数改成
+#   「连接复用 + 8 线程并发」（实测两项合计约 47 倍），全市场降到十几分钟以内，
+#   窗口同时放宽到 60 分钟，两头都留了余量。改这个值之前先确认最长任务要跑多久。
 _LONG_TASK_KEY = "_long_task_pending"
 _LONG_TASK_TTL = 120             # 秒；待办超过这个时长视为作废，避免状态卡死
 _AUTOREFRESH_MS = 60000          # 正常：60 秒
-_AUTOREFRESH_BUSY_MS = 1800000   # 有待办：30 分钟（等价于暂停，但组件仍在 → 不会冻结页面）
+_AUTOREFRESH_BUSY_MS = 3600000   # 有待办：60 分钟（等价于暂停，但组件仍在 → 不会冻结页面）
 
 def _long_task_pending():
     """当前是否有一个"即将执行"的长任务。顺带清理过期待办。
@@ -286,12 +291,32 @@ class DataFetchError(Exception):
         brief = "；".join(f"{s}={e}" for s, e in self.attempts) if self.attempts else "无可用数据源"
         super().__init__(f"{symbol} 日线获取失败：{brief}")
 
+# ★ 连接复用：原来每次取数都是裸 `requests.get`，即**每个请求都重新做一次 TCP+TLS 握手**。
+#   全市场采集要发几千次请求，握手开销直接翻倍（实测本机每只 800ms，其中很大一块是握手）。
+#   改成「每线程一个 Session」：线程内复用连接，握手摊薄到每线程一次。
+#   为什么必须**线程独立**：requests.Session 官方明确不是线程安全的，共用会串数据。
+#   为什么用 `getattr` + try 兜底：拿不到 Session 时退回 requests 模块本身（它同样有 .get），
+#   保证「Session 出问题」永远不会退化成「取不到数据」——这条比提速重要得多。
+_TLS_LOCAL = threading.local()
+
+def _http_session():
+    """取本线程的 requests.Session（复用连接）。任何异常都回退到 requests 模块。"""
+    try:
+        s = getattr(_TLS_LOCAL, "sess", None)
+        if s is None:
+            s = requests.Session()
+            _TLS_LOCAL.sess = s
+        return s
+    except Exception as e:
+        _log("_http_session", e)
+        return requests
+
 def _http_get_json(url, params=None, timeout=(5, 10), retries=2):
     """带 UA / 超时 / 重试的 JSON GET。返回 (ok, data, err)。绝不抛异常。"""
     last_err = "未知错误"
     for i in range(max(1, retries)):
         try:
-            r = requests.get(url, params=params, headers=_HTTP_HEADERS, timeout=timeout)
+            r = _http_session().get(url, params=params, headers=_HTTP_HEADERS, timeout=timeout)
             if r.status_code != 200:
                 last_err = f"HTTP {r.status_code}"
                 continue
@@ -307,7 +332,7 @@ def _http_get_text(url, encoding='gbk', timeout=(5, 10), retries=2):
     last_err = "未知错误"
     for i in range(max(1, retries)):
         try:
-            r = requests.get(url, headers=_HTTP_HEADERS, timeout=timeout)
+            r = _http_session().get(url, headers=_HTTP_HEADERS, timeout=timeout)
             r.encoding = encoding
             if r.status_code != 200:
                 last_err = f"HTTP {r.status_code}"
@@ -2348,6 +2373,21 @@ SAMPLE_MAX_STALE_DAYS = 30
 # 成交量单位：腾讯日线按「手」返回（×100 股），新浪按「股」。实测两者算出的成交额一致，
 # 但单位不同 —— 直接用 raw Volume 算成交额会差 100 倍，这里显式声明，不做猜测。
 SAMPLE_VOL_UNIT = {"qq": 100.0, "sina": 1.0}
+# ★ 采样取数的提速。**这里曾经是"裸 requests.get + 串行"**：全市场 3750 只 × 每只约 1.7 秒
+#   （云端在美国、接口在国内，单次往返就要几百毫秒）≈ **100 分钟**，
+#   而页面顶部的自动刷新「让路」窗口只有 30 分钟 → 跑到一半必被掐断、结果全丢。
+#
+#   提速分两块，**实测的主因是连接复用，不是并发**（见 _debug_probe/bench_harvest.py，60 只真票）：
+#     ① 连接复用（`_http_session`，每线程一个 Session）：3251ms/只 → 200ms/只，**16.2×**
+#        根因是裸 requests.get 每次请求都重做一次 TCP+TLS 握手，本机实测握手就占约 1.6 秒。
+#     ② 8 线程并发：200ms/只 → 69ms/只，**2.9×**
+#     合计相对改造前 **47×**，产出内容与顺序完全一致（bench 里有断言）。
+#   ⚠️ 线程数不是越大越好：实测 16 线程(90ms)、24 线程(117ms) 反而比 8 线程(69ms) 慢，
+#      说明单条网络路径的带宽/队列是瓶颈。改这个值之前先跑 bench 确认，别凭直觉调大。
+#   为什么敢并发：采样专用取数 `_sample_fetch_kline` **直接调取数函数**，
+#   既不写磁盘缓存（`_cache_kline`）也不碰 `LAST_FETCH_DIAG`，全程无共享可写状态。
+#   设成 1 就退化为原来的串行行为（排查限流问题时用）。
+SAMPLE_FETCH_WORKERS = 8
 SAMPLE_SOURCES = ("backfill", "forward")
 SAMPLE_SOURCE_LABEL = {
     "forward": "前瞻采集（真实判断，可作为成绩）",
@@ -2620,6 +2660,69 @@ def _sample_fetch_kline(code, limit=700):
     return None, 1.0
 
 
+def _sample_harvest_one(code, source, lookback_days, fetch, names, bench_df,
+                        market_meta):
+    """处理**单只**股票的全部采样工作，返回 (rows, stats)。
+
+    ★ 刻意做成「无共享可写状态」的纯函数，这样才能安全地并发跑：
+      只读 fetch / names / bench_df / market_meta，自己攒自己的 rows 与计数。
+      （采样取数 `_sample_fetch_kline` 本来就不写磁盘缓存、不碰 LAST_FETCH_DIAG，
+        所以并发不会互相踩。）
+    """
+    code = str(code).zfill(6)
+    st = {"fetched": 0, "failed": 0, "stale": 0, "evaluated": 0, "kept": 0, "fail": None}
+    try:
+        df, unit = fetch(code, 700)
+    except Exception as e:
+        df, unit = None, 1.0
+        _log(f"band_samples_harvest/fetch/{code}", e)
+    if df is None or len(df) < SAMPLE_MIN_BARS + 1:
+        st["failed"] = 1
+        st["fail"] = code
+        return [], st
+    # ★ 陈旧序列剔除：取数只保证"最近 700 根"，退市/长期停牌的票会整段落在很多年前，
+    #   长度校验拦不住它们。判据用最后一根K线距今天的自然日数，宁可少收也不收僵尸样本。
+    try:
+        _last = pd.Timestamp(df['Date'].iloc[-1])
+        if not pd.isna(_last):
+            if (pd.Timestamp(now_cn().date()) - _last.normalize()).days > SAMPLE_MAX_STALE_DAYS:
+                st["stale"] = 1
+                return [], st
+    except Exception as e:
+        _log(f"band_samples_harvest/stale/{code}", e)
+    st["fetched"] = 1
+    mask = _sample_prefilter(df)
+    n = len(df)
+    if lookback_days and lookback_days > 0:
+        start = max(SAMPLE_MIN_BARS, n - int(lookback_days))
+    else:
+        start = n - 1
+    prev_tier = None
+    out = []
+    for i in range(start, n):
+        must = bool(mask[i]) if i < len(mask) else False
+        if lookback_days and lookback_days > 0 and not must:
+            # 非「必算」日（趋势/基准对照）按 1/N 确定性抽样，其余直接跳过省下 3ms/天
+            if not _sample_hash_hit(code, df['Date'].iloc[i], SAMPLE_CTRL_EVERY):
+                continue
+        st["evaluated"] += 1
+        row = band_sample_build(code, names.get(code) or '', df, i, bench_df,
+                                source, vol_unit=unit, market_meta=market_meta)
+        if row is None:
+            continue
+        # ★ 事件去重：只按**分层变化**去重，不按"是否必算日"去重。
+        #   同一分层连续出现（比如连涨 50 天都是 trend_ctrl）只留第一天，
+        #   因为那是同一个机会；但分层一变（trend_ctrl → signal）必须留下，
+        #   那正是我们要找的信号。—— 按"必算日"去重会把行情中间的突破吞掉。
+        tier = row.get('tier')
+        if SAMPLE_EVENT_DEDUP and lookback_days and lookback_days > 0 and tier == prev_tier:
+            continue
+        prev_tier = tier
+        out.append(row)
+        st["kept"] += 1
+    return out, st
+
+
 def band_samples_harvest(codes, source='backfill', lookback_days=0, fetch=None,
                          bench_df=None, names=None, market_meta=None, progress=None,
                          max_codes=0):
@@ -2630,76 +2733,81 @@ def band_samples_harvest(codes, source='backfill', lookback_days=0, fetch=None,
 
     返回 (rows, report)。report 记下成功/失败/跳过的只数，失败原因逐代码留痕 ——
     取数失败必须可见，否则"样本怎么这么少"会变成一个查不出来的谜。
+
+    ★ 并发：每只股票的工作交给 `_sample_harvest_one`，用 `SAMPLE_FETCH_WORKERS` 个线程
+      同时跑（每只至少一次 HTTP 往返，改造前串行跑全市场要 100 分钟以上，页面早被自动刷新
+      掐断了）。**产出顺序仍按输入顺序汇总**，所以结果与串行版逐字节一致 —— 语料可复现、
+      测试可断言（test_memory §[16]、bench_harvest 都有对照断言）。
     """
     fetch = fetch or _sample_fetch_kline
     names = names or {}
-    rows = []
     report = {"codes": 0, "fetched": 0, "failed": 0, "stale": 0,
               "no_bench": bench_df is None,
               "evaluated": 0, "kept": 0, "fail_examples": []}
     cl = list(codes)
     if max_codes and max_codes > 0:
         cl = cl[:max_codes]
-    for k, code in enumerate(cl):
-        code = str(code).zfill(6)
+    total = len(cl)
+    workers = max(1, int(SAMPLE_FETCH_WORKERS or 1))
+    report["workers"] = workers
+
+    results = {}
+
+    def _safe_one(code):
+        """包一层：单只票的意外异常不许带走整批扫描（3750 只里崩一只不该全丢）。"""
+        try:
+            return _sample_harvest_one(code, source, lookback_days, fetch, names,
+                                       bench_df, market_meta)
+        except Exception as e:
+            _log(f"band_samples_harvest/worker/{code}", e)
+            return [], {"fetched": 0, "failed": 1, "stale": 0, "evaluated": 0,
+                        "kept": 0, "fail": str(code).zfill(6)}
+
+    if workers > 1 and total > 1:
+        _fut2idx = {}
+        with ThreadPoolExecutor(max_workers=workers) as _ex:
+            for _k, _c in enumerate(cl):
+                _fut2idx[_ex.submit(_safe_one, _c)] = _k
+            _done = 0
+            for _fut in as_completed(_fut2idx):
+                _k = _fut2idx[_fut]
+                _done += 1
+                try:
+                    results[_k] = _fut.result()
+                except Exception as e:                 # 理论上到不了这里，留个兜底
+                    _log(f"band_samples_harvest/future/{_k}", e)
+                    results[_k] = ([], {"fetched": 0, "failed": 1, "stale": 0,
+                                        "evaluated": 0, "kept": 0,
+                                        "fail": str(cl[_k]).zfill(6)})
+                if progress and _done % 20 == 0:
+                    try:
+                        progress(_done, total, str(cl[_k]).zfill(6))
+                    except Exception as e:
+                        _log("band_samples_harvest/progress", e)
+    else:
+        for _k, _c in enumerate(cl):
+            if progress and (_k % 20 == 0):
+                try:
+                    progress(_k, total, str(_c).zfill(6))
+                except Exception as e:
+                    _log("band_samples_harvest/progress", e)
+            results[_k] = _safe_one(_c)
+
+    # ★ 按输入顺序汇总（并发不改变产出顺序）
+    rows = []
+    for _k in range(total):
+        _r, _st = results.get(
+            _k, ([], {"fetched": 0, "failed": 1, "stale": 0, "evaluated": 0,
+                      "kept": 0, "fail": str(cl[_k]).zfill(6) if _k < total else ""}))
+        rows.extend(_r)
         report["codes"] += 1
-        if progress and (k % 20 == 0):
-            try:
-                progress(k, len(cl), code)
-            except Exception as e:
-                _log("band_samples_harvest/progress", e)
-        try:
-            df, unit = fetch(code, 700)
-        except Exception as e:
-            df, unit = None, 1.0
-            _log(f"band_samples_harvest/fetch/{code}", e)
-        if df is None or len(df) < SAMPLE_MIN_BARS + 1:
-            report["failed"] += 1
-            if len(report["fail_examples"]) < 8:
-                report["fail_examples"].append(code)
-            continue
-        # ★ 陈旧序列剔除：取数只保证"最近 700 根"，退市/长期停牌的票会整段落在很多年前，
-        #   长度校验拦不住它们。判据用最后一根K线距今天的自然日数，宁可少收也不收僵尸样本。
-        try:
-            _last = pd.Timestamp(df['Date'].iloc[-1])
-            if not pd.isna(_last):
-                if (pd.Timestamp(now_cn().date()) - _last.normalize()).days > SAMPLE_MAX_STALE_DAYS:
-                    report["stale"] += 1
-                    continue
-        except Exception as e:
-            _log(f"band_samples_harvest/stale/{code}", e)
-        report["fetched"] += 1
-        mask = _sample_prefilter(df)
-        n = len(df)
-        if lookback_days and lookback_days > 0:
-            start = max(SAMPLE_MIN_BARS, n - int(lookback_days))
-        else:
-            start = n - 1
-        prev_tier = None
-        for i in range(start, n):
-            must = bool(mask[i]) if i < len(mask) else False
-            if lookback_days and lookback_days > 0 and not must:
-                # 非「必算」日（趋势/基准对照）按 1/N 确定性抽样，其余直接跳过省下 3ms/天
-                if not _sample_hash_hit(code, df['Date'].iloc[i], SAMPLE_CTRL_EVERY):
-                    continue
-            report["evaluated"] += 1
-            row = band_sample_build(code, names.get(code) or '', df, i, bench_df,
-                                    source, vol_unit=unit, market_meta=market_meta)
-            if row is None:
-                continue
-            # ★ 事件去重：只按**分层变化**去重，不按"是否必算日"去重。
-            #   同一分层连续出现（比如连涨 50 天都是 trend_ctrl）只留第一天，
-            #   因为那是同一个机会；但分层一变（trend_ctrl → signal）必须留下，
-            #   那正是我们要找的信号。—— 按"必算日"去重会把行情中间的突破吞掉。
-            tier = row.get('tier')
-            if SAMPLE_EVENT_DEDUP and lookback_days and lookback_days > 0 and tier == prev_tier:
-                continue
-            prev_tier = tier
-            rows.append(row)
-            report["kept"] += 1
+        for _key in ("fetched", "failed", "stale", "evaluated", "kept"):
+            report[_key] += _st.get(_key, 0)
+        if _st.get("fail") and len(report["fail_examples"]) < 8:
+            report["fail_examples"].append(_st["fail"])
     if progress:
         try:
-            progress(len(cl), len(cl), '')
+            progress(total, total, '')
         except Exception as e:
             _log("band_samples_harvest/progress_done", e)
     return rows, report
@@ -2913,7 +3021,8 @@ def band_sample_ui():
     if not rows:
         st.info("样本库还是空的。两种攒法：\n\n"
                 "1. **点下面的「采集今日全市场样本」** —— 按今天的真实判断收一批前瞻样本"
-                "（这是唯一能当成绩用的那类）；\n"
+                "（这是唯一能当成绩用的那类）；全市场要跑 5～15 分钟，只想先试流程"
+                "就把「试跑：只采前 N 只」填 50；\n"
                 "2. **在本机跑一次历史回填** —— 立刻拿到数千条重放样本，"
                 "脚本见 `_debug_probe/backfill_samples.py`。")
         _sample_forward_action({})
@@ -2994,19 +3103,34 @@ def band_sample_ui():
 
 def _sample_forward_action(rows_map):
     """「采集今日全市场样本」这一个动作的 UI + 落盘。空库与非空库共用，避免两处逻辑漂移。"""
-    _c1, _c2 = st.columns([1, 2])
+    _c1, _c2, _c3 = st.columns([1, 0.9, 1.8])
     with _c1:
         _do = long_button("📥 采集今日全市场样本", key="sample_forward_btn",
                           use_container_width=True)
     with _c2:
-        st.caption("采集会扫描全市场（含创业板/科创板/北交所），只记信号与对照，不发推送、"
-                   "不写进你的记忆名单。样本只存在本地容器，不会上传仓库。")
+        _limit_in = st.number_input("试跑：只采前 N 只", min_value=0, max_value=6000,
+                                    value=0, step=100, key="sample_forward_limit",
+                                    help="0 = 全市场（默认）。想先确认流程通不通，填 50。")
+    with _c3:
+        # ★ 这里原来写的是「约 1～3 分钟」，**是错的**：全市场 3750 只 × 每只一次 HTTP
+        #   往返（云端在美国、接口在国内），改造前实测跑了 100 分钟以上，比「让路」窗口还长，
+        #   必被自动刷新掐断。现已改成「线程本地连接复用 + 8 线程并发」（实测约 47×；
+        #   其中连接复用 16.2×、并发 2.9×），耗时降到十几分钟以内。
+        #   故意给一个**区间**而不给单点：云端耗时随网络波动很大，本机测不出云端绝对值，
+        #   所以在文案里引导用户用「试跑」自己量，而不是给一个看起来很准的假数字。
+        st.caption("扫描全市场（含创业板/科创板/北交所），只记信号与对照，不发推送、不写进记忆名单；"
+                   "样本只存在本地容器，不会上传仓库。**全市场约 5～15 分钟**（视网络而定；"
+                   "想先量准就填上面的「试跑」），期间请保持本页打开（自动刷新已自动让路）。")
     if not _do:
         return
+    _limit = int(_limit_in or 0)
     _sample_progress_widget.bar = None
     try:
-        with st.spinner("正在扫描全市场并采集样本（约 1～3 分钟）..."):
-            rows_new, rep = band_samples_harvest_forward(progress_cb=_sample_progress_widget)
+        with st.spinner("正在扫描全市场并采集样本（约 5～15 分钟，已开连接复用 + 8 线程）..."
+                        if not _limit else
+                        f"正在试跑采集（前 {_limit} 只，约 1 分钟）..."):
+            rows_new, rep = band_samples_harvest_forward(
+                progress_cb=_sample_progress_widget, limit=_limit)
     except Exception as e:
         _log("band_sample_ui/forward", e)
         st.error(f"采集出错（已拦截）：{e}")
@@ -3078,7 +3202,7 @@ def band_samples_harvest_forward(progress_cb=None, bench_df=None, limit=0):
 
     limit>0 时只取清单里的前 limit 只（报告里的 universe 仍报真实总数）。
     这是给**冒烟测试**用的：云端 CI 想验证「密钥配好了、加密落盘通了」时，
-    跑全市场要几十分钟，跑 5 只一分钟就够。正式采集必须留空（limit=0）。
+    跑全市场要十几分钟，跑 5 只一分钟就够。正式采集必须留空（limit=0）。
 
     ★ 两条走过弯路的地方：
       ① 北交所不在东财股票列表分页里，必须单独按 `m:0+t:81+s:2048` 补一次，
