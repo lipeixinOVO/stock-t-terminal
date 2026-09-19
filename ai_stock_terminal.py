@@ -11,6 +11,8 @@ import math
 import os
 import traceback
 import sys
+import gzip
+import hashlib
 import time as _time_module
 from datetime import datetime, time, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2204,7 +2206,889 @@ def _band_status_badge(status):
         '波段未形成': ('#888', '⬜'),
     }.get(status, ('#888', '❔'))
 
+# ================================================================
+# 策略样本语料库（2026-09-19 新增）—— 让机器自己攒样本，不再依赖手工名单
+# ================================================================
+# 为什么要它：只记录「用户选中的票」，永远无法证明这套逻辑有效 —— 没有分母，
+# 也没有对照组。要知道「突破＋放量」到底有没有用，必须同时看到：
+#   ① 满足信号的日子后来怎么样了（signal）
+#   ② 只满足一半条件的日子怎么样了（near_break / near_vol）—— 这是"到底哪个条件在起作用"的关键对照
+#   ③ 完全不满足条件的普通日子怎么样了（trend_ctrl / base_ctrl）—— 这是基准率，没有它就不知道信号有没有超额
+#
+# ★ 三条不可动摇的原则（改这里之前务必读完）：
+#  1. **样本与用户的名单完全分开**。用户名单是 band_memory（要给人看的），
+#     样本语料是 band_samples（只给机器统计用）。两边的口径、数量、入册规则互不影响。
+#  2. **全市场全收，但每条都打「可交易」标记**。不设板块与数量门槛（否则等于预先筛掉了
+#     可能有效的那部分逻辑），但成交额/价格/ST 必须记下来，报表默认只看可交易样本 ——
+#     否则"选出来的票都涨了"很可能只是不可交易小票的流动性幻觉。
+#  3. **回填样本与前瞻样本永不混在一张表里统计**。回填（历史重放）自带前视与生存者偏差
+#     （退市股缺失、前复权数据被后续分红改写），只能用来提假设；前瞻样本才是成绩。
+SAMPLE_FILE = os.path.join(BASE_DIR, "band_samples.jsonl.gz")   # ★ 仅本地，已 gitignore
+SAMPLE_CTRL_EVERY = 100        # 非「必算」日按 1/N 确定性抽样（趋势/基准对照）
+SAMPLE_MAX_ROWS = 200000       # 行数上限，超出按日期从旧到新裁剪（聚合统计不受影响）
+SAMPLE_MIN_BARS = 60           # 真实指标函数需要的历史根数
+SAMPLE_MIN_AMOUNT_YI = 1.0     # 「可交易」口径：近20日日均成交额 >= 1 亿
+SAMPLE_MIN_PRICE = 2.0         # 「可交易」口径：股价 >= 2 元（规避面值退市股）
+SAMPLE_EVENT_DEDUP = True      # 连续「必算」日只保留事件首日，避免把一次机会重复计成 N 笔
+# ★ 陈旧序列门槛：最后一根K线距今超过这么多自然日 → 视为停牌/退市，整只不进样本。
+#   为什么必须有：取数是「最近 700 根」，若一只票 2002 年就退市了（如 000003 PT金田A），
+#   它的 700 根全在 2002 年之前，长度校验照样通过，回看 450 天就落进 1998~2002 ——
+#   实测 632 条样本里有 157 条是这种 20 多年前的"僵尸样本"，会把时间切分彻底带偏。
+SAMPLE_MAX_STALE_DAYS = 30
+# 成交量单位：腾讯日线按「手」返回（×100 股），新浪按「股」。实测两者算出的成交额一致，
+# 但单位不同 —— 直接用 raw Volume 算成交额会差 100 倍，这里显式声明，不做猜测。
+SAMPLE_VOL_UNIT = {"qq": 100.0, "sina": 1.0}
+SAMPLE_SOURCES = ("backfill", "forward")
+SAMPLE_SOURCE_LABEL = {
+    "forward": "前瞻采集（真实判断，可作为成绩）",
+    "backfill": "历史回填（重放，仅供提假设）",
+}
+SAMPLE_TIER_LABEL = {
+    "signal": "入场信号（突破＋放量）",
+    "near_break": "突破了但没放量",
+    "near_vol": "放量了但没突破",
+    "trend_ctrl": "趋势对照（在20日线上）",
+    "base_ctrl": "基准对照（20日线下）",
+}
+
+
+def _sample_key(code, date, source):
+    return f"{str(code).zfill(6)}|{str(date)[:10]}|{source}"
+
+
+def _sample_hash_hit(code, date, every):
+    """确定性抽样：同一 (代码, 日期, every) 永远得到同一结果。
+
+    ★ 绝不能用 random —— 否则每次重跑抽到的日子都不一样，样本库无法复现，
+      而且同一个机会可能被反复计入。用 md5 取模，稳定且与顺序无关。
+    """
+    if every <= 1:
+        return True
+    h = hashlib.md5(f"{code}|{str(date)[:10]}|{every}".encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % every == 0
+
+
+def _sample_tier(m):
+    """按真实指标给这一天分层。**只认 _calculate_band_metrics 的输出**，
+    预筛函数不参与分层判定（它只负责"不漏"，见 _sample_prefilter）。"""
+    try:
+        bo = bool(m.get('breakout'))
+        ve = bool(m.get('volume_expansion'))
+        if bo and ve:
+            return 'signal'
+        if bo:
+            return 'near_break'
+        if ve:
+            return 'near_vol'
+        if float(m.get('current') or 0) > float(m.get('ma20') or 0):
+            return 'trend_ctrl'
+        return 'base_ctrl'
+    except Exception as e:
+        _log("_sample_tier", e)
+        return None
+
+
+def _sample_prefilter(df, min_bars=SAMPLE_MIN_BARS):
+    """向量化预筛：标出「必须用真实指标函数全量评估」的交易日。
+
+    ★ 必须是 signal/near_break/near_vol 三个分层的**超集**。
+      因为逐日重放的真实函数调用约 3ms/天（实测），全量跑 4000 只 × 450 天 ≈ 40 分钟；
+      预筛把这一层压到毫秒级，只对可能成为样本的日子付真实计算的钱。
+      一旦预筛漏掉真实信号，样本库就会系统性缺失 —— 比慢严重得多。
+      所以这里用**与 _calculate_band_metrics 完全相同的公式**算 breakout / volume_expansion
+      （逐字对齐，不是近似）。
+      测试里有一条不变式断言守住它：凡真实分层不为对照的日子，必须在预筛集合内。
+
+    ★ 为什么**只**放 breakout / volume_expansion，不放「已在20日线上」：
+      「站上20日线」是 _sample_tier 里的 trend_ctrl 分层，它只是**对照**，按 1/N 抽样即可。
+      若把它也划进必算集合，会连带毁掉事件去重 ——
+      一只股票连涨 100 天，中间出现的那次真突破会和前面 99 个"站上20日线"的日子
+      被并成同一个事件，真正的信号样本就被丢掉了。这个坑已经踩过一次。
+    """
+    try:
+        close = df['Close'].astype(float)
+        high = df['High'].astype(float)
+        vol = df['Volume'].astype(float)
+        n = len(df)
+        idx = np.arange(n)
+        hi60 = high.rolling(60).max()
+        c60 = close.rolling(60).max()
+        v5 = vol.rolling(5).mean()
+        v20 = vol.rolling(20).mean()
+        # 与 _calculate_band_metrics 逐字一致的 breakout / volume_expansion
+        breakout_v = (close >= hi60 * 0.995) & (close >= c60 * 0.999)
+        vol_exp_v = ((v20 > 0) & (v5 / v20 >= 1.5)) | ((v20 > 0) & (vol >= v20 * 1.5))
+        mask = (breakout_v | vol_exp_v) & (idx >= min_bars)
+        mask = mask.fillna(False)
+        return mask.values.astype(bool)
+    except Exception as e:
+        _log("_sample_prefilter", e)
+        return np.zeros(len(df), dtype=bool) if len(df) else np.zeros(0, dtype=bool)
+
+
+def _sample_tradable(df, i, vol_unit, name=''):
+    """「可交易」标记。返回 (tradable|None, amt_yi|None, price, st_proxy)。
+
+    ★ 历史回填拿不到当时的市值与 ST 名称（接口只给当下值），所以：
+      - 成交额用日线自算（近20日均值），单位靠显式声明的 vol_unit 折算；
+      - 市值一律记 None，**不拿今天的市值冒充历史**；
+      - ST 只能用当前名称做代理，字段名直接叫 st_proxy，不装成历史事实。
+      推不出就返回 None（未知），不用 False 冒充"不可交易"。
+    """
+    try:
+        price = float(df['Close'].iloc[i])
+    except Exception as e:
+        _log("_sample_tradable/price", e)
+        return None, None, 0.0, None
+    st_proxy = _is_st_or_risk(name) if name else None
+    amt_yi = None
+    try:
+        lo = max(0, i - 19)
+        cl = df['Close'].astype(float).iloc[lo:i + 1]
+        vo = df['Volume'].astype(float).iloc[lo:i + 1]
+        amt = float((cl * vo).mean()) * float(vol_unit or 1.0)
+        if amt > 0:
+            amt_yi = round(amt / 1e8, 4)
+    except Exception as e:
+        _log("_sample_tradable/amount", e)
+    if amt_yi is None or st_proxy is None:
+        return None, amt_yi, price, st_proxy
+    ok = (amt_yi >= SAMPLE_MIN_AMOUNT_YI) and (price >= SAMPLE_MIN_PRICE) and not st_proxy
+    return bool(ok), amt_yi, price, st_proxy
+
+
+def band_evaluate_asof(code, name, df, i, bench_df=None):
+    """把 band_evaluate 的结果在**历史第 i 根K线**上重演。
+
+    ★ 关键设计：切 `df.iloc[i-299 : i+1]`，而不是 `df.iloc[:i+1]`。
+      因为线上 _get_daily_history 只取 300 根日线，MACD 用的是 ewm（递归、对起点敏感）。
+      切最近 300 根 = 当时线上真正看到的那 300 根，所以这不是近似，是对线上行为的**精确复现**。
+      切片再长/再短都会与线上不一致，别"顺手优化"。
+    """
+    try:
+        if df is None or i is None or i < 0 or i >= len(df):
+            return None
+        lo = max(0, i - 299)
+        sub = df.iloc[lo:i + 1]
+        m = _calculate_band_metrics(sub)
+        if m is None:
+            return None
+        score, reasons = _band_score(m)
+        status, color = _band_status(m)
+        return {
+            'Code': str(code), 'Name': name or str(code),
+            'Price': m['current'], 'ChangePct': _sample_change_pct(df, i),
+            'Score': max(0, score), 'Status': status, 'StatusColor': color,
+            'MA20': m['ma20'], 'MA60': m['ma60'],
+            'PlatformHigh': m['platform_high'], 'PlatformLow': m['platform_low'],
+            'VolRatio': m['vol_ratio'], 'Position250': round(m['position_pct'], 1),
+            'Reasons': ' | '.join(reasons), 'LastClose': m['current'],
+            'Breakout': bool(m['breakout']), 'VolumeExpansion': bool(m['volume_expansion']),
+            'TopDivergence': bool(m['top_divergence']), 'BelowSupport': bool(m['below_support']),
+        }
+    except Exception as e:
+        _log(f"band_evaluate_asof/{code}", e)
+        return None
+
+
+def _sample_change_pct(df, i):
+    """当日涨跌幅（用前一根收盘算）。没有前一根就给 0，不猜。"""
+    try:
+        if i <= 0:
+            return 0.0
+        prev = float(df['Close'].iloc[i - 1])
+        cur = float(df['Close'].iloc[i])
+        if prev <= 0:
+            return 0.0
+        return round((cur / prev - 1.0) * 100, 2)
+    except Exception as e:
+        _log("_sample_change_pct", e)
+        return 0.0
+
+
+def _sample_bench_asof(bench_df, date_s):
+    """把基准（沪深300）日线切到「入场日当天」为止；切不出来返回 None。
+
+    ★ 为什么必须是 None 而不是退回整段 bench_df：退回整段 = 拿今天的大盘状态
+      描述历史每一天，这是典型的前视泄露，会让「大盘环境」这个维度完全不可用。
+      拿不准就**放弃这一列特征**（_bench_above_ma20(None) → None → 该桶不计入），
+      样本少一列不会撒谎，多一列假信息才会。
+    """
+    try:
+        if bench_df is None or not len(bench_df):
+            return None
+        d = str(date_s)[:10]
+        sub = bench_df[bench_df['Date'].astype(str).str.slice(0, 10) <= d]
+        if len(sub) >= 25:      # 与 _bench_above_ma20 的下限一致
+            return sub
+    except Exception as e:
+        _log("_sample_bench_asof", e)
+    return None
+
+
+def band_sample_build(code, name, df, i, bench_df, source, vol_unit=1.0, market_meta=None):
+    """构造一条样本：(入场时可见的特征) + (按 r1 规则算出的结果标签)。
+
+    ★ 特征一律取自入场当日及之前，绝不使用事后信息 —— 这是整个语料库的地基。
+      特征字典的键名与 _band_entry_context 保持一致，所以可以直接复用 _bucket_defs()
+      的分桶定义，不用维护第二套维度口径。
+    """
+    try:
+        r = band_evaluate_asof(code, name, df, i, bench_df)
+        if r is None:
+            return None
+        tier = _sample_tier({
+            'breakout': r['Breakout'], 'volume_expansion': r['VolumeExpansion'],
+            'current': r['Price'], 'ma20': r['MA20'],
+        })
+        if tier is None:
+            return None
+        date = df['Date'].iloc[i]
+        date_s = pd.Timestamp(date).strftime('%Y-%m-%d')
+        meta = (market_meta or {}).get(str(code).zfill(6)) or {}
+        if meta:
+            # 前瞻：用接口给的当日真实市值/成交额
+            amt_yi = meta.get('amt_yi')
+            mv_yi = meta.get('mv_yi')
+            price = float(meta.get('price') or r['Price'])
+            st_proxy = _is_st_or_risk(meta.get('name') or name)
+            tradable = None
+            if amt_yi is not None:
+                tradable = bool(amt_yi >= SAMPLE_MIN_AMOUNT_YI and price >= SAMPLE_MIN_PRICE
+                                and not st_proxy)
+        else:
+            tradable, amt_yi, price, st_proxy = _sample_tradable(df, i, vol_unit, name)
+            mv_yi = None
+        # ★ 大盘环境必须切到「入场日当天」为止。直接吃整段 bench_df 会把**今天**的大盘
+        #   状态套到历史每一天上（前视泄露），「大盘在20日线上」这个桶就彻底废了。
+        #   切不动就返回 None（宁可这一列缺失，也不许用未来信息），由 _bench_above_ma20 判空。
+        ctx = _band_entry_context({
+            'Price': r['Price'], 'MA20': r['MA20'], 'MA60': r['MA60'],
+            'Score': r['Score'], 'Position250': r['Position250'],
+            'VolRatio': r['VolRatio'], 'Breakout': r['Breakout'],
+        }, bench_above=_bench_above_ma20(_sample_bench_asof(bench_df, date_s)))
+        ctx['change_pct'] = r['ChangePct']
+        ctx['volume_expansion'] = r['VolumeExpansion']
+        ctx['platform_high'] = r['PlatformHigh']
+        ctx['dist_to_platform_pct'] = (round((r['PlatformHigh'] / r['Price'] - 1) * 100, 2)
+                                       if r['Price'] > 0 else None)
+        outcome = band_outcome_compute(date_s, float(r['Price']), df, bench_df)
+        if outcome is None:
+            # ★ 前瞻采集的正常情况：入场点就是最后一根K线，还没有"之后"可以判结案。
+            #   这时**必须**以 pending 落库，绝不能不收 ——
+            #   否则「每日前瞻采集」会永远产出 0 条、静默失效（这个坑被测试抓到过）。
+            #   结果留给 band_samples_refresh_pending 在之后的每日采集里补算。
+            if i >= len(df) - 1:
+                outcome = _sample_pending_outcome()
+            else:
+                return None
+        return {
+            "code": str(code).zfill(6), "name": name or str(code), "date": date_s,
+            "source": source, "tier": tier, "status": r['Status'],
+            "rule_version": REVIEW_RULE_VERSION,
+            "tradable": tradable, "amt_yi": amt_yi, "mv_yi": mv_yi,
+            "price": round(float(price or r['Price']), 3), "st_proxy": st_proxy,
+            "ctx": ctx, "outcome": outcome,
+        }
+    except Exception as e:
+        _log(f"band_sample_build/{code}", e)
+        return None
+
+
+def _sample_fetch_kline(code, limit=700):
+    """采样专用取数：返回 (df, vol_unit)。**必须同时带回单位**，
+    否则成交额会差 100 倍（腾讯按手、新浪按股）。"""
+    for fn, unit in ((_fetch_kline_qq, SAMPLE_VOL_UNIT['qq']),
+                     (_fetch_kline_sina, SAMPLE_VOL_UNIT['sina'])):
+        try:
+            df, _src, _errs = fn(_get_code(code), limit=limit)
+            if df is not None and len(df) >= SAMPLE_MIN_BARS:
+                return df, unit
+        except Exception as e:
+            _log(f"_sample_fetch_kline/{code}", e)
+            continue
+    return None, 1.0
+
+
+def band_samples_harvest(codes, source='backfill', lookback_days=0, fetch=None,
+                         bench_df=None, names=None, market_meta=None, progress=None,
+                         max_codes=0):
+    """采样主引擎：对一批代码逐日重放（或只看最新一天），产出样本行。
+
+    lookback_days=0 → 只评估最后一根K线（前瞻采集用）
+    lookback_days=N → 回看最近 N 个交易日（历史回填用）
+
+    返回 (rows, report)。report 记下成功/失败/跳过的只数，失败原因逐代码留痕 ——
+    取数失败必须可见，否则"样本怎么这么少"会变成一个查不出来的谜。
+    """
+    fetch = fetch or _sample_fetch_kline
+    names = names or {}
+    rows = []
+    report = {"codes": 0, "fetched": 0, "failed": 0, "stale": 0,
+              "no_bench": bench_df is None,
+              "evaluated": 0, "kept": 0, "fail_examples": []}
+    cl = list(codes)
+    if max_codes and max_codes > 0:
+        cl = cl[:max_codes]
+    for k, code in enumerate(cl):
+        code = str(code).zfill(6)
+        report["codes"] += 1
+        if progress and (k % 20 == 0):
+            try:
+                progress(k, len(cl), code)
+            except Exception as e:
+                _log("band_samples_harvest/progress", e)
+        try:
+            df, unit = fetch(code, 700)
+        except Exception as e:
+            df, unit = None, 1.0
+            _log(f"band_samples_harvest/fetch/{code}", e)
+        if df is None or len(df) < SAMPLE_MIN_BARS + 1:
+            report["failed"] += 1
+            if len(report["fail_examples"]) < 8:
+                report["fail_examples"].append(code)
+            continue
+        # ★ 陈旧序列剔除：取数只保证"最近 700 根"，退市/长期停牌的票会整段落在很多年前，
+        #   长度校验拦不住它们。判据用最后一根K线距今天的自然日数，宁可少收也不收僵尸样本。
+        try:
+            _last = pd.Timestamp(df['Date'].iloc[-1])
+            if not pd.isna(_last):
+                if (pd.Timestamp(now_cn().date()) - _last.normalize()).days > SAMPLE_MAX_STALE_DAYS:
+                    report["stale"] += 1
+                    continue
+        except Exception as e:
+            _log(f"band_samples_harvest/stale/{code}", e)
+        report["fetched"] += 1
+        mask = _sample_prefilter(df)
+        n = len(df)
+        if lookback_days and lookback_days > 0:
+            start = max(SAMPLE_MIN_BARS, n - int(lookback_days))
+        else:
+            start = n - 1
+        prev_tier = None
+        for i in range(start, n):
+            must = bool(mask[i]) if i < len(mask) else False
+            if lookback_days and lookback_days > 0 and not must:
+                # 非「必算」日（趋势/基准对照）按 1/N 确定性抽样，其余直接跳过省下 3ms/天
+                if not _sample_hash_hit(code, df['Date'].iloc[i], SAMPLE_CTRL_EVERY):
+                    continue
+            report["evaluated"] += 1
+            row = band_sample_build(code, names.get(code) or '', df, i, bench_df,
+                                    source, vol_unit=unit, market_meta=market_meta)
+            if row is None:
+                continue
+            # ★ 事件去重：只按**分层变化**去重，不按"是否必算日"去重。
+            #   同一分层连续出现（比如连涨 50 天都是 trend_ctrl）只留第一天，
+            #   因为那是同一个机会；但分层一变（trend_ctrl → signal）必须留下，
+            #   那正是我们要找的信号。—— 按"必算日"去重会把行情中间的突破吞掉。
+            tier = row.get('tier')
+            if SAMPLE_EVENT_DEDUP and lookback_days and lookback_days > 0 and tier == prev_tier:
+                continue
+            prev_tier = tier
+            rows.append(row)
+            report["kept"] += 1
+    if progress:
+        try:
+            progress(len(cl), len(cl), '')
+        except Exception as e:
+            _log("band_samples_harvest/progress_done", e)
+    return rows, report
+
+
+# ---------------- 存储：本地 JSONL.gz（原始行是唯一事实来源，聚合一律从它现算）----------------
+
+def load_band_samples(path=None, cap=None):
+    """读样本库，返回 {key: row}。文件不存在返回空 dict（首次运行是正常情况，不是错误）。"""
+    p = path or SAMPLE_FILE
+    out = {}
+    if not os.path.exists(p):
+        return out
+    try:
+        with gzip.open(p, "rt", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception as e:
+                    _log("load_band_samples/line", e)
+                    continue
+                if not isinstance(row, dict) or not row.get("code") or not row.get("date"):
+                    continue
+                out[_sample_key(row["code"], row["date"], row.get("source"))] = row
+                if cap and len(out) >= cap:
+                    break
+    except Exception as e:
+        _log("load_band_samples", e)
+        return {}
+    return out
+
+
+def save_band_samples(rows, path=None):
+    """写样本库。rows 可以是 dict 或 list。返回实际写入行数。
+
+    ★ 用 JSONL + gzip：样本到几十万行时普通 json 一次性反序列化会让页面卡住，
+      JSONL 可以按行流式读，gzip 把体积压到约 1/5。
+    """
+    p = path or SAMPLE_FILE
+    items = list(rows.values()) if isinstance(rows, dict) else list(rows)
+    try:
+        tmp = p + ".tmp"
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            for row in items:
+                f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        os.replace(tmp, p)
+        return len(items)
+    except Exception as e:
+        _log("save_band_samples", e)
+        return 0
+
+
+def band_samples_merge(old, new):
+    """把新采的样本并入已有库。返回 (merged, added, updated, trimmed)。
+
+    ★ 去重键 = 代码 + 日期 + 来源。同一机会重复采集不会重复计数。
+      ★ 但「跟踪中 → 已结案」必须允许更新：早期采的样本当时候波段还没结束，
+        结果字段是 pending；后来重跑时应该用新的结案结果覆盖它，
+        否则样本库里会永久留着一批永远算不出结果的 pending 行。
+    """
+    merged = dict(old)
+    added = updated = 0
+    for row in new:
+        k = _sample_key(row.get("code"), row.get("date"), row.get("source"))
+        prev = merged.get(k)
+        if prev is None:
+            merged[k] = row
+            added += 1
+            continue
+        p_closed = bool((prev.get("outcome") or {}).get("closed"))
+        n_closed = bool((row.get("outcome") or {}).get("closed"))
+        if n_closed and not p_closed:
+            merged[k] = row
+            updated += 1
+    trimmed = 0
+    if len(merged) > SAMPLE_MAX_ROWS:
+        # 按日期从旧到新裁剪；聚合统计是从行现算的，所以裁剪会让最早那段退出统计窗口，
+        # 这是有意的取舍（本地文件不能无限长大），面板上会显示实际覆盖的日期区间。
+        ordered = sorted(merged.items(), key=lambda kv: str(kv[1].get("date") or ""))
+        over = len(merged) - SAMPLE_MAX_ROWS
+        for k, _v in ordered[:over]:
+            merged.pop(k, None)
+            trimmed += 1
+    return merged, added, updated, trimmed
+
+
+def band_samples_range(rows):
+    """样本覆盖的日期区间与基本信息。"""
+    ds = [str(r.get("date") or "") for r in rows]
+    ds = [d for d in ds if d]
+    return {
+        "n": len(rows),
+        "min_date": min(ds) if ds else "",
+        "max_date": max(ds) if ds else "",
+        "codes": len({r.get("code") for r in rows if r.get("code")}),
+    }
+
+
+def band_sample_summary(rows):
+    """按来源 × 分层汇总。**来源绝不合并展示** —— 回填与前瞻的可信度完全不同。"""
+    out = {}
+    for r in rows:
+        src = r.get("source") or "unknown"
+        tier = r.get("tier") or "unknown"
+        d = out.setdefault(src, {"total": 0, "tiers": {}, "tradable": 0, "closed": 0})
+        d["total"] += 1
+        d["tiers"][tier] = d["tiers"].get(tier, 0) + 1
+        if r.get("tradable"):
+            d["tradable"] += 1
+        if (r.get("outcome") or {}).get("closed"):
+            d["closed"] += 1
+    return out
+
+
+def _sample_usable(row):
+    """能否进统计：必须已结案。跟踪中的样本只攒着，不参与任何结论。"""
+    return bool((row.get("outcome") or {}).get("closed"))
+
+
+def band_sample_lift(rows, source=None, tradable_only=True, split_ratio=0.7):
+    """核心报表：每个入场条件分桶的表现，以及**与该来源基准率的差**。
+
+    ★ 为什么必须有基准率：只说「突破＋放量 的胜率 55%」是没有意义的 ——
+      牛市里随便买都有 55%。只有和同期全样本基准率对比出的**差额**才是逻辑的贡献。
+
+    ★ split_ratio：按日期排序把样本切成前 70%（样本内）与后 30%（样本外）。
+      参数/规律只有在样本外仍保持同号才算站得住。这是防止"在噪音里挑好看的那一桶"
+      唯一的自动化防线 —— 没有它，样本越多越容易自欺。
+
+    返回 {"baseline": {...}, "rows": [...]}。
+    """
+    use = [r for r in rows if isinstance(r, dict) and _sample_usable(r)
+           and (source is None or r.get("source") == source)
+           and (not tradable_only or r.get("tradable"))]
+    baseline = {"n": len(use)}
+    if not use:
+        baseline.update({"avg_excess": None, "win_rate": None, "avg_ret": None})
+        return {"baseline": baseline, "rows": []}
+    ex = [r['outcome']['excess_pct'] for r in use
+          if r['outcome'].get('excess_pct') is not None]
+    baseline["avg_excess"] = round(sum(ex) / len(ex), 2) if ex else None
+    baseline["win_rate"] = round(sum(1 for r in use
+                                     if r['outcome'].get('verdict') == 'win') / len(use) * 100, 1)
+    rets = [r['outcome'].get('ret_pct') or 0.0 for r in use]
+    baseline["avg_ret"] = round(sum(rets) / len(rets), 2)
+    # 时间切分：按日期升序取前 split 比例为样本内，其余为样本外
+    ordered = sorted(use, key=lambda r: str(r.get("date") or ""))
+    cut = int(len(ordered) * split_ratio)
+    is_set = {_sample_key(r.get("code"), r.get("date"), r.get("source")) for r in ordered[:cut]}
+    outs = []
+    for dim, fn in _bucket_defs():
+        groups = {}
+        for r in use:
+            name = fn(r.get('ctx') or {})
+            if name:
+                groups.setdefault(name, []).append(r)
+        for name in sorted(groups.keys()):
+            items = groups[name]
+            o = [r['outcome'] for r in items]
+            e = [x['excess_pct'] for x in o if x.get('excess_pct') is not None]
+            rets_b = [x.get('ret_pct') or 0.0 for x in o]
+            is_items = [r for r in items
+                        if _sample_key(r.get("code"), r.get("date"), r.get("source")) in is_set]
+            is_ex = [r['outcome']['excess_pct'] for r in is_items
+                     if r['outcome'].get('excess_pct') is not None]
+            oos_items = [r for r in items
+                         if _sample_key(r.get("code"), r.get("date"), r.get("source")) not in is_set]
+            oos_ex = [r['outcome']['excess_pct'] for r in oos_items
+                      if r['outcome'].get('excess_pct') is not None]
+            avg_ex = round(sum(e) / len(e), 2) if e else None
+            oos_avg = round(sum(oos_ex) / len(oos_ex), 2) if oos_ex else None
+            ins_avg = round(sum(is_ex) / len(is_ex), 2) if is_ex else None
+            enough = len(items) >= REVIEW_MIN_SAMPLE
+            stable = None
+            if enough and oos_avg is not None and ins_avg is not None and baseline["avg_excess"] is not None:
+                d_in = ins_avg - baseline["avg_excess"]
+                d_oos = oos_avg - baseline["avg_excess"]
+                stable = bool((d_in > 0) == (d_oos > 0))
+            outs.append({
+                "dim": dim, "bucket": name, "n": len(items), "enough": enough,
+                "win_rate": round(sum(1 for x in o if x.get('verdict') == 'win') / len(items) * 100, 1),
+                "avg_ret": round(sum(rets_b) / len(rets_b), 2),
+                "avg_excess": avg_ex,
+                "lift": round(avg_ex - baseline["avg_excess"], 2)
+                        if (avg_ex is not None and baseline["avg_excess"] is not None) else None,
+                "in_sample_excess": ins_avg, "oos_excess": oos_avg,
+                "oos_n": len(oos_items), "stable": stable,
+            })
+    return {"baseline": baseline, "rows": outs}
+
+
+def band_sample_ui():
+    """🧪 逻辑有效性验证：机器自采样本的诚实报表。
+
+    ★ 本面板只做统计，**不改任何选股参数**，也不产出给你的推荐名单。
+      它的唯一用途是回答「哪个入场条件真的在贡献超额收益」。
+    """
+    st.markdown("---")
+    st.header("🧪 逻辑有效性验证")
+    st.caption("样本由机器在全市场自动采集，与「🧠 波段记忆」里给你的名单**完全分开** —— "
+               "这一块是给逻辑自己用的：靠它才能回答「突破＋放量到底有没有用」。")
+    st.caption(f"判定规则 **{REVIEW_RULE_VERSION}**（与复盘面板同一套）｜"
+               f"基准 沪深300｜样本量下限 {REVIEW_MIN_SAMPLE} 笔｜"
+               "回填样本与前瞻样本**分开统计，绝不混算**")
+
+    rows_map = load_band_samples()
+    rows = list(rows_map.values())
+    if not rows:
+        st.info("样本库还是空的。两种攒法：\n\n"
+                "1. **点下面的「采集今日全市场样本」** —— 按今天的真实判断收一批前瞻样本"
+                "（这是唯一能当成绩用的那类）；\n"
+                "2. **在本机跑一次历史回填** —— 立刻拿到数千条重放样本，"
+                "脚本见 `_debug_probe/backfill_samples.py`。")
+        _sample_forward_action({})
+        return
+
+    rng = band_samples_range(rows)
+    summ = band_sample_summary(rows)
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("样本总数", f"{rng['n']} 条")
+    m2.metric("覆盖股票", f"{rng['codes']} 只")
+    m3.metric("前瞻样本", f"{summ.get('forward', {}).get('total', 0)} 条")
+    m4.metric("回填样本", f"{summ.get('backfill', {}).get('total', 0)} 条")
+    m5.metric("已结案", f"{sum(s.get('closed', 0) for s in summ.values())} 条")
+    st.caption(f"样本覆盖区间：{rng['min_date']} ～ {rng['max_date']}"
+               f"（超过 {SAMPLE_MAX_ROWS} 条时从最早开始裁剪，所以区间起点会随时间前移）")
+
+    with st.expander(f"📊 来源 × 分层分布", expanded=False):
+        _t = []
+        for src in sorted(summ.keys()):
+            d = summ[src]
+            for tier in sorted(d["tiers"].keys()):
+                _t.append({"来源": SAMPLE_SOURCE_LABEL.get(src, src),
+                           "分层": SAMPLE_TIER_LABEL.get(tier, tier),
+                           "条数": d["tiers"][tier]})
+        if _t:
+            st.dataframe(pd.DataFrame(_t), use_container_width=True, hide_index=True)
+        st.caption("「入场信号」是完整的突破＋放量；两个 near_ 分层是只满足一半条件的对照 —— "
+                   "**它们才是回答「到底哪个条件在起作用」的关键**；两个 ctrl 是基准率对照。")
+
+    _src_pick = st.radio("看哪一类样本", ["forward", "backfill"], horizontal=True,
+                         format_func=lambda k: SAMPLE_SOURCE_LABEL.get(k, k),
+                         key="sample_src_pick")
+    _tradable_only = st.checkbox("只看可交易样本（推荐）", value=True, key="sample_tradable_only")
+    if _src_pick == "backfill":
+        st.warning("这是**历史回填**样本：自带前视偏差与生存者偏差"
+                   "（退市股缺失、前复权数据被后续分红改写、当时的市值/ST状态已不可知）。"
+                   "**只能用来提出假设，不能当成绩看。**")
+    lift = band_sample_lift(rows, source=_src_pick, tradable_only=_tradable_only)
+    base = lift.get("baseline") or {}
+    if not base.get("n"):
+        st.info("这个口径下还没有已结案的样本。回填刚跑完时大部分样本已结案；"
+                "前瞻样本要等波段走完（最长 40 个交易日）才有结果。")
+    else:
+        b1, b2, b3 = st.columns(3)
+        b1.metric("基准样本量", f"{base['n']} 笔")
+        b2.metric("基准胜率", f"{base.get('win_rate')}%")
+        b3.metric("基准平均超额",
+                  "—" if base.get('avg_excess') is None else f"{base['avg_excess']:+.2f}%")
+        st.caption("以上是**该来源全样本**的基准率。下面每个分桶都要跟它比 —— "
+                   "只看分桶胜率的绝对值会被牛市骗（谁都在赚）。")
+        if lift["rows"]:
+            _df = pd.DataFrame(lift["rows"]).rename(columns={
+                "dim": "维度", "bucket": "分桶", "n": "笔数", "enough": "样本够",
+                "win_rate": "胜率%", "avg_ret": "平均收益%", "avg_excess": "平均超额%",
+                "lift": "相对基准", "in_sample_excess": "样本内超额%",
+                "oos_excess": "样本外超额%", "oos_n": "样本外笔数", "stable": "稳健",
+            })
+            _df["样本够"] = _df["样本够"].map({True: "✅", False: "样本不足"})
+            _df["稳健"] = _df["稳健"].map({True: "✅ 同号", False: "❌ 反号", None: "—"})
+            st.dataframe(_df[["维度", "分桶", "笔数", "样本够", "胜率%", "平均超额%",
+                              "相对基准", "样本内超额%", "样本外超额%", "样本外笔数", "稳健"]],
+                         use_container_width=True, hide_index=True)
+            st.caption("**「稳健」一列是整个面板最有价值的地方**：样本内为正、样本外却反号，"
+                       "说明那点优势只是噪音。样本不足或反号的桶，一律不许拿来改逻辑。")
+        else:
+            st.caption("暂无可分桶的样本（入场上下文缺失或都未结案）。")
+
+    _sample_forward_action(rows_map)
+
+    _rep = st.session_state.get("sample_last_report")
+    if _rep:
+        with st.expander("上次采集明细", expanded=False):
+            st.json({k: v for k, v in _rep.items() if k != 'fail_examples'})
+            if _rep.get("fail_examples"):
+                st.caption("取数失败的代码（最多列 8 个）：" + ", ".join(_rep["fail_examples"]))
+
+
+def _sample_forward_action(rows_map):
+    """「采集今日全市场样本」这一个动作的 UI + 落盘。空库与非空库共用，避免两处逻辑漂移。"""
+    _c1, _c2 = st.columns([1, 2])
+    with _c1:
+        _do = st.button("📥 采集今日全市场样本", key="sample_forward_btn",
+                        use_container_width=True)
+    with _c2:
+        st.caption("采集会扫描全市场（含创业板/科创板/北交所），只记信号与对照，不发推送、"
+                   "不写进你的记忆名单。样本只存在本地容器，不会上传仓库。")
+    if not _do:
+        return
+    _sample_progress_widget.bar = None
+    try:
+        with st.spinner("正在扫描全市场并采集样本（约 1～3 分钟）..."):
+            rows_new, rep = band_samples_harvest_forward(progress_cb=_sample_progress_widget)
+    except Exception as e:
+        _log("band_sample_ui/forward", e)
+        st.error(f"采集出错（已拦截）：{e}")
+        return
+    st.session_state.sample_last_report = rep
+    # ★ 先把上次留下的「跟踪中」样本重算一遍：前瞻样本采下来时波段还没走完，
+    #   不补算就永远是 pending，前瞻样本库只进不出、永远无法统计。
+    merged, added, updated, trimmed = band_samples_merge(rows_map, rows_new)
+    try:
+        _bench = _bench_history()
+        merged, refreshed = band_samples_refresh_pending(merged, bench_df=_bench)
+    except Exception as e:
+        _log("band_sample_ui/refresh_pending", e)
+        refreshed = 0
+    if not rows_new and not refreshed:
+        st.warning(f"本次没采到新样本（扫描 {rep.get('codes')} 只，取数失败 {rep.get('failed')} 只）。"
+                   f"{rep.get('error') or '非交易时段或全市场接口不稳时会这样。'}")
+        return
+    save_band_samples(merged)
+    st.success(f"采集完成：本次 {len(rows_new)} 条，新增 {added} 条，"
+               f"更新结案 {updated + refreshed} 条"
+               + (f"，裁剪 {trimmed} 条" if trimmed else "") + "。")
+    if rep.get("no_bench"):
+        st.warning("⚠️ 本次没取到基准（沪深300）日线：这批样本的**超额收益会是空的**，"
+                   "只能看绝对收益。等网络恢复后重跑同一天即可补上（同键会覆盖更新）。")
+    st.rerun()
+
+
+def _sample_progress_widget(done, total, code):
+    """采集进度条。用函数属性持有 Streamlit 进度对象，避免每次回调都新建组件。"""
+    try:
+        if getattr(_sample_progress_widget, "bar", None) is None:
+            _sample_progress_widget.bar = st.progress(0.0, text="正在扫描全市场...")
+        if total and done <= total:
+            _sample_progress_widget.bar.progress(min(done / total, 1.0),
+                                                text=f"已扫描 {done}/{total}（{code}）")
+    except Exception as e:
+        _log("_sample_progress_widget", e)
+
+
+def _sample_meta_add(meta, names, s):
+    """把东财股票列表的一行收进 (meta, names)。
+
+    ★ 成交额 / 市值取不到时记 **None（未知）**，绝不写 0：
+      下游 `band_sample_build` 是 `if amt_yi is not None` 才判「可交易」，
+      写 0 会被判成「不可交易」，等于把一只正常股票悄悄排除在统计之外。
+    """
+    code = str(s.get("f12") or "").zfill(6)
+    if len(code) != 6 or not code.isdigit():
+        return
+    price = _safe_float(s.get("f2"))
+    if price <= 0:
+        return
+    amt = _safe_float_or_none(s.get("f62"))
+    mv = _safe_float_or_none(s.get("f20"))
+    meta[code] = {
+        "name": str(s.get("f14") or ""), "price": price,
+        "mv_yi": round(mv / 1e8, 2) if (mv and mv > 0) else None,
+        "amt_yi": round(amt / 1e8, 4) if (amt and amt > 0) else None,
+    }
+    names[code] = meta[code]["name"]
+
+
+def band_samples_harvest_forward(progress_cb=None, bench_df=None):
+    """前瞻采集：扫描全市场，对**今天**这一根K线取样本。
+
+    返回 (rows, report)。扫描口径与选股一致（同一套 _EM_HOSTS 分页），
+    但**不套用 EXCLUDE_PREFIXES** —— 采样要覆盖所有板块，这是与选股的关键差别。
+
+    ★ 两条走过弯路的地方：
+      ① 北交所不在东财股票列表分页里，必须单独按 `m:0+t:81+s:2048` 补一次，
+         否则「不限板块」是假的 —— 北交所的波动结构恰恰是最不该被预先排除的。
+      ② 基准（沪深300）必须一起传进采样引擎。不传的话 band_outcome_compute 拿不到
+         bench_df → excess_pct 恒为 None → 分桶报表里所有「相对基准」全是空的，
+         这批样本就永远回答不了「它到底有没有产生超额」——采集全白做。
+    """
+    report = {"codes": 0, "fetched": 0, "failed": 0, "kept": 0, "fail_examples": []}
+    meta = {}
+    names = {}
+    try:
+        raw = []
+        for pn in range(1, 41):
+            page = fetch_market_page(pn)
+            if not page:
+                break
+            raw.extend(page)
+        if not raw:
+            report["error"] = "全市场接口暂不可用（非交易时段/网络限制）"
+            return [], report
+        for s in raw:
+            _sample_meta_add(meta, names, s)
+        # 北交所补采（失败不阻断主流程，但要在日志里留痕）
+        try:
+            r = requests.get(f"{_EM_HOSTS[0]}/api/qt/clist/get",
+                             params={"pn": "1", "pz": "1000", "po": "1", "np": "1",
+                                     "fltt": "2", "invt": "2", "fid": "f62",
+                                     "fs": "m:0+t:81+s:2048",
+                                     "fields": "f12,f14,f2,f20,f62"},
+                             timeout=10, headers=_REQUEST_HEADERS)
+            for s in _diff_to_list((r.json().get("data") or {}).get("diff")):
+                _sample_meta_add(meta, names, s)
+        except Exception as e:
+            _log("band_samples_harvest_forward/bj", e)
+    except Exception as e:
+        _log("band_samples_harvest_forward/universe", e)
+        report["error"] = f"获取全市场清单失败：{e}"
+        return [], report
+    if not meta:
+        report["error"] = "全市场清单为空"
+        return [], report
+    if bench_df is None:                      # 允许调用方传入（无头采集脚本会复用缓存）
+        bench_df = _bench_history()
+    rows, rep = band_samples_harvest(
+        list(meta.keys()), source='forward', lookback_days=0, names=names,
+        market_meta=meta, bench_df=bench_df, progress=(progress_cb or None), max_codes=0)
+    rep["universe"] = len(meta)
+    rep["no_bench"] = bench_df is None        # 必须显式告知：没有基准就没有超额
+    return rows, rep
+
+
+def _sample_pending_outcome():
+    """前瞻样本「还没到能判结案的时候」的占位结果。
+
+    字段与 band_outcome_compute 的输出保持同构，这样报表代码不用分支判断；
+    但它 `closed=False`，所以永远进不了统计（_sample_usable 会挡住）。
+    """
+    return {
+        "closed": False, "close_reason": "pending", "close_at": "", "close_price": None,
+        "days_held": 0, "ret_pct": None, "bench_ret_pct": None, "excess_pct": None,
+        "mfe_pct": None, "mae_pct": None, "verdict": "pending",
+        "rule_version": REVIEW_RULE_VERSION, "computed_at": now_cn_str(),
+    }
+
+
+def band_samples_pending_keys(rows):
+    """列出所有「还没结案」的样本（这些需要每天重算一次结果）。"""
+    out = []
+    for k, r in (rows.items() if isinstance(rows, dict) else enumerate(rows)):
+        if not isinstance(r, dict):
+            continue
+        if not (r.get("outcome") or {}).get("closed"):
+            out.append(r)
+    return out
+
+
+def band_samples_refresh_pending(rows_map, fetch=None, bench_df=None, max_items=400):
+    """把跟踪中的样本重算一遍，能结案的补上结果。返回 (rows_map, 更新数)。
+
+    ★ 为什么必须有它：前瞻样本采下来时波段还没走完，结果必然是 pending。
+      没有这一步，前瞻样本库里会永久堆着一批永远算不出结果的占位行 ——
+      「每日前瞻」就变成了只进不出、永远无法统计的死数据。
+    只重算未结案的；已结案的绝不复算（历史结果不可被改写）。
+    """
+    fetch = fetch or _sample_fetch_kline
+    pend = band_samples_pending_keys(rows_map)[:max_items]
+    if not pend:
+        return rows_map, 0
+    by_code = {}
+    for r in pend:
+        by_code.setdefault(str(r.get("code")).zfill(6), []).append(r)
+    updated = 0
+    for code, items in by_code.items():
+        try:
+            df, _unit = fetch(code, 700)
+        except Exception as e:
+            _log(f"band_samples_refresh_pending/fetch/{code}", e)
+            continue
+        if df is None or len(df) < SAMPLE_MIN_BARS:
+            continue
+        dates = [str(x)[:10] for x in df['Date'].astype(str).tolist()]
+        for r in items:
+            d = str(r.get("date") or "")[:10]
+            i0 = None
+            for j in range(len(dates)):
+                if dates[j] <= d:
+                    i0 = j
+            if i0 is None or i0 >= len(df) - 1:
+                continue
+            try:
+                out = band_outcome_compute(d, r.get("price"), df, bench_df)
+            except Exception as e:
+                _log(f"band_samples_refresh_pending/{code}", e)
+                continue
+            if out is None or not out.get("closed"):
+                continue
+            r["outcome"] = out
+            updated += 1
+    return rows_map, updated
+
+
 def band_review_ui():
+
     """📊 策略复盘：把「选了 → 结案 → 归因」变成可统计的看板。
 
     ★ 本面板**只做统计，不改动任何选股参数**。理由见 REVIEW_* 常量的注释：
@@ -2806,6 +3690,15 @@ def ai_band_picker_ui():
     except Exception as e:
         _log("band_review_ui", e)
         st.warning("策略复盘面板渲染出错（已拦截，不影响其他功能）")
+        with st.expander("查看错误详情"):
+            st.code(traceback.format_exc(), language="python")
+
+    # 逻辑有效性验证面板（机器自采样本 —— 与上面的记忆名单完全分开）
+    try:
+        band_sample_ui()
+    except Exception as e:
+        _log("band_sample_ui", e)
+        st.warning("逻辑验证面板渲染出错（已拦截，不影响其他功能）")
         with st.expander("查看错误详情"):
             st.code(traceback.format_exc(), language="python")
 
