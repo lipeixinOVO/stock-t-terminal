@@ -44,3 +44,19 @@ band_watch.json.tmp
 # 摘要只同步巡检必需的「代码 + 状态」，收益率永远留在本地容器。
 band_batches.json
 band_batches.json.tmp
+
+# ===== 策略样本语料库（隐私 + 体积，绝对禁止进仓库）=====
+# band_samples.jsonl.gz 是机器自采的全市场样本（含逐条入场特征与收益率）。
+# 双重理由不进仓库：① 它是这套选股逻辑的完整"成绩单 + 特征表"，公开等于把策略送人；
+# ② 几十万行、数 MB，放仓库里提交一次就再也压不下去。
+# 汇总统计（band_sample_stats.json）将来若需同步，走 BAND_KEY 加密路线，不用明文。
+band_samples.jsonl.gz
+band_samples.jsonl.gz.tmp
+
+# ===== 加密语料产物（可上传缓存/产物，但仍不进仓库树）=====
+# band_samples.enc = 上面那份语料的 BAND_KEY 加密版，给 Actions 的缓存/产物用。
+# 它**不是**明文，但也没必要占仓库体积，所以同样忽略。
+band_samples.enc
+band_samples.enc.tmp
+# 回填用的日线磁盘缓存（几千个小文件，纯中间产物）
+.sample_cache/
