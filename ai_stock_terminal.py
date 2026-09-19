@@ -1408,6 +1408,99 @@ def _github_headers(token):
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "stock-t-terminal"}
 
+# ============ 波段摘要加密（可选，用于隐藏「关注了哪些股票」）============
+# 背景：本仓库是 public。脱敏摘要虽然不含备注/入选价，但仍含股票代码清单。
+# 为什么不直接改成 Private：public 仓库的 Actions 完全免费、不限分钟；private 仓库只有
+# 2000 分钟/月，而本项目「定时巡检 + 保活」约需 7800 分钟/月，额度烧穿后 GitHub 会
+# **静默停掉**定时任务 —— 那样你反而收不到任何提醒。所以正确做法是保持 public，
+# 把摘要文件**加密**后再提交：Streamlit Secrets 与 GitHub Actions Secrets 各加一个
+# 同名的 BAND_KEY（两边值必须一致）。未配置 BAND_KEY 时保持明文（与历史行为一致），
+# 页面会明确提示「摘要未加密」。
+
+_ENC_FIELD = "enc"
+_ENC_VERSION = 1
+
+def band_crypto_key():
+    """读加密密钥：环境变量 → 本地 config.json → Streamlit Secrets。空串表示未启用。"""
+    v = os.environ.get("BAND_KEY", "")
+    if v and str(v).strip():
+        return str(v).strip()
+    try:
+        v = (load_config() or {}).get("band_key")
+    except Exception as e:
+        _log("band_crypto_key:config", e)
+        v = ""
+    if v and str(v).strip():
+        return str(v).strip()
+    try:
+        v = st.secrets.get("BAND_KEY", "")
+        if v and str(v).strip():
+            return str(v).strip()
+    except Exception:
+        pass      # 本地无 secrets.toml 属预期情况，刷日志反而是噪声
+    return ""
+
+def band_crypto_enabled():
+    """是否已配置加密密钥（页面据此提示「加密 / 未加密」）。"""
+    return bool(band_crypto_key())
+
+def _fernet():
+    """构造 Fernet 实例。未配密钥返回 None；配了但不可用则**抛异常**。
+
+    刻意不在这里吞掉异常：如果配了 BAND_KEY 却因为缺依赖 / 密钥格式错而悄悄退回明文，
+    就等于把「关注了哪些股票」原样公开出去，而这种泄露不会有任何提示。"""
+    key = band_crypto_key()
+    if not key:
+        return None
+    try:
+        from cryptography.fernet import Fernet
+    except Exception as e:
+        raise RuntimeError(f"已配置 BAND_KEY 但缺少 cryptography 依赖：{e}") from e
+    try:
+        return Fernet(key.encode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"BAND_KEY 不是合法的 Fernet 密钥（应为 44 字符 base64）：{e}") from e
+
+def band_encrypt_obj(obj):
+    """把摘要对象包成可公开的文件结构。
+
+    未配密钥 → 原样返回（明文，兼容历史行为）；
+    配了密钥但加密失败 → 抛异常，由调用方中止提交。"""
+    f = _fernet()
+    if f is None:
+        return obj
+    raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    return {"v": _ENC_VERSION, _ENC_FIELD: f.encrypt(raw).decode("ascii")}
+
+def band_decrypt_obj(data):
+    """还原摘要对象，返回 (ok, obj 或 None, err)。
+
+    明文（没有 enc 字段）原样返回，兼容历史文件与未启用加密的场景；
+    是密文但本端没密钥 / 解不开 → 明确报错，由调用方展示，绝不当作空数据静默处理。"""
+    if not isinstance(data, dict):
+        return False, None, "文件内容不是 JSON 对象"
+    token = data.get(_ENC_FIELD)
+    if not token:
+        return True, data, ""
+    try:
+        f = _fernet()
+    except Exception as e:
+        return False, None, str(e)[:160]
+    if f is None:
+        return False, None, "文件是加密的，但本端没有配置 BAND_KEY"
+    try:
+        obj = json.loads(f.decrypt(str(token).encode("ascii")).decode("utf-8"))
+    except Exception as e:
+        return False, None, f"解密失败（两端 BAND_KEY 是否一致？）：{type(e).__name__}"
+    if not isinstance(obj, dict):
+        return False, None, "解密后的内容不是 JSON 对象"
+    return True, obj, ""
+
+def generate_band_key():
+    """生成一个新的 Fernet 密钥，供用户填入两边 Secrets。"""
+    from cryptography.fernet import Fernet
+    return Fernet.generate_key().decode("ascii")
+
 def _band_memory_digest(mem):
     """从完整记忆里提取「可公开」的最小摘要，用于提交到仓库。
 
@@ -1501,29 +1594,38 @@ def band_memory_merge_digest(local, digest):
     return out
 
 def _fetch_remote_memory():
-    """拉取仓库里的「波段摘要」。返回 (ok, msg, digest 或 None)。"""
+    """拉取仓库里的「波段摘要」。返回 (ok, msg, digest 或 None, 远端是否加密)。
+
+    第 4 项 encrypted 用于**防止把加密数据降级成明文**：若远端已是密文而本端没有密钥，
+    调用方必须拒绝提交 —— 否则一次推送就会让之前的加密前功尽弃。"""
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_WATCH_PATH}"
     try:
         r = requests.get(url, headers=_github_headers(_github_token()),
                          params={"ref": "main"}, timeout=(5, 15))
         if r.status_code == 404:
-            return False, f"仓库里还没有 {GITHUB_WATCH_PATH}（首次同步时创建）", None
+            return False, f"仓库里还没有 {GITHUB_WATCH_PATH}（首次同步时创建）", None, False
         if r.status_code != 200:
-            return False, f"拉取失败 HTTP {r.status_code}: {r.text[:120]}", None
+            return False, f"拉取失败 HTTP {r.status_code}: {r.text[:120]}", None, False
         raw = base64.b64decode(r.json().get("content") or "").decode("utf-8", errors="replace")
-        digest = json.loads(raw)
-        if not isinstance(digest, dict) or not isinstance(digest.get("stocks"), dict):
-            return False, "仓库里的波段摘要结构异常，已忽略", None
-        return True, f"{len(digest.get('stocks', {}))} 只", digest
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return False, "仓库里的波段摘要结构异常，已忽略", None, False
+        encrypted = bool(payload.get(_ENC_FIELD))
+        ok, digest, err = band_decrypt_obj(payload)
+        if not ok:
+            return False, err, None, encrypted
+        if not isinstance(digest.get("stocks"), dict):
+            return False, "仓库里的波段摘要结构异常，已忽略", None, encrypted
+        return True, f"{len(digest.get('stocks', {}))} 只", digest, encrypted
     except Exception as e:
         _log("_fetch_remote_memory", e)
-        return False, f"拉取异常：{type(e).__name__}: {str(e)[:100]}", None
+        return False, f"拉取异常：{type(e).__name__}: {str(e)[:100]}", None, False
 
 def band_memory_pull_github():
     """从仓库拉取波段摘要并合并进本地记忆。返回 (ok, msg, merged_local_mem 或 None)。"""
     if not _github_token():
         return False, "未配置 GitHub Token", None
-    ok, msg, digest = _fetch_remote_memory()
+    ok, msg, digest, _enc = _fetch_remote_memory()
     if not ok or digest is None:
         return ok, msg, None
     return True, f"已拉取云端摘要（{msg}）", band_memory_merge_digest(load_band_memory(), digest)
@@ -1534,17 +1636,27 @@ def band_memory_push_github(mem, merge_remote=True):
     merge_remote=True 时先拉取云端摘要并合并（原地更新 mem），这样巡检脚本写入的
     状态变化不会被网页端覆盖。冲突（409/422）时重取 sha 再试一次。
 
-    ⚠️ 提交的是 _band_memory_digest(mem)，**不含备注/入选价**（仓库是 public 的）。"""
+    ⚠️ 提交的是 `_band_memory_digest(mem)`，**不含备注/入选价**（仓库是 public 的）。
+    若配置了 BAND_KEY，还会再用 Fernet 整段加密后才提交，连代码清单也一并隐藏。"""
     token = _github_token()
     if not token:
         return False, "未配置 GitHub Token（在 Streamlit Secrets 加 GITHUB_TOKEN 即可自动同步）"
+    encrypted_remote = False
     if merge_remote:
-        ok, _msg, digest = _fetch_remote_memory()
+        ok, _msg, digest, encrypted_remote = _fetch_remote_memory()
         if ok and digest is not None:
             merged = band_memory_merge_digest(mem, digest)
             mem.clear(); mem.update(merged)      # 原地更新，保持调用方引用有效
             _save_json(BAND_MEMORY_FILE, mem)
+    if encrypted_remote and not band_crypto_enabled():
+        return False, ("仓库里的摘要是加密的，但本端没配 BAND_KEY，已中止同步"
+                       "（否则会把密文覆盖成明文，等于加密白做）")
     payload_obj = _band_memory_digest(mem)
+    try:
+        payload_obj = band_encrypt_obj(payload_obj)
+    except Exception as e:
+        _log("band_memory_push_github:encrypt", e)
+        return False, f"加密失败，已中止同步（不会以明文提交）：{str(e)[:120]}"
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_WATCH_PATH}"
     content = base64.b64encode(json.dumps(payload_obj, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii")
     n = len(payload_obj.get('stocks', {}))
@@ -1666,6 +1778,12 @@ def band_memory_ui():
     if not _github_token():
         st.info("ℹ️ 还没配置 GitHub Token —— 记忆只保存在本页容器里（重启会丢），"
                 "云端也不会推送微信。配置方法见下方「☁️ 云端推送」说明。")
+
+    if band_crypto_enabled():
+        st.caption("🔒 云端摘要已加密：仓库里的 band_watch.json 是密文，看不到你关注了哪些股票。")
+    else:
+        st.caption("🔓 云端摘要未加密：仓库里的 band_watch.json 能直接读出股票代码清单，"
+                   "想隐藏它见下方「🔒 隐藏股票代码清单」。")
 
     # ---- 概览 ----
     c1, c2, c3, c4 = st.columns(4)
@@ -1896,6 +2014,39 @@ def band_memory_ui():
         也可以改用 GitHub Secrets 里的 `BAND_WATCHLIST`（逗号分隔代码）作为替代方案，
         那样连代码列表都不需要提交。
         """)
+
+        st.markdown("---")
+        st.markdown("#### 🔒 隐藏股票代码清单（可选，推荐）")
+        if band_crypto_enabled():
+            st.success("当前状态：**已开启加密** —— 仓库里的 band_watch.json 是密文。")
+        else:
+            st.warning("当前状态：**未加密** —— 仓库里的 band_watch.json 能直接读出你关注了哪些股票。")
+
+        st.markdown("""
+        上面只解决了「备注和买入价」不外泄，但 `band_watch.json` 里仍有**股票代码清单**。
+        想连这份清单也藏起来，就在两端各加一个**完全相同**的密钥 `BAND_KEY`：
+
+        1. 点下面的按钮生成一个密钥。
+        2. **Streamlit Cloud** → 你的 app → Settings → Secrets，加一行 `BAND_KEY = "密钥"`。
+        3. **GitHub 仓库** → Settings → Secrets and variables → Actions →
+           New repository secret，名字填 `BAND_KEY`，值填**同一串**。
+        4. 保存后回到本页，点一次「☁️ 同步到云端」，仓库里的文件就变成密文了。
+
+        ⚠️ 两边必须是**同一串**密钥。少配一边或填错，摘要就解不开 ——
+        网页端会明确提示「解密失败」，巡检侧会在 Actions 日志里打印醒目告警
+        （这时波段监控实际不工作，不会静默假装正常）。
+        另外，开启加密之后**不要把某一端的 BAND_KEY 删掉**：同步逻辑会拒绝用明文去覆盖密文，
+        宁可报错也不会泄露。
+        """)
+
+        if st.button("🔑 生成一个新的加密密钥", key="band_key_gen"):
+            try:
+                st.session_state["band_key_new"] = generate_band_key()
+            except Exception as e:
+                st.error(f"生成失败（缺少 cryptography 依赖？）：{e}")
+        if st.session_state.get("band_key_new"):
+            st.code(st.session_state["band_key_new"], language="text")
+            st.caption("把上面这串原样复制到两处 Secrets（Streamlit 与 GitHub Actions），一字都不能差。")
 
 
 def ai_band_picker_ui():
