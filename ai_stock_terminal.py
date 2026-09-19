@@ -80,9 +80,63 @@ st.markdown("""
 
 st.title("🤖 日内做T信号标注助手")
 
+# ============ 长任务 × 自动刷新 的互斥（★ 别动这里，这是"跑一会就得再点一次"的修复）============
+# 根因（已实测确认）：本页顶部有一个全局 st_autorefresh(60 秒)。长任务（采集/扫描/复盘）
+# 要跑 1~3 分钟，而**按钮点击后的那次运行会把这个 60 秒计时器装上**；到第 60 秒计时器触发
+# rerun，Streamlit 会在**下一个 st.* 调用**处中断正在跑的那次运行（采集的进度回调每 20 只
+# 就调一次 st.progress，几乎立刻被打断）。中断后按钮的"按下"状态已经消失——它只在被点击的
+# 那一次运行里为 True——于是活停在一半、结果也没落盘，用户只能再点一次。
+# 因为是**全局**计时器，所以几乎所有的长任务都是这个毛病，不是单个按钮写错了。
+# 修法：把"点击"和"执行"拆成两次运行。点击那次只登记待办 + 立刻 rerun；下一次运行发现有待办
+# 就把自动刷新间隔放宽到 30 分钟（组件照旧渲染 → 组件自带的 debounce 会 clearInterval 掉那根
+# 60 秒的定时器，不会出现"自动刷新被永久关掉"），这一次运行就砍不到了，可以安心把活干完。
+_LONG_TASK_KEY = "_long_task_pending"
+_LONG_TASK_TTL = 120             # 秒；待办超过这个时长视为作废，避免状态卡死
+_AUTOREFRESH_MS = 60000          # 正常：60 秒
+_AUTOREFRESH_BUSY_MS = 1800000   # 有待办：30 分钟（等价于暂停，但组件仍在 → 不会冻结页面）
+
+def _long_task_pending():
+    """当前是否有一个"即将执行"的长任务。顺带清理过期待办。
+
+    任何一次用户交互都会走到这里，所以即使状态因为异常而卡住，也会自愈回 60 秒刷新。"""
+    p = st.session_state.get(_LONG_TASK_KEY)
+    if not p:
+        return False
+    try:
+        if _time_module.time() - float(p.get("ts", 0)) > _LONG_TASK_TTL:
+            st.session_state[_LONG_TASK_KEY] = None
+            return False
+    except Exception as e:
+        _log("_long_task_pending/stale", e)
+        st.session_state[_LONG_TASK_KEY] = None
+        return False
+    return True
+
+def long_button(label, key, container=None, **kw):
+    """长任务专用按钮：**点一次就够**。用法与 st.button 完全一致，只是把触发拆成两次运行。
+
+    第 1 次（被点击的那次运行）：只登记待办 + st.rerun()，立刻返回，界面马上有反应；
+    第 2 次：顶部已把自动刷新放宽到 30 分钟 → 本次运行不会被打断 → 安心把活干完。
+    调用方原有的 `if <按钮>:` 与末尾的 st.rerun() 都不用改。
+
+    ⚠️ 凡是"会跑几十秒以上"的动作都该用它；秒级动作继续用 st.button 就行（多一次 rerun 没必要）。"""
+    c = container if container is not None else st
+    if c.button(label, key=key, **kw):
+        st.session_state[_LONG_TASK_KEY] = {"key": key, "ts": _time_module.time()}
+        st.rerun()
+    p = st.session_state.get(_LONG_TASK_KEY)
+    if p and p.get("key") == key:
+        st.session_state[_LONG_TASK_KEY] = None   # 先清掉：干完活后调用方的 rerun 会恢复 60 秒刷新
+        return True
+    return False
+
 if HAS_AUTOREFRESH:
-    st_autorefresh(interval=60000, key="auto_refresh")
-    st.caption("✅ 自动刷新已开启（每60秒更新一次行情，全自选股监控）")
+    _busy = _long_task_pending()
+    st_autorefresh(interval=(_AUTOREFRESH_BUSY_MS if _busy else _AUTOREFRESH_MS),
+                   key="auto_refresh")
+    st.caption("✅ 自动刷新已开启（每60秒更新一次行情，全自选股监控）"
+               + ("　⏳ 长任务进行中，定时刷新已临时让路（60 秒的刷新会打断长任务）"
+                  if _busy else ""))
 else:
     st.caption("⚠️ 未安装自动刷新组件，请按 F5 手动刷新网页")
 
@@ -2886,8 +2940,8 @@ def _sample_forward_action(rows_map):
     """「采集今日全市场样本」这一个动作的 UI + 落盘。空库与非空库共用，避免两处逻辑漂移。"""
     _c1, _c2 = st.columns([1, 2])
     with _c1:
-        _do = st.button("📥 采集今日全市场样本", key="sample_forward_btn",
-                        use_container_width=True)
+        _do = long_button("📥 采集今日全市场样本", key="sample_forward_btn",
+                          use_container_width=True)
     with _c2:
         st.caption("采集会扫描全市场（含创业板/科创板/北交所），只记信号与对照，不发推送、"
                    "不写进你的记忆名单。样本只存在本地容器，不会上传仓库。")
@@ -3120,7 +3174,8 @@ def band_review_ui():
 
     _c1, _c2 = st.columns([1, 3])
     with _c1:
-        _do = st.button("🔄 重算结案与归因", key="band_review_refresh", use_container_width=True)
+        _do = long_button("🔄 重算结案与归因", key="band_review_refresh",
+                          use_container_width=True)
     with _c2:
         st.caption("重算只处理「跟踪中」的条目（已结案的不会再变）；结案点由日线回溯决定，"
                    "与是否开着网页无关，因此结果可复现。")
@@ -3273,8 +3328,9 @@ def band_memory_ui():
 
     # ---- 操作区 ----
     b1, b2, b3, b4 = st.columns(4)
-    if b1.button("🔄 刷新全部状态", use_container_width=True, key="bandmem_refresh",
-                 help="重新拉取记忆里所有股票的最新波段状态，并标出变化"):
+    if long_button("🔄 刷新全部状态", key="bandmem_refresh", container=b1,
+                   use_container_width=True,
+                   help="重新拉取记忆里所有股票的最新波段状态，并标出变化"):
         if not mem['stocks']:
             st.warning("记忆里还没有股票。")
         else:
@@ -3287,14 +3343,16 @@ def band_memory_ui():
             st.session_state.band_memory_changes = _changes
             st.session_state.band_memory_sync_msg = f"已刷新，{len(_changes)} 只状态发生变化{_pushed_msg}"
             st.rerun()
-    if b2.button("☁️ 同步到云端", use_container_width=True, key="bandmem_push",
-                 help="把记忆提交到 GitHub 仓库，云端巡检脚本据此推送微信"):
+    if long_button("☁️ 同步到云端", key="bandmem_push", container=b2,
+                   use_container_width=True,
+                   help="把记忆提交到 GitHub 仓库，云端巡检脚本据此推送微信"):
         with st.spinner("正在同步..."):
             _ok, _msg = band_memory_push_github(mem)
         st.session_state.band_memory_sync_msg = _msg
         st.rerun()
-    if b3.button("⬇️ 从云端拉取", use_container_width=True, key="bandmem_pull",
-                 help="把云端记录（含巡检脚本发现的状态变化）合并到本地"):
+    if long_button("⬇️ 从云端拉取", key="bandmem_pull", container=b3,
+                   use_container_width=True,
+                   help="把云端记录（含巡检脚本发现的状态变化）合并到本地"):
         with st.spinner("正在拉取..."):
             _ok, _msg, _merged = band_memory_pull_github()
         if _ok and _merged is not None:
@@ -3630,7 +3688,7 @@ def ai_band_picker_ui():
         scan_label = "🔍 扫描手动自选"
     elif scan_scope == "指定板块":
         scan_label = "🔍 扫描指定板块"
-    if st.button(scan_label, type="primary", use_container_width=True, key="scan_stocks"):
+    if long_button(scan_label, key="scan_stocks", type="primary", use_container_width=True):
         try:
             with st.spinner("正在拉取行情并分析波段状态..."):
                 st.session_state.scan_results = screen_band_stocks(custom_codes=custom_codes)
@@ -3976,7 +4034,8 @@ def dynamic_pool_ui():
         st.markdown(f"""<div style="background:#1e1e2e; border-radius:10px; padding:15px; border-left:4px solid #89b4fa;"><div style="color:#89b4fa; font-size:14px;">📦 动态池状态</div><div style="font-size:28px; font-weight:bold; color:#f0f2f6; margin:8px 0;">{len(pool)}<span style="font-size:16px; color:#888;"> 只</span></div><div style="color:#00cc66; font-size:14px;">高分股(≥65): {high_score} 只</div><div style="color:#c9d1d9; font-size:12px; margin-top:8px;">上次更新: {last_upd}</div></div>""", unsafe_allow_html=True)
     col_refresh, col_clean = st.columns([1, 1])
     with col_refresh:
-        if st.button("🔄 刷新动态池", type="primary", use_container_width=True, key="refresh_pool"):
+        if long_button("🔄 刷新动态池", key="refresh_pool", type="primary",
+                       use_container_width=True):
             with st.spinner("并发拉取中，约需 30 秒..."): st.session_state.dynamic_pool = refresh_dynamic_pool()
             st.success("✅ 动态池刷新完成！"); st.rerun()
     with col_clean:
