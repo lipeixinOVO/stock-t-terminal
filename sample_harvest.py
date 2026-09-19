@@ -216,7 +216,16 @@ def _wrap_plain(ns, src, dst):
 
 
 def load_store(ns, path, enc=False):
-    """读语料库 → {key: row}。enc=True 表示 path 是密文。"""
+    """读语料库 → {key: row}。enc=True 表示 path 是密文。
+
+    ★ 文件**不存在**＝首次运行，返回空库（合法状态，**不是**错误）；
+      文件**存在但读不出/解不开**＝照旧抛 StoreError，绝不静默当空数据（fail-closed 不变）。
+    踩过的坑（run 35440036252）：云端首次运行时没有历史语料，这里直接抛
+    「加密语料不是合法 JSON：[Errno 2] No such file or directory: 'band_samples.enc'」，
+    把刚采完的 3711 条全丢了、退出码 3。**首次运行必须能正常起步。**
+    """
+    if not os.path.exists(path):
+        return {}
     if enc:
         tmp = os.path.join(CACHE_DIR, "_unwrap_work.jsonl.gz")
         os.makedirs(CACHE_DIR, exist_ok=True)
