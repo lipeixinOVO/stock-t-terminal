@@ -533,16 +533,18 @@ def main():
             return 2
 
     if args.forward:
+        limited = max(0, int(args.limit or 0))
         print("=" * 72)
         print(f"前瞻采集 ｜ 全市场最新一根K线 ｜ 落盘 {os.path.basename(path)}"
-              f"（{'加密' if enc else '明文'}）")
+              f"（{'加密' if enc else '明文'}）"
+              + (f" ｜ ⚠️ 冒烟测试：只取前 {limited} 只" if limited else ""))
         print("=" * 72)
         print("[1] 取基准（沪深300）")
         bench = fetch_bench(ns)
         print("[2] 全市场扫描 + 逐只取日线")
         try:
             rows, rep = ns["band_samples_harvest_forward"](
-                bench_df=bench, progress_cb=None)
+                bench_df=bench, progress_cb=None, limit=limited)
         except Exception as e:
             ns["_log"]("harvest/forward", e)
             print(f"!! 前瞻采集失败：{e}")
@@ -552,6 +554,9 @@ def main():
             return 4
         print(f"  全市场 {rep.get('universe')} 只，扫描 {rep.get('codes')} 只，"
               f"取数成功 {rep.get('fetched')}，失败 {rep.get('failed')} → {len(rows)} 条")
+        if rep.get("limit"):
+            print(f"  ⚠️ 本次为冒烟测试（limit={rep['limit']}），这批样本不代表全市场，"
+                  f"正式采集请留空 limit")
         if rep["fail_examples"]:
             print(f"  取数失败示例：{rep['fail_examples']}")
         rows_map = load_store(ns, path, enc=enc)
