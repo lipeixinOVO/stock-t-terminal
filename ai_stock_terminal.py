@@ -3997,6 +3997,11 @@ def dynamic_pool_ui():
 
 # ================= 12. 图表绘制 =================
 PLOTLY_CONFIG_CLEAN = {'displayModeBar': False, 'scrollZoom': False, 'staticPlot': False, 'doubleClick': 'reset'}
+# 日K主图专用：把模式栏给回来（缩放 / 框选缩放 / 平移 / 自动缩放 / 重置）。
+# 全站原本都是 displayModeBar=False，用户在日K图上就只剩「拖框」和「双击重置」两种手段；
+# 一旦拖框因坐标轴被锁而失效，表现就完全是「缩放坏了」。分时图仍用 CLEAN
+# （它所有轴都 fixedrange=True，本来就不需要交互，多一根工具栏只是噪声）。
+PLOTLY_CONFIG_DAILY = dict(PLOTLY_CONFIG_CLEAN, displayModeBar=True)
 
 def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.72, 0.28])
@@ -4016,11 +4021,20 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
     cur_vol = latest['Volume']; vol_ma5 = latest['VOL_MA5'] if not pd.isna(latest.get('VOL_MA5', np.nan)) else 0; vol_ma10 = latest['VOL_MA10'] if not pd.isna(latest.get('VOL_MA10', np.nan)) else 0
     fig.add_annotation(xref="paper", yref="paper", x=0.005, y=0.275, text=f"<b>成交量</b>  {cur_vol/1e6:.2f}M   MA5:{vol_ma5/1e6:.2f}M   MA10:{vol_ma10/1e6:.2f}M", showarrow=False, xanchor='left', yanchor='top', font=dict(color='#89b4fa', size=11, family='Consolas'), bgcolor='rgba(0,0,0,0)', bordercolor='rgba(0,0,0,0)')
     fig.update_layout(template="plotly_dark", height=650, xaxis_rangeslider_visible=False, hovermode="x unified", dragmode='zoom', legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10), bgcolor='rgba(0,0,0,0)', bordercolor='rgba(0,0,0,0)'), margin=dict(t=50, l=10, r=10, b=10), uirevision=uirevision_key)
-    # 主图可自由缩放；成交量副图 X/Y 轴均锁定 → 完全跟随主图联动，不能独立缩放平移
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], fixedrange=False, row=1, col=1)
-    fig.update_xaxes(matches='x', row=2, col=1)
-    fig.update_xaxes(fixedrange=True, row=2, col=1)
-    fig.update_yaxes(fixedrange=False, row=1, col=1); fig.update_yaxes(fixedrange=True, row=2, col=1)
+    # ---- 缩放联动（这块踩过坑，动手前务必读完）----
+    # make_subplots(shared_xaxes=True) 的真实行为：让**上方**子图的 x 去 matches **最下方**子图的 x。
+    # 实测 fig.layout.xaxis.matches == 'x2' —— 也就是主图 x 是"跟随者"，成交量副图的 x2 才是"驱动者"。
+    # ⚠️ 曾经的写法是给副图又加 `matches='x'` 且 `fixedrange=True`，等于干了两件坏事：
+    #    ① 制造 x ↔ x2 的循环匹配；② 把"驱动者"锁死 —— 跟随者自然跟着一起锁死。
+    #    症状就是：主图**横向完全拖不动、只剩纵向能缩放**，而且"只要去动成交量图的缩放设置，
+    #    主图就坏掉"（因为被锁的正是驱动轴）。所以这里**绝不能**再给副图 x 加 fixedrange。
+    # 现在的口径：两根 x 靠 shared_xaxes 天然联动，在任意一个子图上拖框，两个面板同时缩放；
+    #    副图纵向锁死（成交量刻度不需要拖），主图纵向自由。
+    # rangebreaks 也必须**两根 x 都设**：rangebreaks 不会被 matches 复制，只设一根会让两个面板的
+    #    日期刻度错位（少了"驱动轴不带周末压缩"这个半坏状态）。
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], fixedrange=False)
+    fig.update_yaxes(fixedrange=False, row=1, col=1)
+    fig.update_yaxes(fixedrange=True, row=2, col=1)
     return fig
 
 def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, uirevision_key=0):
@@ -4120,8 +4134,9 @@ try:
         if st.button("🔄 复位", use_container_width=True, key="reset_daily_chart"): st.session_state.chart_reset_key += 1; st.rerun()
     ma_html = f"""<div class="ma-bar"><span style="color:#ffffff">M5: {latest['MA5']:.3f}</span><span style="color:#ffff00">M10: {latest['MA10']:.3f}</span><span style="color:#ff00ff">M20: {latest['MA20']:.3f}</span><span style="color:#00ff00">M30: {latest['MA30']:.3f}</span><span style="color:#00ccff">年线: {latest['MA250']:.3f}</span></div>"""
     st.markdown(ma_html, unsafe_allow_html=True)
-    st.plotly_chart(plot_daily_chart(df_daily.tail(120), symbol, latest, st.session_state.chart_reset_key), use_container_width=True, config=PLOTLY_CONFIG_CLEAN)
-    st.caption("💡 **框选放大**：在**主图**上按住鼠标左键拖出一个矩形框，松开即放大该区域；双击图表或点「🔄 复位」恢复初始视图。成交量副图已锁定。")
+    st.plotly_chart(plot_daily_chart(df_daily.tail(120), symbol, latest, st.session_state.chart_reset_key), use_container_width=True, config=PLOTLY_CONFIG_DAILY)
+    st.caption("💡 **放大**：在图上按住左键拖出矩形框，松开即放大该区域（主图与成交量**同步缩放**，在哪个子图上拖都可以）；"
+               "右上角工具栏有缩放 / 平移 / 自动缩放 / 重置按钮；双击图表或点「🔄 复位」回到初始视图。")
     col_title2, col_btn2 = st.columns([9, 1])
     with col_title2: st.subheader(f"⏱️ {current_name} ({symbol}) 分时级别走势（同花顺风格）")
     with col_btn2:
