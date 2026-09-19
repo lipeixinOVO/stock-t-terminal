@@ -2960,11 +2960,15 @@ def _sample_meta_add(meta, names, s):
     names[code] = meta[code]["name"]
 
 
-def band_samples_harvest_forward(progress_cb=None, bench_df=None):
+def band_samples_harvest_forward(progress_cb=None, bench_df=None, limit=0):
     """前瞻采集：扫描全市场，对**今天**这一根K线取样本。
 
     返回 (rows, report)。扫描口径与选股一致（同一套 _EM_HOSTS 分页），
     但**不套用 EXCLUDE_PREFIXES** —— 采样要覆盖所有板块，这是与选股的关键差别。
+
+    limit>0 时只取清单里的前 limit 只（报告里的 universe 仍报真实总数）。
+    这是给**冒烟测试**用的：云端 CI 想验证「密钥配好了、加密落盘通了」时，
+    跑全市场要几十分钟，跑 5 只一分钟就够。正式采集必须留空（limit=0）。
 
     ★ 两条走过弯路的地方：
       ① 北交所不在东财股票列表分页里，必须单独按 `m:0+t:81+s:2048` 补一次，
@@ -3011,8 +3015,10 @@ def band_samples_harvest_forward(progress_cb=None, bench_df=None):
         bench_df = _bench_history()
     rows, rep = band_samples_harvest(
         list(meta.keys()), source='forward', lookback_days=0, names=names,
-        market_meta=meta, bench_df=bench_df, progress=(progress_cb or None), max_codes=0)
+        market_meta=meta, bench_df=bench_df, progress=(progress_cb or None),
+        max_codes=max(0, int(limit or 0)))
     rep["universe"] = len(meta)
+    rep["limit"] = max(0, int(limit or 0))     # 报告里显式留痕：这次是不是冒烟测试
     rep["no_bench"] = bench_df is None        # 必须显式告知：没有基准就没有超额
     return rows, rep
 
