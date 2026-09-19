@@ -4,3 +4,6 @@ numpy
 plotly
 requests
 streamlit-autorefresh
+# 波段摘要加密（可选，配了 BAND_KEY 才生效）：用于把 band_watch.json 加密后再提交，
+# 避免 public 仓库暴露「关注了哪些股票」。不配 BAND_KEY 时这个依赖只是被装着，不影响运行。
+cryptography
