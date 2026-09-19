@@ -1227,6 +1227,9 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None):
 BAND_MEMORY_VERSION = 1
 BAND_ALERT_STATUSES = ('顶背离预警', '跌破支撑')        # 波段结束预警：需要止盈/止损
 BAND_ENTRY_STATUSES = ('波段启动确认',)                 # 波段启动：值得关注/参与
+# ⚠️ 这个常量**只用于「更新已入册的条目」**；新建条目只认 BAND_ENTRY_STATUSES。
+#    2026-09-19 之前它被直接当成入册条件，于是全市场扫描时几百只「跌破支撑」
+#    被灌进记忆（实测 460 只/458 只是预警）。改回之前先读 band_memory_record 的说明。
 BAND_AUTO_MEMO_STATUSES = BAND_ENTRY_STATUSES + BAND_ALERT_STATUSES
 # 状态层级：用于判断是「变好」还是「恶化」，从而决定要不要打扰用户
 BAND_STATUS_LEVEL = {'波段未形成': 0, '波段进行中': 1, '波段启动确认': 2,
@@ -1303,19 +1306,28 @@ def _band_alert_decision(old_status, new_status):
 def band_memory_record(mem, rows, source):
     """把本次扫描结果中「值得跟踪」的股票写入记忆。返回新增代码列表。
 
-    只记 BAND_AUTO_MEMO_STATUSES（波段启动确认 / 顶背离预警 / 跌破支撑），
-    其余状态不进记忆 —— 否则每扫一次就堆十几只，很快变成噪音。"""
+    ★ 入册规则（2026-09-19 修正）：
+      - **新建**条目只认「波段启动确认」；
+      - 「顶背离预警 / 跌破支撑」只用于**更新已在记忆里**的股票，绝不新建条目。
+
+    为什么必须这样分：结束预警的意思是「你在盯的那只波段要结束了」，前提是它曾经启动过。
+    全市场扫描时处于「跌破 20 日线」的股票动辄几百只（实测 600 只深度分析里 458 只），
+    旧规则把它们全部入册 —— 记忆瞬间堆到 460 只、其中 458 只是预警，完全没法用。
+    """
     added = []
     for r in (rows or []):
         code = str(r.get('Code') or '').strip()
-        if not code or r.get('Status') not in BAND_AUTO_MEMO_STATUSES:
+        status = r.get('Status')
+        if not code:
             continue
         node = mem['stocks'].get(code)
         if node is None:
+            if status not in BAND_ENTRY_STATUSES:
+                continue                  # ← 关键：预警状态不得新建条目
             node = {
                 "code": code, "name": r.get('Name') or code,
                 "added_at": now_cn_str(), "added_price": float(r.get('Price') or 0.0),
-                "added_status": r.get('Status'), "added_source": source,
+                "added_status": status, "added_source": source,
                 "snapshot": {
                     "score": r.get('Score', 0), "ma20": r.get('MA20', 0.0),
                     "platform_high": r.get('PlatformHigh', 0.0),
@@ -1329,9 +1341,56 @@ def band_memory_record(mem, rows, source):
             added.append(code)
             _band_memory_apply(node, r, event=f"入选记忆（{source}）")
         else:
+            if status not in BAND_AUTO_MEMO_STATUSES:
+                continue
             # 已记住的：后续扫描发现状态变化（例如 启动确认 → 跌破支撑）也要记下来
             _band_memory_apply(node, r, event=f"扫描刷新（{source}）")
     return added
+
+def band_memory_purge(mem, mode="never_started"):
+    """清理记忆，返回 (mem, 删除数量)。
+
+    mode="never_started"：只删「入选时不是波段启动确认」的条目 —— 也就是旧规则下
+        由「跌破支撑 / 顶背离预警」误建的那些。**带备注的条目一律保留**，
+        因为写了备注说明你是主动关注它的，不能当噪音清掉。
+    mode="all"：全清（调用方须自行做二次确认）。
+    """
+    stocks = mem.get('stocks')
+    if not isinstance(stocks, dict):
+        return mem, 0
+    removed = 0
+    for code in list(stocks.keys()):
+        node = stocks.get(code)
+        if not isinstance(node, dict):
+            stocks.pop(code, None)
+            removed += 1
+            continue
+        if mode == "all":
+            stocks.pop(code, None)
+            removed += 1
+            continue
+        if node.get('added_status') in BAND_ENTRY_STATUSES:
+            continue                       # 正常入册（启动确认）的保留
+        if str(node.get('note') or '').strip():
+            continue                       # 你写过备注的保留
+        stocks.pop(code, None)
+        removed += 1
+    return mem, removed
+
+def band_memory_purge_stats(mem):
+    """清理前的预估：返回 (将被删除的条数, 带备注会被保留的条数)。"""
+    junk = noted = 0
+    for node in (mem.get('stocks') or {}).values():
+        if not isinstance(node, dict):
+            junk += 1
+            continue
+        if node.get('added_status') in BAND_ENTRY_STATUSES:
+            continue
+        if str(node.get('note') or '').strip():
+            noted += 1
+        else:
+            junk += 1
+    return junk, noted
 
 def band_memory_refresh(mem, codes=None):
     """重新拉取记忆内股票的当前波段状态（并发）。返回 (mem, changes)。
@@ -1756,8 +1815,8 @@ def band_memory_ui():
     """波段记忆面板：记住选过的票、跟踪状态变化、并同步到云端巡检。"""
     st.markdown("---")
     st.header("🧠 波段记忆")
-    st.caption("扫描到「波段启动确认 / 顶背离预警 / 跌破支撑」会自动记在这里；"
-               "记录入选时间、入选价和之后每一次状态变化。")
+    st.caption("扫描到**波段启动确认**才会自动记在这里（结束预警只更新已在册的股票，"
+               "不会新建条目）；记录入选时间、入选价和之后每一次状态变化。")
     st.caption("🔒 备注与入选价**只存在本地容器**；同步到仓库的只是「代码 + 状态」摘要"
                "（你的仓库是公开的，所以隐私字段一律不上传）。")
 
@@ -1858,6 +1917,52 @@ def band_memory_ui():
     if st.session_state.get('band_memory_sync_msg'):
         st.caption(f"☁️ {st.session_state.band_memory_sync_msg}")
 
+    # ---- 清理（2026-09-19 新增）----
+    # 修复「全市场扫描把几百只预警灌进记忆」之后，必须给用户一个清掉存量的口子，
+    # 否则 460 条只能一只一只点删除。
+    _junk, _noted = band_memory_purge_stats(mem)
+    with st.expander(f"🧹 清理记忆（{_junk} 只可清理）", expanded=False):
+        st.markdown(f"""
+        2026-09-19 之前的版本允许用「跌破支撑 / 顶背离预警」**新建**记忆条目，
+        全市场扫描一次就会把几百只跌破 20 日线的股票灌进来。现在规则已改为
+        **只有「波段启动确认」能入册**，这里用来清理已经堆下来的存量。
+
+        - 可清理：**{_junk}** 只（入选时不是「波段启动确认」，且你没写过备注）
+        - 会保留：**{_noted}** 只（你写过备注，说明是主动关注的）
+        - 正常入册的（启动确认）一律不动
+        """)
+        _pend = st.session_state.get('bandmem_purge_pending')
+        if _pend == 'junk':
+            st.warning(f"确认删除这 {_junk} 只？不可恢复，建议先点上方「📥 下载备份」留底。")
+        elif _pend == 'all':
+            st.error("确认**清空全部记忆**？所有备注与轨迹都会一起删除，不可恢复。")
+        if _pend:
+            _k1, _k2 = st.columns(2)
+            if _k1.button("✅ 确认", key="bandmem_purge_ok", use_container_width=True):
+                _mode = 'all' if _pend == 'all' else 'never_started'
+                _mem2, _n = band_memory_purge(mem, _mode)
+                save_band_memory(_mem2)
+                _pmsg = ""
+                if _github_token():
+                    # merge_remote=False：不能用远端摘要反向合并，否则刚清掉的条目会被拉回来
+                    _, _pmsg = band_memory_push_github(_mem2, merge_remote=False)
+                st.session_state['bandmem_purge_pending'] = None
+                st.session_state.band_memory_sync_msg = (
+                    f"已清理 {_n} 条{('；' + _pmsg) if _pmsg else ''}")
+                st.rerun()
+            if _k2.button("✖️ 取消", key="bandmem_purge_cancel", use_container_width=True):
+                st.session_state['bandmem_purge_pending'] = None
+                st.rerun()
+        else:
+            _b1, _b2 = st.columns(2)
+            if _b1.button(f"🧹 清理这 {_junk} 只", key="bandmem_purge_junk",
+                          use_container_width=True, disabled=(_junk == 0)):
+                st.session_state['bandmem_purge_pending'] = 'junk'
+                st.rerun()
+            if _b2.button("🗑️ 清空全部记忆", key="bandmem_purge_all", use_container_width=True):
+                st.session_state['bandmem_purge_pending'] = 'all'
+                st.rerun()
+
     with st.expander("📤 从备份恢复 / 手动记入代码", expanded=False):
         up = st.file_uploader("上传之前下载的 band_memory.json（会与当前记录合并）",
                               type=["json"], key="bandmem_upload")
@@ -1873,7 +1978,7 @@ def band_memory_ui():
             except Exception as e:
                 _log("band_memory_ui/upload", e)
                 st.error(f"解析失败：{e}")
-        st.caption("—— 手动记入（自动入册只收「启动确认 / 结束预警」，其他状态想跟踪就手动加）——")
+        st.caption("—— 手动记入（自动入册只收「波段启动确认」，其他状态想跟踪就手动加）——")
         with st.form("bandmem_manual_form", clear_on_submit=True):
             manual = st.text_input("股票代码（多个用空格/逗号分隔）", placeholder="例如: 600176,000001")
             if st.form_submit_button("➕ 记入并分析", use_container_width=True) and manual.strip():
@@ -2122,7 +2227,8 @@ def ai_band_picker_ui():
             with st.spinner("正在拉取行情并分析波段状态..."):
                 st.session_state.scan_results = screen_band_stocks(custom_codes=custom_codes)
                 st.session_state.scan_time = now_cn_str('%Y-%m-%d %H:%M:%S')
-                # 自动入册：本次扫描中「波段启动确认 / 顶背离预警 / 跌破支撑」的股票写进记忆，
+                # 自动入册：本次扫描中「波段启动确认」的股票写进记忆（预警状态只更新已有条目，
+                # 不新建 —— 否则全市场扫描会把几百只跌破 20 日线的股票一次性灌进来），
                 # 这样你关掉页面之后再回来，仍然知道当初是哪些票、后来变成了什么状态。
                 _mem = load_band_memory()
                 _added = band_memory_record(_mem, st.session_state.get('band_last_raw'), scan_scope)
