@@ -429,14 +429,93 @@ def check_band_end(sym, log, today):
     return False
 
 
+# ============ 波段摘要加密（与 ai_stock_terminal.py 同一套规则）============
+# 本仓库是 public：脱敏摘要虽不含备注/入选价，但仍含股票代码清单。若在两端 Secrets
+# 配了同名的 BAND_KEY，摘要文件会整段加密后再提交，连代码清单也看不到。
+# 为什么不改 Private：public 仓库的 Actions 免费不限量，private 只有 2000 分钟/月，
+# 而本项目的巡检 + 保活约需 7800 分钟/月，额度烧穿后 GitHub 会静默停掉定时任务。
+# ⚠️ 下面 crypto 三个函数必须与 ai_stock_terminal.py 里的同名函数行为保持一致。
+
+_ENC_FIELD = "enc"
+_ENC_VERSION = 1
+
+def band_crypto_key():
+    """读加密密钥。巡检侧只认环境变量（由 workflow 从 Secrets 注入 BAND_KEY）。"""
+    v = os.environ.get("BAND_KEY", "")
+    return str(v).strip() if v and str(v).strip() else ""
+
+def band_crypto_enabled():
+    """是否已配置加密密钥。"""
+    return bool(band_crypto_key())
+
+def _fernet():
+    """构造 Fernet 实例。未配密钥返回 None；配了但不可用则**抛异常**。
+
+    刻意不吞异常：配了 BAND_KEY 却因缺依赖/格式错而悄悄退回明文，
+    等于把代码清单原样公开，而这种泄露不会有任何提示。"""
+    key = band_crypto_key()
+    if not key:
+        return None
+    try:
+        from cryptography.fernet import Fernet
+    except Exception as e:
+        raise RuntimeError(f"已配置 BAND_KEY 但缺少 cryptography 依赖：{e}") from e
+    try:
+        return Fernet(key.encode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"BAND_KEY 不是合法的 Fernet 密钥（应为 44 字符 base64）：{e}") from e
+
+def band_encrypt_obj(obj):
+    """未配密钥 → 原样返回（明文）；配了但加密失败 → 抛异常，由调用方中止写入。"""
+    f = _fernet()
+    if f is None:
+        return obj
+    raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    return {"v": _ENC_VERSION, _ENC_FIELD: f.encrypt(raw).decode("ascii")}
+
+def band_decrypt_obj(data):
+    """还原摘要对象，返回 (ok, obj 或 None, err)。明文原样返回，兼容历史文件。"""
+    if not isinstance(data, dict):
+        return False, None, "文件内容不是 JSON 对象"
+    token = data.get(_ENC_FIELD)
+    if not token:
+        return True, data, ""
+    try:
+        f = _fernet()
+    except Exception as e:
+        return False, None, str(e)[:160]
+    if f is None:
+        return False, None, "文件是加密的，但本端没有配置 BAND_KEY"
+    try:
+        obj = json.loads(f.decrypt(str(token).encode("ascii")).decode("utf-8"))
+    except Exception as e:
+        return False, None, f"解密失败（两端 BAND_KEY 是否一致？）：{type(e).__name__}"
+    if not isinstance(obj, dict):
+        return False, None, "解密后的内容不是 JSON 对象"
+    return True, obj, ""
+
 # ============ 波段记忆（读网页端同步来的脱敏摘要 band_watch.json）============
 
 def load_band_memory():
-    """读仓库里的波段摘要（由网页端同步过来）。缺失/损坏都退化为空摘要。"""
+    """读仓库里的波段摘要（由网页端同步过来）。缺失/损坏都退化为空摘要。
+
+    若文件是密文而本端没有 BAND_KEY，会打印醒目横幅并返回空 —— 此时波段监控实际不可用，
+    必须让它在 Actions 日志里一眼可见，而不是安静地什么都不推。"""
     try:
         if os.path.exists(BAND_MEMORY_FILE):
             with open(BAND_MEMORY_FILE, 'r', encoding='utf-8') as f:
-                mem = json.load(f)
+                payload = json.load(f)
+            ok, mem, err = band_decrypt_obj(payload)
+            if not ok:
+                print("=" * 70, file=sys.stderr)
+                print(f"[watcher] ⚠️ 波段摘要读取失败：{err}", file=sys.stderr)
+                print(f"[watcher]    → 本次无法按「波段记忆」清单监控（文件 {BAND_MEMORY_FILE}）",
+                      file=sys.stderr)
+                print("[watcher]    → 请确认 GitHub Secrets 有 BAND_KEY，且与网页端 Secrets 一致",
+                      file=sys.stderr)
+                print("=" * 70, file=sys.stderr)
+                _log("load_band_memory:decrypt", ValueError(err))
+                return {"version": 1, "stocks": {}}
             if isinstance(mem, dict) and isinstance(mem.get("stocks"), dict):
                 return mem
             _log("load_band_memory", ValueError(f"{BAND_MEMORY_FILE} 结构异常，已忽略"))
@@ -448,7 +527,8 @@ def load_band_memory():
 def save_band_memory(mem):
     """把状态变化回写到摘要文件（workflow 会检测到 diff 后提交回仓库）。
 
-    只写巡检需要的字段，绝不引入备注/入选价 —— 这个文件会进 public 仓库。"""
+    只写巡检需要的字段，绝不引入备注/入选价 —— 这个文件会进 public 仓库。
+    配置了 BAND_KEY 时会整段加密后再落盘。"""
     try:
         mem["updated_at"] = now_cn().strftime('%Y-%m-%d %H:%M:%S')
         clean = {"version": mem.get("version", 1), "updated_at": mem["updated_at"], "stocks": {}}
@@ -471,10 +551,12 @@ def save_band_memory(mem):
                 "alerts": dict(node.get("alerts") or {}),
                 "history": hist,
             }
+        out = band_encrypt_obj(clean)
         with open(BAND_MEMORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(clean, f, ensure_ascii=False, indent=2)
+            json.dump(out, f, ensure_ascii=False, indent=2)
         return True
     except Exception as e:
+        print(f"[watcher] ⚠️ 波段摘要写入失败（本次状态变化不会被提交）：{e}", file=sys.stderr)
         _log("save_band_memory", e)
         return False
 
@@ -684,6 +766,7 @@ def main():
     print(f"===== 巡检开始 北京时间 {now_cn().strftime('%Y-%m-%d %H:%M:%S')} =====")
     print(f"🔧 配置检查：SEND_KEY={'已配置' if SEND_KEY else '缺失'} | "
           f"WATCHLIST={len(WATCHLIST)} 只 | BAND_WATCHLIST={len(BAND_WATCHLIST)} 只 | 新鲜窗口={WINDOW_MIN} 分钟")
+    print(f"🔒 摘要加密：{'已开启（仓库里是密文）' if band_crypto_enabled() else '未开启（仓库里可读出代码清单）'}")
     if not SEND_KEY:
         print("✗ 未配置 SERVERCHAN_KEY。请到 GitHub 仓库 → Settings → Secrets and variables → "
               "Actions → New repository secret 添加 SERVERCHAN_KEY 后重试。")
