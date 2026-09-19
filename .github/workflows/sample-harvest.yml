@@ -26,6 +26,11 @@ on:
         required: false
         default: "450"
         type: string
+      limit:
+        description: "冒烟测试用：只处理前 N 只（留空=全市场，正式采集必须留空）"
+        required: false
+        default: ""
+        type: string
   schedule:
     # 北京 15:40 = UTC 07:40，收盘后半小时（周一至周五）
     # 未配置 BAND_KEY 时这一步会自动跳过（不会报红），配好即自动开始积累。
@@ -82,11 +87,16 @@ jobs:
           fi
           MODE="${{ github.event.inputs.mode || 'forward' }}"
           LOOKBACK="${{ github.event.inputs.lookback || '450' }}"
-          echo "===== 模式：$MODE ｜ 回看：$LOOKBACK ====="
+          # 冒烟测试用：留空则全市场（正式采集都是留空）
+          LIMIT_ARG=""
+          if [ -n "${{ github.event.inputs.limit }}" ]; then
+            LIMIT_ARG="--limit ${{ github.event.inputs.limit }}"
+          fi
+          echo "===== 模式：$MODE ｜ 回看：$LOOKBACK ｜ 限量：${LIMIT_ARG:-全市场} ====="
           if [ "$MODE" = "forward" ]; then
-            python sample_harvest.py --forward --store enc --file band_samples.enc
+            python sample_harvest.py --forward --store enc --file band_samples.enc $LIMIT_ARG
           elif [ "$MODE" = "backfill" ]; then
-            python sample_harvest.py --backfill "$LOOKBACK" --store enc --file band_samples.enc
+            python sample_harvest.py --backfill "$LOOKBACK" --store enc --file band_samples.enc $LIMIT_ARG
           elif [ "$MODE" = "merge" ]; then
             python sample_harvest.py --merge --store enc --file band_samples.enc
           else
