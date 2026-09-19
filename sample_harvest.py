@@ -66,15 +66,23 @@ NET_FUNCS = {
     "_safe_float", "_safe_float_or_none", "_is_st_or_risk", "_diff_to_list",
     "fetch_market_page", "_normalize_kline_rows", "_fetch_kline_qq", "_fetch_kline_sina",
     "_get_daily_history", "_load_json",
+    # ★ `_http_get_json/_http_get_text` 内部会调 `_http_session()`；不抽它出来，
+    #   这两个函数在**本文件（Actions 夜跑）**里每次请求都会 NameError，
+    #   被 `_http_session` 的兜底吞掉 → 连接复用静默失效 + 每次请求刷一行 stderr。
+    #   表现为"采集慢且日志刷屏"，极难定位。新增网络内部依赖时务必同步加这里。
+    "_http_session",
 }
 NET_CONSTS = {"_REQUEST_HEADERS", "_EM_HOSTS", "_HTTP_HEADERS", "_QQ_APP_HOSTS",
-              "KLINE_CACHE_FILE", "BASE_DIR", "CONFIG_FILE", "_ENC_FIELD", "_ENC_VERSION"}
+              "KLINE_CACHE_FILE", "BASE_DIR", "CONFIG_FILE", "_ENC_FIELD", "_ENC_VERSION",
+              "_TLS_LOCAL"}
 METRIC_FUNCS = {"_calculate_band_metrics", "_band_score", "_band_status", "_band_evaluate"}
 
 SAMPLE_FUNCS = {
     "_sample_key", "_sample_hash_hit", "_sample_tier", "_sample_prefilter", "_sample_tradable",
     "_sample_bench_asof", "_sample_change_pct", "_sample_meta_add", "_sample_pending_outcome",
     "band_evaluate_asof", "band_sample_build", "_sample_fetch_kline", "band_samples_harvest",
+    # 并发改造后，单只股票的处理拆到了这个函数里
+    "_sample_harvest_one",
     "band_samples_harvest_forward", "load_band_samples", "save_band_samples",
     "band_samples_merge", "band_samples_range", "band_sample_summary", "band_sample_lift",
     "_sample_usable", "band_samples_pending_keys", "band_samples_refresh_pending",
@@ -90,6 +98,7 @@ SAMPLE_CONSTS = {
     "SAMPLE_FILE", "SAMPLE_CTRL_EVERY", "SAMPLE_MAX_ROWS", "SAMPLE_MIN_BARS",
     "SAMPLE_MIN_AMOUNT_YI", "SAMPLE_MIN_PRICE", "SAMPLE_EVENT_DEDUP", "SAMPLE_VOL_UNIT",
     "SAMPLE_SOURCES", "SAMPLE_SOURCE_LABEL", "SAMPLE_TIER_LABEL", "SAMPLE_MAX_STALE_DAYS",
+    "SAMPLE_FETCH_WORKERS",
 }
 REVIEW_CONSTS = {
     "REVIEW_RULE_VERSION", "REVIEW_BENCH_SYMBOL", "REVIEW_TP_PCT", "REVIEW_MAX_HOLD_DAYS",
@@ -136,6 +145,7 @@ def load_app_namespace(app_path=APP_PATH, base_dir=None):
         "st": st_stub, "pd": pd, "np": np, "requests": requests,
         "re": __import__("re"), "os": os, "json": json, "sys": sys,
         "base64": base64, "math": __import__("math"),
+        "threading": __import__("threading"),      # _http_session 的线程本地 Session 要用
         "traceback": __import__("traceback"), "time": __import__("time"),
         "_time_module": __import__("time"), "datetime": __import__("datetime"),
         "ThreadPoolExecutor": ThreadPoolExecutor, "as_completed": as_completed,
@@ -144,6 +154,11 @@ def load_app_namespace(app_path=APP_PATH, base_dir=None):
         "KLINE_CACHE_FILE": os.path.join(here, "kline_cache.json"),
         "BAND_MEMORY_FILE": os.path.join(here, "band_memory.json"),
         "BAND_BATCHES_FILE": os.path.join(here, "band_batches.json"),
+        # ★ 兜底预置：`_TLS_LOCAL` 是 `_http_session` 的线程本地连接池。
+        #   正常路径下由 NET_CONSTS 抽取真实定义覆盖；这里再给一份，
+        #   是为了在**抽取失败**（改名 / 改成 `x: T = ...` 注解式赋值，ast.Assign 抓不到）时
+        #   仍能工作，而不是退化成"每次请求 NameError + 刷日志"。
+        "_TLS_LOCAL": __import__("threading").local(),
         "now_cn": _cn_now,
         "now_cn_str": lambda fmt='%Y-%m-%d %H:%M:%S': _cn_now().strftime(fmt),
     }
