@@ -99,6 +99,10 @@ BAND_MANUAL_FILE = os.path.join(BASE_DIR, "band_manual_list.json")
 # ⚠️ 本文件含隐私（手写备注、入选价），**只留在本地容器，禁止提交**（已加入 .gitignore）。
 #    巡检需要的脱敏摘要另存为仓库里的 band_watch.json，见 _band_memory_digest()。
 BAND_MEMORY_FILE = os.path.join(BASE_DIR, "band_memory.json")
+# 策略复盘的批次档案（哪一批选了哪些票、每笔结案结果与归因）。
+# ⚠️ 同 band_memory.json 一样含隐私（批次名单、收益率、胜率），**只留本地，禁止提交**。
+#    刻意不进 band_watch.json 的脱敏摘要：收益率曲线属于交易绩效，公开了等于公开持仓表现。
+BAND_BATCHES_FILE = os.path.join(BASE_DIR, "band_batches.json")
 
 def _load_json(path, default):
     try:
@@ -1236,6 +1240,35 @@ BAND_STATUS_LEVEL = {'波段未形成': 0, '波段进行中': 1, '波段启动�
                      '跌破支撑': 3, '顶背离预警': 4}
 BAND_MEMORY_HISTORY_MAX = 40    # 每只股票最多保留的轨迹条数，防止文件无限膨胀
 
+# ============ 策略复盘规则（2026-09-19 新增）============
+# 目的：让「选了 → 跟踪 → 结案 → 归因」变成可统计的闭环，而不是凭印象复盘。
+#
+# ★ 三条不可动摇的原则（改这里之前务必读完）：
+#  1. **判定规则必须冻结**：一本账只有一套规则，规则一改就必须升 REVIEW_RULE_VERSION，
+#     且老批次永远按它入册时的版本判定。否则等于用今天的尺子去量昨天的成绩，历史不可比。
+#  2. **绝不用 LLM 判成败**：成败必须由下面这些确定性阈值算出来，可复现、可审计。
+#     让模型「读一读这笔为什么失败」得到的是叙事，不是可验证的结论，而且无法证伪。
+#  3. **结案判定只用日线回溯，不看巡检频率**：同一笔在任何时候、任何机器上重算，
+#     结果必须完全一致。所以结案点由日线序列里的第一个触发日决定，与是否开着网页无关。
+REVIEW_RULE_VERSION = "r1"       # 判定规则版本号；改阈值/改结案条件必须同步升版
+REVIEW_BENCH_SYMBOL = "sh000300"  # 基准：沪深300（统一走数据层的腾讯源，已验证可用）
+REVIEW_TP_PCT = 15.0              # 止盈结案线：浮盈达到 +15% 即结案
+REVIEW_MAX_HOLD_DAYS = 40         # 时间结案：入场后 40 个交易日仍无触发则按当日收盘结案
+REVIEW_MFE_GOOD = 8.0             # 「给过机会」判据：最大浮盈曾 >= 8%
+REVIEW_MIN_SAMPLE = 20            # 分桶样本量下限；低于此只显示「样本不足」，不许下结论
+CLOSE_REASON_LABEL = {
+    'take_profit': '止盈结案', 'stop': '跌破20日线结案',
+    'timeout': '时间结案', 'pending': '跟踪中',
+}
+# 四分类：只有 lose_logic（入场逻辑本身错）才是「该改选股逻辑」的信号；
+# lose_exec 是卖点问题，改选股逻辑只会把对的信号改坏。
+VERDICT_LABEL = {
+    'win': '成功（绝对盈利且跑赢基准）',
+    'lose_rel': '跑输（赚了但没跑赢基准，属搭便车）',
+    'lose_exec': '逻辑对、执行错（曾有大浮盈但没守住）',
+    'lose_logic': '入场逻辑错（从未给过机会）',
+}
+
 GITHUB_REPO = "lipeixinOVO/stock-t-terminal"
 # 提交到仓库的是「脱敏摘要」；完整记忆（含备注/入选价）只留在本地容器。
 # ⚠️ 本仓库是 public，所以两个文件职责必须严格区分，不要把 band_memory.json 提交上去。
@@ -1303,7 +1336,7 @@ def _band_alert_decision(old_status, new_status):
     return None
 
 
-def band_memory_record(mem, rows, source):
+def band_memory_record(mem, rows, source, batch_id=None, bench_above=None):
     """把本次扫描结果中「值得跟踪」的股票写入记忆。返回新增代码列表。
 
     ★ 入册规则（2026-09-19 修正）：
@@ -1313,6 +1346,9 @@ def band_memory_record(mem, rows, source):
     为什么必须这样分：结束预警的意思是「你在盯的那只波段要结束了」，前提是它曾经启动过。
     全市场扫描时处于「跌破 20 日线」的股票动辄几百只（实测 600 只深度分析里 458 只），
     旧规则把它们全部入册 —— 记忆瞬间堆到 460 只、其中 458 只是预警，完全没法用。
+
+    batch_id / bench_above 供「策略复盘」使用：批次用于把同一期选的票归到一组，
+    bench_above 记录入场时的大盘环境（归因要用）。两者都不参与入册判定。
     """
     added = []
     for r in (rows or []):
@@ -1328,8 +1364,11 @@ def band_memory_record(mem, rows, source):
                 "code": code, "name": r.get('Name') or code,
                 "added_at": now_cn_str(), "added_price": float(r.get('Price') or 0.0),
                 "added_status": status, "added_source": source,
+                "batch_id": batch_id or "",
+                "entry_context": _band_entry_context(r, bench_above),
                 "snapshot": {
                     "score": r.get('Score', 0), "ma20": r.get('MA20', 0.0),
+                    "ma60": r.get('MA60', 0.0),
                     "platform_high": r.get('PlatformHigh', 0.0),
                     "vol_ratio": r.get('VolRatio', 0.0),
                     "position250": r.get('Position250', 0.0),
@@ -1391,6 +1430,360 @@ def band_memory_purge_stats(mem):
         else:
             junk += 1
     return junk, noted
+
+# ============ 策略复盘：批次 / 结案 / 归因（P0，只统计不改参数）============
+# 读这一节之前先看上面 REVIEW_* 常量的三条原则。
+#
+# 这一阶段的产出是「可归因的样本库 + 诚实的统计看板」，**不含任何自动调参**。
+# 为什么不直接上自动优化：每周 10 只，一年约 500 笔，但真正走到结案的只有一部分，
+# 而要判断「量比门槛 1.2 还是 1.5 更好」同一分桶至少需要几十笔样本 —— 头两三个月
+# 任何参数调整都只是噪音拟合。先攒样本，攒够了再谈优化。
+
+def _batches_empty():
+    return {"version": 1, "updated_at": now_cn_str(), "batches": {}}
+
+def load_band_batches():
+    """读批次档案；结构异常时重置而不是抛异常（与 load_band_memory 同策略）。"""
+    b = _load_json(BAND_BATCHES_FILE, _batches_empty())
+    if not isinstance(b, dict) or not isinstance(b.get("batches"), dict):
+        _log("load_band_batches", ValueError("band_batches.json 结构异常，已重置"))
+        return _batches_empty()
+    b.setdefault("version", 1)
+    b.setdefault("batches", {})
+    return b
+
+def save_band_batches(batches):
+    batches["updated_at"] = now_cn_str()
+    batches["version"] = 1
+    _save_json(BAND_BATCHES_FILE, batches)
+
+def band_batch_create(batches, codes, source, note='', rule_version=REVIEW_RULE_VERSION):
+    """把「这一次选出来的这批票」记成一个批次。返回 batch_id。
+
+    批次的意义：复盘时必须能回答「这一批（同一时刻、同一套规则下选出来的）成绩如何」。
+    逐只散着记，事后就分不清哪些是同一期选的，也就无法归因。
+    """
+    codes = [str(c).strip() for c in (codes or []) if str(c).strip()]
+    today = now_cn().strftime('%Y-%m-%d')
+    n = 1
+    while f"{today}-{n:02d}" in (batches.get('batches') or {}):
+        n += 1
+    batch_id = f"{today}-{n:02d}"
+    batches.setdefault('batches', {})[batch_id] = {
+        "batch_id": batch_id, "created_at": now_cn_str(), "source": source or "",
+        "note": note or "", "rule_version": rule_version,
+        "codes": codes, "count": len(codes),
+    }
+    return batch_id
+
+_BENCH_CACHE = {}
+
+def _get_index_history(full_symbol, limit=300):
+    """指数日线。**必须传完整符号**（如 sh000300）——指数不能走 _quote_prefix，
+    因为 000300 会被判成 sz000300（那是个不存在的股票代码）。仍复用统一取数层。"""
+    for fn in (_fetch_kline_qq, _fetch_kline_sina):
+        try:
+            df, _src, _errs = fn(full_symbol, limit=limit)
+            if df is not None and len(df) >= 60:
+                return df
+        except Exception as e:
+            _log(f"_get_index_history/{full_symbol}", e)
+            continue
+    return None
+
+def _bench_history(force=False):
+    """基准（沪深300）日线，按自然日缓存，同一天内多处调用只取一次。
+    取数失败**不写缓存**，否则一次网络抖动会让当天所有复盘都拿不到基准。"""
+    key = now_cn().strftime('%Y-%m-%d')
+    if not force and _BENCH_CACHE.get('key') == key and _BENCH_CACHE.get('df') is not None:
+        return _BENCH_CACHE['df']
+    df = _get_index_history(REVIEW_BENCH_SYMBOL)
+    if df is not None:
+        _BENCH_CACHE['key'] = key
+        _BENCH_CACHE['df'] = df
+    return df
+
+def _bench_above_ma20(bench_df):
+    """入场时的大盘环境：沪深300 收盘是否在 20 日线上。取不到返回 None（不猜）。"""
+    try:
+        if bench_df is None or len(bench_df) < 25:
+            return None
+        close = bench_df['Close'].astype(float)
+        ma20 = float(close.rolling(20).mean().iloc[-1])
+        cur = float(close.iloc[-1])
+        if ma20 != ma20 or ma20 <= 0 or cur <= 0:
+            return None
+        return bool(cur > ma20)
+    except Exception as e:
+        _log("_bench_above_ma20", e)
+        return None
+
+def _band_entry_context(r, bench_above=None):
+    """入场那一刻的可量化条件。**这是整个归因的地基**：
+    没有入场快照，事后只能说「它跌了」；有了它才能问「在什么条件下这套逻辑失效」。"""
+    try:
+        px = float(r.get('Price') or 0.0)
+        ma20 = float(r.get('MA20') or 0.0)
+        ma60 = float(r.get('MA60') or 0.0)
+    except Exception as e:
+        _log("_band_entry_context", e)
+        px = ma20 = ma60 = 0.0
+    return {
+        "entry_score": float(r.get('Score') or 0.0),
+        "position250": float(r.get('Position250') or 0.0),
+        "vol_ratio": float(r.get('VolRatio') or 0.0),
+        "breakout": bool(r.get('Breakout')),
+        "above_ma60": (px > ma60) if (px > 0 and ma60 > 0) else None,
+        "ma_bull": (px > ma20 > ma60) if (px > 0 and ma20 > 0 and ma60 > 0) else None,
+        "ma20": ma20, "ma60": ma60,
+        "bench_above_ma20": bench_above,
+        "rule_version": REVIEW_RULE_VERSION,
+    }
+
+def band_outcome_compute(entry_date, entry_price, df, bench_df=None):
+    """用日线回溯确定结案点，并算出复盘指标。**纯函数，不碰网络，可复现**。
+
+    结案条件（按日线逐日检查，取第一个触发日）：
+      ① 浮盈 >= REVIEW_TP_PCT        → 'take_profit'
+      ② 收盘跌破 MA20                 → 'stop'
+      ③ 持有满 REVIEW_MAX_HOLD_DAYS   → 'timeout'
+    入场日算第 0 天、不参与判定（当天买当天卖不算一笔波段）。
+
+    ★ 为什么不按巡检快照判：快照取决于你有没有开着网页、网络通不通。
+      用日线回溯则任何时间、任何机器重算都得到同一个结果 —— 这是统计可信的前提。
+
+    返回 dict；数据不足返回 None。
+    """
+    try:
+        if df is None or len(df) < 25 or not entry_date:
+            return None
+        d0 = str(entry_date)[:10]
+        dates = df['Date'].astype(str).str.slice(0, 10).tolist()
+        closes = [float(x) for x in df['Close'].tolist()]
+        highs = [float(x) for x in df['High'].tolist()]
+        lows = [float(x) for x in df['Low'].tolist()]
+        ma20_full = [float(x) for x in df['Close'].astype(float).rolling(20).mean().tolist()]
+        n = len(dates)
+
+        # 入场日 = 最后一根「日期 <= 入场日」的K线。周末/节假日入场时它会落到前一个交易日，
+        # 而入选价本来就是那个收盘价（手动记入在非交易日拿到的就是最近收盘）。
+        i0 = None
+        for i in range(n):
+            if dates[i] <= d0:
+                i0 = i
+        if i0 is None or i0 >= n - 1:
+            return None                    # 入场之后还没有新的交易日
+
+        px = float(entry_price or 0.0)
+        if px <= 0:
+            px = closes[i0]
+        if px <= 0:
+            return None
+
+        # ★ MFE / MAE 口径（别乱改，页面指标与归因都依赖它）：
+        #   MFE = 最大浮盈，初值 0 → 全程没涨过就是 0%（不用负数），用于判「给没给过机会」。
+        #   MAE = 最大浮亏，初值 0 → 全程没跌破入场价就是 0%，有下探才是负数。
+        #   两者都只统计入场日之后的K线（入场日算第 0 天，不参与）。
+        #   合起来才能把「入场逻辑错」和「卖点执行错」分开：
+        #   MFE 够大却亏 → 逻辑没错，是卖的问题；MFE 一直贴地 → 才是选股逻辑的问题。
+        mfe = 0.0
+        mae = 0.0
+        close_reason = None
+        close_i = None
+        for j in range(i0 + 1, n):
+            if highs[j] / px - 1 > mfe:
+                mfe = highs[j] / px - 1
+            if lows[j] / px - 1 < mae:
+                mae = lows[j] / px - 1
+            if closes[j] / px - 1 >= REVIEW_TP_PCT / 100.0:
+                close_reason, close_i = 'take_profit', j
+                break
+            m = ma20_full[j]
+            if m == m and m > 0 and closes[j] < m:
+                close_reason, close_i = 'stop', j
+                break
+            if (j - i0) >= REVIEW_MAX_HOLD_DAYS:
+                close_reason, close_i = 'timeout', j
+                break
+
+        closed = close_i is not None
+        if not closed:
+            close_i = n - 1                # 跟踪中：先按最新一根给浮动指标
+        close_price = closes[close_i]
+        ret = close_price / px - 1.0
+        days_held = close_i - i0
+
+        # 基准：与个股使用同一对日期（入场日、结案日各取「最后一根 <= 该日」的基准K线）
+        bench_ret = None
+        try:
+            if bench_df is not None and len(bench_df) >= 20:
+                bd = bench_df['Date'].astype(str).str.slice(0, 10).tolist()
+                bc = [float(x) for x in bench_df['Close'].tolist()]
+                bi0 = bi1 = None
+                for i in range(len(bd)):
+                    if bd[i] <= dates[i0]:
+                        bi0 = i
+                    if bd[i] <= dates[close_i]:
+                        bi1 = i
+                if bi0 is not None and bi1 is not None and bi1 > bi0 and bc[bi0] > 0:
+                    bench_ret = bc[bi1] / bc[bi0] - 1.0
+        except Exception as e:
+            _log("band_outcome_compute/bench", e)
+
+        excess = (ret - bench_ret) if bench_ret is not None else None
+
+        if not closed:
+            verdict = 'pending'
+        elif excess is not None:
+            if ret > 0 and excess > 0:
+                verdict = 'win'
+            elif ret > 0:
+                verdict = 'lose_rel'                       # 赚了但跑输 → 搭便车
+            elif mfe * 100 >= REVIEW_MFE_GOOD:
+                verdict = 'lose_exec'                      # 给过机会没走 → 卖点问题
+            else:
+                verdict = 'lose_logic'                     # 从未给过机会 → 入场逻辑问题
+        else:
+            # 基准拿不到时只能按绝对收益粗判，并显式标记（缺少「搭便车」这一档）
+            verdict = 'win' if ret > 0 else (
+                'lose_exec' if mfe * 100 >= REVIEW_MFE_GOOD else 'lose_logic')
+
+        return {
+            "closed": bool(closed),
+            "close_reason": close_reason or 'pending',
+            "close_at": dates[close_i] if closed else "",
+            "close_price": round(close_price, 3),
+            "days_held": int(days_held),
+            "ret_pct": round(ret * 100, 2),
+            "bench_ret_pct": round(bench_ret * 100, 2) if bench_ret is not None else None,
+            "excess_pct": round(excess * 100, 2) if excess is not None else None,
+            "mfe_pct": round(mfe * 100, 2),
+            "mae_pct": round(mae * 100, 2),
+            "verdict": verdict,
+            "rule_version": REVIEW_RULE_VERSION,
+            "computed_at": now_cn_str(),
+        }
+    except Exception as e:
+        _log("band_outcome_compute", e)
+        return None
+
+def band_review_refresh(mem, max_items=80, force=False):
+    """给记忆里的股票补算结案结果（并写回 node['outcome']）。返回 (mem, 更新只数)。
+
+    只重算「跟踪中」的条目；已结案的默认跳过（结果不会再变），除非 force=True。
+    上限 max_items 防止记忆里有几百只时把页面卡住。
+    """
+    stocks = (mem or {}).get('stocks') or {}
+    if not isinstance(stocks, dict):
+        return mem, 0
+    bench_df = _bench_history()
+    updated = 0
+    for code, node in stocks.items():
+        if updated >= max_items:
+            break
+        if not isinstance(node, dict):
+            continue
+        if node.get('closed'):
+            continue
+        prev = node.get('outcome') or {}
+        if prev.get('closed') and not force:
+            continue
+        try:
+            df = _get_daily_history(code)
+            out = band_outcome_compute(node.get('added_at'), node.get('added_price'), df, bench_df)
+            if out is None:
+                continue
+            node['outcome'] = out
+            updated += 1
+        except Exception as e:
+            _log(f"band_review_refresh/{code}", e)
+            continue
+    if updated:
+        mem['review_updated_at'] = now_cn_str()
+    return mem, updated
+
+def _bucket_defs():
+    """归因维度：全部取自「入场时就已知」的条件，绝不用事后才知道的信息分桶。"""
+    return [
+        ("大盘环境", lambda c: {True: "沪深300在20日线上", False: "沪深300在20日线下"}
+            .get(c.get('bench_above_ma20'))),
+        ("位置分位", lambda c: (None if c.get('position250') is None else
+                              ("0-50%" if c['position250'] < 50 else
+                               ("50-75%" if c['position250'] < 75 else "75-100%")))),
+        ("放量倍数", lambda c: (None if c.get('vol_ratio') is None else
+                              ("<1.2" if c['vol_ratio'] < 1.2 else
+                               ("1.2-1.5" if c['vol_ratio'] < 1.5 else ">=1.5")))),
+        ("平台突破", lambda c: {True: "真突破60日平台", False: "未突破"}.get(c.get('breakout'))),
+        ("入场评分", lambda c: (None if c.get('entry_score') is None else
+                              ("<30" if c['entry_score'] < 30 else
+                               ("30-50" if c['entry_score'] < 50 else ">=50")))),
+    ]
+
+def band_attribution_report(mem):
+    """按入场条件分桶统计。只统计**已结案**的笔。返回 list[dict]。
+
+    每行带 enough 标记：样本量 < REVIEW_MIN_SAMPLE 时页面必须显示「样本不足」，
+    不允许据此下结论 —— 否则就是在噪音里挑好看的那一桶。"""
+    rows = []
+    closed_nodes = [n for n in ((mem or {}).get('stocks') or {}).values()
+                    if isinstance(n, dict) and (n.get('outcome') or {}).get('closed')]
+    for dim, fn in _bucket_defs():
+        groups = {}
+        for node in closed_nodes:
+            ctx = node.get('entry_context') or {}
+            name = fn(ctx)
+            if not name:
+                continue
+            groups.setdefault(name, []).append(node)
+        for name in sorted(groups.keys()):
+            items = groups[name]
+            outs = [n['outcome'] for n in items]
+            rets = [o.get('ret_pct') or 0.0 for o in outs]
+            wins = sum(1 for o in outs if o.get('verdict') == 'win')
+            exs = [o['excess_pct'] for o in outs if o.get('excess_pct') is not None]
+            rows.append({
+                "dim": dim, "bucket": name, "n": len(items),
+                "enough": len(items) >= REVIEW_MIN_SAMPLE,
+                "win_rate": round(wins / len(items) * 100, 1) if items else 0.0,
+                "avg_ret": round(sum(rets) / len(rets), 2) if rets else 0.0,
+                "avg_excess": round(sum(exs) / len(exs), 2) if exs else None,
+                "avg_mfe": round(sum(o.get('mfe_pct') or 0.0 for o in outs) / len(outs), 2),
+                "avg_mae": round(sum(o.get('mae_pct') or 0.0 for o in outs) / len(outs), 2),
+            })
+    return rows
+
+def band_review_stats(mem):
+    """复盘总览。tracked 含未结案的，closed 才是可用于统计的样本。
+
+    ★ tracked 要排除「用户已归档、但波段从未算出结案结果」的条目：
+      这类条目已被用户手工移出观察（`closed=True` 且 outcome 为空），
+      `band_review_refresh` 会跳过它们、永远不会补上 outcome，
+      若还计进 tracked 就会让「跟踪中」永久虚高几只，看板数字从一开始就是假的。
+    """
+    stocks = (mem or {}).get('stocks') or {}
+    tracked = [n for n in stocks.values()
+               if isinstance(n, dict)
+               and not (n.get('closed') and not (n.get('outcome') or {}).get('closed'))]
+    closed = [n for n in tracked if (n.get('outcome') or {}).get('closed')]
+    outs = [n['outcome'] for n in closed]
+    verdict_counts = {}
+    for o in outs:
+        v = o.get('verdict') or 'unknown'
+        verdict_counts[v] = verdict_counts.get(v, 0) + 1
+    exs = [o['excess_pct'] for o in outs if o.get('excess_pct') is not None]
+    return {
+        "tracked": len(tracked), "closed": len(closed), "open": len(tracked) - len(closed),
+        "win": verdict_counts.get('win', 0),
+        "win_rate": round(verdict_counts.get('win', 0) / len(outs) * 100, 1) if outs else 0.0,
+        "avg_ret": round(sum(o.get('ret_pct') or 0.0 for o in outs) / len(outs), 2) if outs else 0.0,
+        "avg_excess": round(sum(exs) / len(exs), 2) if exs else None,
+        "avg_mfe": round(sum(o.get('mfe_pct') or 0.0 for o in outs) / len(outs), 2) if outs else 0.0,
+        "avg_mae": round(sum(o.get('mae_pct') or 0.0 for o in outs) / len(outs), 2) if outs else 0.0,
+        "verdict_counts": verdict_counts,
+        "bench_ready": _bench_history() is not None,
+        "rule_version": REVIEW_RULE_VERSION,
+        "min_sample": REVIEW_MIN_SAMPLE,
+    }
 
 def band_memory_refresh(mem, codes=None):
     """重新拉取记忆内股票的当前波段状态（并发）。返回 (mem, changes)。
@@ -1811,6 +2204,115 @@ def _band_status_badge(status):
         '波段未形成': ('#888', '⬜'),
     }.get(status, ('#888', '❔'))
 
+def band_review_ui():
+    """📊 策略复盘：把「选了 → 结案 → 归因」变成可统计的看板。
+
+    ★ 本面板**只做统计，不改动任何选股参数**。理由见 REVIEW_* 常量的注释：
+      每周 10 只的样本量，头两三个月根本不足以区分参数优劣，此时调参就是噪音拟合。
+      所以这一阶段的正确产出是「可归因的样本库 + 诚实的分桶报表」，不是自动优化。
+
+    ★ 重算走显式按钮，**渲染时不发网络请求**：一是页面不会无故变慢，
+      二是同一个按钮任何时候点都得到同一结果（因为结案完全由日线回溯决定）。
+    """
+    st.markdown("---")
+    st.header("📊 策略复盘")
+    st.caption(f"判定规则 **{REVIEW_RULE_VERSION}**（规则一改必须升版；老批次永远按入册时的版本判定）"
+               f"｜基准 沪深300｜止盈 +{REVIEW_TP_PCT:.0f}%｜止损 跌破20日线｜"
+               f"时间结案 {REVIEW_MAX_HOLD_DAYS} 个交易日")
+    st.caption("⚠️ 本面板只统计、**不改选股参数**。样本量够之前任何调参都是噪音拟合 —— "
+               f"分桶样本少于 {REVIEW_MIN_SAMPLE} 笔只标「样本不足」，不下结论。")
+
+    mem = load_band_memory()
+    batches = load_band_batches()
+    if not mem.get('stocks'):
+        st.info("记忆里还没有股票。先在上方选股，或用「🧠 波段记忆 → 手动记入」把想跟踪的代码加进来。")
+        return
+
+    _c1, _c2 = st.columns([1, 3])
+    with _c1:
+        _do = st.button("🔄 重算结案与归因", key="band_review_refresh", use_container_width=True)
+    with _c2:
+        st.caption("重算只处理「跟踪中」的条目（已结案的不会再变）；结案点由日线回溯决定，"
+                   "与是否开着网页无关，因此结果可复现。")
+    if _do:
+        with st.spinner("正在回溯日线、计算结案点与归因指标..."):
+            mem, _n = band_review_refresh(mem)
+            save_band_memory(mem)
+        st.success(f"已更新 {_n} 只的结案/归因。")
+        st.rerun()
+
+    st_ = band_review_stats(mem)
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("跟踪中", f"{st_['open']} 只")
+    m2.metric("已结案", f"{st_['closed']} 只")
+    m3.metric("胜率", f"{st_['win_rate']}%")
+    m4.metric("平均超额", ("—" if st_['avg_excess'] is None else f"{st_['avg_excess']:+.2f}%"))
+    m5.metric("平均最大浮盈", f"{st_['avg_mfe']:+.2f}%")
+    m6.metric("平均最大浮亏", f"{st_['avg_mae']:+.2f}%")
+    if not st_['bench_ready']:
+        st.warning("基准（沪深300）日线本次没取到，超额收益暂时算不出来 —— "
+                   "缺少超额的胜率会虚高（牛市里谁都在赚），别据此下判断。")
+
+    if st_['closed'] == 0:
+        st.info("还没有已结案的样本。点上方「🔄 重算结案与归因」先算一遍："
+                "只要某笔已触发止盈/跌破20日线/满40个交易日，就会被判为结案并计入统计。")
+        return
+
+    # ---- 败因四分类（这是本面板最有价值的一块）----
+    st.markdown("#### 🔍 败因四分类")
+    st.markdown("**只有「入场逻辑错」才该去改选股逻辑；「逻辑对、执行错」是卖点问题，"
+                "此时改选股逻辑只会把对的信号改坏。**")
+    _vc = st_.get('verdict_counts') or {}
+    _vc_rows = []
+    for _k in ('win', 'lose_rel', 'lose_exec', 'lose_logic'):
+        _n = _vc.get(_k, 0)
+        if _n:
+            _vc_rows.append(f"| {VERDICT_LABEL.get(_k, _k)} | {_n} | {_n / st_['closed'] * 100:.1f}% |")
+    if _vc_rows:
+        st.markdown("| 分类 | 笔数 | 占比 |\n|---|---:|---:|\n" + "\n".join(_vc_rows))
+
+    # ---- 分桶归因 ----
+    st.markdown("#### 🧮 分桶归因")
+    st.caption("全部按「入场时就已知」的条件分桶，绝不使用事后才知道的信息。"
+               "找的是「哪种入场条件下这套逻辑失效」，用于后续加过滤条件（做减法），"
+               "而不是放大看起来有效的信号。")
+    _rows = band_attribution_report(mem)
+    if not _rows:
+        st.caption("暂无可用分桶（可能是入场上下文缺失，或基准数据不足）。")
+    else:
+        _df = pd.DataFrame(_rows)
+        _df = _df.rename(columns={
+            "dim": "维度", "bucket": "分桶", "n": "笔数", "win_rate": "胜率%",
+            "avg_ret": "平均收益%", "avg_excess": "平均超额%",
+            "avg_mfe": "平均最大浮盈%", "avg_mae": "平均最大浮亏%", "enough": "样本够",
+        })
+        _df["样本够"] = _df["样本够"].map({True: "✅", False: "样本不足"})
+        st.dataframe(_df[["维度", "分桶", "笔数", "样本够", "胜率%",
+                          "平均收益%", "平均超额%", "平均最大浮盈%", "平均最大浮亏%"]],
+                     use_container_width=True, hide_index=True)
+        if not any(r['enough'] for r in _rows):
+            st.caption(f"当前所有分桶的样本量都不到 {REVIEW_MIN_SAMPLE} 笔 —— "
+                       "上面的胜率差异**还只是噪音**，不要据此调整任何参数。")
+
+    # ---- 批次档案 ----
+    _allb = batches.get('batches') or {}
+    with st.expander(f"📦 批次档案（{len(_allb)} 批）", expanded=False):
+        if not _allb:
+            st.caption("还没有批次。下次在「🧠 波段记忆 → 手动记入」批量记入时会自动记成一批 —— "
+                       "批次是复盘的前提：逐只散着记，事后分不清哪些是同一期选的，也就无法归因。")
+        else:
+            for _bid in sorted(_allb.keys(), reverse=True):
+                _b = _allb[_bid] or {}
+                _codes = [str(x) for x in (_b.get('codes') or [])]
+                _done = 0
+                for _cc in _codes:
+                    _nd = mem['stocks'].get(_cc)
+                    if isinstance(_nd, dict) and ((_nd.get('outcome') or {}).get('closed')):
+                        _done += 1
+                st.markdown(f"**{_bid}**　{_b.get('source', '')}｜{len(_codes)} 只｜已结案 {_done} 只"
+                            f"　`{' '.join(_codes)}`")
+
 def band_memory_ui():
     """波段记忆面板：记住选过的票、跟踪状态变化、并同步到云端巡检。"""
     st.markdown("---")
@@ -1999,7 +2501,11 @@ def band_memory_ui():
                             _log(f"band_memory_ui/manual/{code}", e)
                             st.warning(f"{code} 分析失败：{e}")
                     if rows:
-                        added = band_memory_record(mem, rows, source="手动记入")
+                        # 入场时的大盘环境：归因要用，必须在「入场那一刻」记下来，事后补不了
+                        _bench = _bench_history()
+                        _above = _bench_above_ma20(_bench)
+                        added = band_memory_record(mem, rows, source="手动记入",
+                                                   bench_above=_above)
                         # 手动记入的票不分状态一律收下（用户明确想跟踪）
                         for r in rows:
                             code = str(r['Code'])
@@ -2008,11 +2514,23 @@ def band_memory_ui():
                                     "code": code, "name": r.get('Name') or code,
                                     "added_at": now_cn_str(), "added_price": r.get('Price', 0.0),
                                     "added_status": r.get('Status'), "added_source": "手动记入",
+                                    "batch_id": "",
+                                    "entry_context": _band_entry_context(r, _above),
                                     "snapshot": {}, "note": "", "closed": False,
                                     "alerts": {}, "history": [],
                                 }
                                 _band_memory_apply(mem['stocks'][code], r, event="手动记入")
                                 added.append(code)
+                        # 复盘用：这一次新增的票记成一个批次（没有新增就不建，避免重复批次）
+                        if added:
+                            _bs = load_band_batches()
+                            _bid = band_batch_create(_bs, added, source="手动记入",
+                                                     note="面板手动批量记入")
+                            save_band_batches(_bs)
+                            for _c in added:
+                                _n = mem['stocks'].get(_c)
+                                if isinstance(_n, dict):
+                                    _n['batch_id'] = _bid
                         save_band_memory(mem)
                         st.session_state.band_memory_sync_msg = f"已记入 {len(added)} 只"
                         band_memory_push_github(mem)
@@ -2279,6 +2797,15 @@ def ai_band_picker_ui():
     except Exception as e:
         _log("band_memory_ui", e)
         st.warning("波段记忆面板渲染出错（已拦截，不影响上方选股功能）")
+        with st.expander("查看错误详情"):
+            st.code(traceback.format_exc(), language="python")
+
+    # 策略复盘面板（批次 / 结案 / 归因 —— 只统计，不改选股参数）
+    try:
+        band_review_ui()
+    except Exception as e:
+        _log("band_review_ui", e)
+        st.warning("策略复盘面板渲染出错（已拦截，不影响其他功能）")
         with st.expander("查看错误详情"):
             st.code(traceback.format_exc(), language="python")
 
