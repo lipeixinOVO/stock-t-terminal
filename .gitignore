@@ -37,3 +37,10 @@ kline_cache.json.tmp
 band_memory.json
 band_memory.json.tmp
 band_watch.json.tmp
+
+# ===== 策略复盘（隐私，绝对禁止进仓库）=====
+# band_batches.json 含批次名单与逐笔收益/胜率，属于交易绩效数据，
+# 公开了等于公开自己的成绩单。**刻意不进 band_watch.json 的脱敏摘要**：
+# 摘要只同步巡检必需的「代码 + 状态」，收益率永远留在本地容器。
+band_batches.json
+band_batches.json.tmp
