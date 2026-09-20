@@ -1593,10 +1593,16 @@ def _calculate_band_metrics(df):
     recent['local_high'] = (recent['High'] > recent['High'].shift(1)) & (recent['High'] > recent['High'].shift(-1))
     highs = recent[recent['local_high']].tail(5)
     top_divergence = False
+    top_divergence_gap_pct = 0.0
     if len(highs) >= 2:
         h1, h2 = highs.iloc[-2], highs.iloc[-1]
         if h2['High'] > h1['High'] and h2['macd'] < h1['macd']:
-            top_divergence = True
+            # 背离幅度：以第一个高点的 MACD 为分母。它小到约等于 0 时分比没有意义
+            # → 记 0（= 不给预警），避免出现「分母趋零 ⇒ 幅度无穷大」的假信号。
+            _m1 = float(h1['macd'])
+            top_divergence_gap_pct = (((_m1 - float(h2['macd'])) / abs(_m1) * 100.0)
+                                      if abs(_m1) > 1e-9 else 0.0)
+            top_divergence = top_divergence_gap_pct >= BAND_DIVERGENCE_MACD_MIN_PCT
 
     below_support = current < ma20
 
@@ -1609,7 +1615,8 @@ def _calculate_band_metrics(df):
         'platform_range_pct': platform_range_pct, 'breakout': breakout,
         'vol_ratio': vol_ratio, 'volume_expansion': volume_expansion,
         'macd': float(macd.iloc[-1]), 'macd_golden': bool(diff.iloc[-1] > dea.iloc[-1] and diff.iloc[-2] <= dea.iloc[-2]),
-        'top_divergence': top_divergence, 'below_support': below_support,
+        'top_divergence': top_divergence, 'top_divergence_gap_pct': top_divergence_gap_pct,
+        'below_support': below_support,
         'position_pct': position_pct, 'lookback': lookback,
     }
 
@@ -1875,6 +1882,20 @@ BAND_AUTO_MEMO_STATUSES = BAND_ENTRY_STATUSES + BAND_ALERT_STATUSES
 #    启动确认=2 比它低，纯粹因为「启动」不是需要你立刻动手的事。
 BAND_STATUS_LEVEL = {'波段未形成': 0, '波段进行中': 1, '波段启动确认': 2,
                      '跌破支撑': 3, '顶背离预警': 4}
+# ★ 顶背离的「MACD 背离幅度」门槛（%）：第二个高点的 MACD 必须比第一个低这么多，才算真背离。
+#   0 = 只看方向（2026-09-20 之前的旧行为）；30 = 要求 MACD 真的掉三成。
+#
+#   依据 `_debug_probe/probe_divergence_backtest.py`（3398 只票 / 27,352 次「进入顶背离预警」
+#   事件 / 2023-11 起约 450 根日线 / 判据只用事件之后的走势）：在「之后 10 天内跌破 20 日线」
+#   这个判据上，四个候选收紧方向里**只有这个方向是单调有效的** ——
+#     门槛 0/5/10/15/20/25/30/40/50% → 保留组跌破率 68.3/69.1/70.0/70.7/71.2/72.1/72.9/74.3/75.3%
+#   而「新高须 ≥N%」方向**相反**（68.3%→64.4% 单调下降：擦边新高反而更准，
+#   照直觉收紧会先砍掉更准的那批）；「两高点间隔 ≥M 根」几乎无效
+#   （现状本身就保证 ≥2 根，再抬高只是减少样本）。
+#
+#   ⚠️ 必须与 watcher.py 中的同名常量保持一致；不一致就会出现
+#      「网页标了顶背离、微信不推」这种最难查的不对称。
+BAND_DIVERGENCE_MACD_MIN_PCT = 30.0
 BAND_MEMORY_HISTORY_MAX = 40    # 每只股票最多保留的轨迹条数，防止文件无限膨胀
 
 # ============ 策略复盘规则（2026-09-19 新增）============
@@ -4991,8 +5012,17 @@ def ai_band_picker_ui():
         4. MACD 金叉或红柱，资金流入加分。
 
         **波段结束提醒**：
-        - 顶背离：股价创新高，但 MACD 未创新高。
+        - 顶背离：股价创新高，但 MACD 未创新高（且背离幅度 ≥30%，见下）。
         - 跌破支撑：收盘价跌破 20 日线。
+
+        **顶背离为什么要求 ≥30% 的 MACD 落差**：回测 27,352 次预警事件后发现，
+        只看「MACD 有没有变低」会把大量擦边情况标成预警（实测有只高 0.27% 的新高），
+        而按 MACD 的落差收紧是唯一能让预警变准的方向；顺带一提，
+        **按「新高幅度」收紧是反的**（新高幅度越大，趋势反而越不容易坏）。
+        另外要清楚：顶背离不是「要跌」的信号，而是「趋势更容易坏」的信号 ——
+        背离组与「创新高但无背离」组之后 10 天平均收益几乎一样，
+        但背离组 10 天内跌破 20 日线的比例是 68%，无背离组只有 37%。
+        所以它的用法是「别追高 / 准备止盈」，不是清仓。
 
         ⚠️ 本工具仅为量化初筛，不构成投资建议。
         """)
