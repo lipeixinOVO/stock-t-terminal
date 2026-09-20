@@ -2401,6 +2401,20 @@ SAMPLE_TIER_LABEL = {
     "base_ctrl": "基准对照（20日线下）",
 }
 
+# ★ 云端语料的回读通道（2026-09-19 改造）。
+#   为什么需要它：语料原来只存在**本地文件**里（SAMPLE_FILE 是 gitignore 的），
+#   而每天自动采集跑在 GitHub Actions —— 采完的产物躺在 Actions 缓存里，
+#   网页端根本看不见。于是云端页面上「逻辑有效性验证」**永远是空的**，
+#   你只能在本机手点采集；就算在云上点了，Streamlit Cloud 没有持久化磁盘，
+#   容器一重启采到的样本就没了。这就是「每天都要点一下」的根因。
+#   现在 Actions 每天把**只含前瞻样本**的加密快照发布成这个滚动 release 资源，
+#   网页端打开页面自动拉取 + 解密 + 与本地合并（见 load_band_samples_cloud）。
+CORPUS_RELEASE_TAG = "data-latest"
+CORPUS_ASSET_NAME = "band_samples_forward.enc"
+CORPUS_URL = (f"https://github.com/{GITHUB_REPO}/releases/download/"
+              f"{CORPUS_RELEASE_TAG}/{CORPUS_ASSET_NAME}")
+CORPUS_FETCH_TIMEOUT = (4, 12)   # (连接, 读取) 秒；页面渲染路径上不能久等
+
 
 def _sample_key(code, date, source):
     return f"{str(code).zfill(6)}|{str(date)[:10]}|{source}"
@@ -2843,6 +2857,72 @@ def load_band_samples(path=None, cap=None):
     return out
 
 
+def _unwrap_corpus_text(data):
+    """把加密语料文件的内容解回 JSONL 文本。
+
+    ★ 格式与 `sample_harvest.py::_wrap_plain` **严格一致，两边必须同步改**：
+        文件 = JSON 文本 {"v":1,"enc":"<fernet token>"}
+        解开 token → {"v":1,"kind":"band_samples","gz_b64":"<base64(gzip(JSONL))>"}
+      解不开一律抛异常，交给调用方决定怎么降级 —— **绝不把「解不开」当成「库里是空的」**，
+      否则密钥配错会静默表现为「没有样本」，最难排查。
+    """
+    env = json.loads(data)
+    if not isinstance(env, dict):
+        raise ValueError("语料密文外层不是 JSON 对象")
+    obj = env
+    if env.get(_ENC_FIELD):
+        ok, obj, err = band_decrypt_obj(env)
+        if not ok:
+            raise ValueError(f"语料解密失败：{err}")
+    b64 = (obj or {}).get("gz_b64")
+    if not b64:
+        raise ValueError("解密成功但内容里没有 gz_b64 字段（文件类型不对？）")
+    return gzip.decompress(base64.b64decode(b64)).decode("utf-8")
+
+
+def parse_band_samples_text(text, rows=None):
+    """把语料的 JSONL 文本解析成行列表。坏行跳过并留痕（与 load_band_samples 同一套判据）。"""
+    out = rows if rows is not None else []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception as e:
+            _log("parse_band_samples_text/line", e)
+            continue
+        if isinstance(row, dict) and row.get("code") and row.get("date"):
+            out.append(row)
+    return out
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fetch_cloud_corpus(url=CORPUS_URL):
+    """拉云端语料快照 → (rows, err)。**永不抛异常**：失败返回 ([], 原因字符串)。"""
+    try:
+        r = _http_session().get(url, timeout=CORPUS_FETCH_TIMEOUT,
+                                headers=_REQUEST_HEADERS, allow_redirects=True)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        return parse_band_samples_text(_unwrap_corpus_text(r.text)), ""
+    except Exception as e:
+        _log("_fetch_cloud_corpus", e)
+        return [], f"{type(e).__name__}: {str(e)[:120]}"
+
+
+def load_band_samples_cloud():
+    """读云端前瞻语料 → (rows, 说明)。任何失败都只降级为「读不到」，不影响本地那份。"""
+    if not band_crypto_enabled():
+        return [], "本端没有 BAND_KEY，读不了云端语料（只有本机那份可用）"
+    rows, err = _fetch_cloud_corpus()
+    if err:
+        return [], f"云端语料拉取失败：{err}"
+    if not rows:
+        return [], "云端语料还没有前瞻样本（首次发布后就会出现）"
+    return rows, f"云端前瞻语料 {len(rows)} 条"
+
+
 def save_band_samples(rows, path=None):
     """写样本库。rows 可以是 dict 或 list。返回实际写入行数。
 
@@ -3017,14 +3097,26 @@ def band_sample_ui():
                "回填样本与前瞻样本**分开统计，绝不混算**")
 
     rows_map = load_band_samples()
+    _local_n = len(rows_map)
+    # ★ 云端那份（盘后 Actions 自动采的前瞻语料）合并进来：这一步是「不用手点」的关键。
+    #   复用 band_samples_merge —— 去重键与「结案覆盖 pending」的规则完全同一套，
+    #   不另写一份合并逻辑。云端读不到时只降级，本地那份照旧可用。
+    _cloud_rows, _cloud_msg = load_band_samples_cloud()
+    if _cloud_rows:
+        rows_map, _c_added, _c_updated, _c_trimmed = band_samples_merge(rows_map, _cloud_rows)
     rows = list(rows_map.values())
+    st.caption(f"📥 语料来源：本地明文 {_local_n} 条 ｜ {_cloud_msg}"
+               "　·　云端那份由**盘后自动采集**每天更新，不需要你手点。")
     if not rows:
-        st.info("样本库还是空的。两种攒法：\n\n"
-                "1. **点下面的「采集今日全市场样本」** —— 按今天的真实判断收一批前瞻样本"
-                "（这是唯一能当成绩用的那类）；全市场要跑 5～15 分钟，只想先试流程"
+        st.info("还没读到样本。三种来源：\n\n"
+                "0. **盘后自动采集已上线** —— 周一至周五 15:40（北京时间）由 GitHub Actions "
+                "自动扫全市场，采到的前瞻样本每天发布一次，本页打开时会自动拉取，"
+                "**正常情况你什么都不用点**；\n"
+                "1. **点下面的「采集今日全市场样本」** —— 立刻按今天的真实判断收一批"
+                "（这是唯一能当成绩用的那类）；全市场约 5～15 分钟，只想先试流程"
                 "就把「试跑：只采前 N 只」填 50；\n"
-                "2. **在本机跑一次历史回填** —— 立刻拿到数千条重放样本，"
-                "脚本见 `_debug_probe/backfill_samples.py`。")
+                "2. **在本机跑一次历史回填** —— 立刻拿到数千条重放样本"
+                "（自带前视偏差，只能提假设），脚本见 `_debug_probe/backfill_samples.py`。")
         _sample_forward_action({})
         return
 
@@ -3811,10 +3903,38 @@ def band_memory_ui():
             st.caption("把上面这串原样复制到两处 Secrets（Streamlit 与 GitHub Actions），一字都不能差。")
 
 
+def _render_band_card(r, tracked=None):
+    """渲染一张波段选股结果卡片。
+
+    ★ 已在「跟踪清单」（波段记忆）里的票只打标记，**不再重复当成一条新发现** ——
+      原先扫描结果里出现一次、记忆清单里又出现一次，就是「两块内容看着重复」的来源。
+    """
+    tracked = tracked or set()
+    chg_color = "#ff4b4b" if r['ChangePct'] >= 0 else "#00cc66"
+    _tag = ("　<span style='color:#89b4fa;font-size:12px;'>✅ 已在跟踪清单</span>"
+            if str(r['Code']) in tracked else "")
+    st.markdown(f"""
+                <div style="background:#1e1e2e; border-radius:10px; padding:14px 18px; margin-bottom:10px; border-left:4px solid {r['StatusColor']};">
+                    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+                        <div><span style="font-size:18px; font-weight:bold; color:#f0f2f6;">{r['Name']}</span>
+                        <span style="color:#89b4fa; font-size:14px; margin-left:8px;">({r['Code']})</span>
+                        <span style="color:{chg_color}; font-size:14px; margin-left:10px;">{r['ChangePct']:+.2f}%</span>{_tag}</div>
+                        <div style="text-align:right;"><span style="color:{r['StatusColor']}; font-size:16px; font-weight:bold;">{r['Status']}</span></div>
+                    </div>
+                    <div style="margin-top:8px; color:#c9d1d9; font-size:13px; line-height:1.8;">
+                        <span style="color:#89b4fa;">价格:</span> {r['Price']:.2f} | <span style="color:#89b4fa;">20日线:</span> {r['MA20']:.2f} | <span style="color:#89b4fa;">平台上沿:</span> {r['PlatformHigh']:.2f} | <span style="color:#89b4fa;">量比:</span> {r['VolRatio']:.1f} | <span style="color:#89b4fa;">250日分位:</span> {r['Position250']:.0f}%
+                    </div>
+                    <div style="margin-top:6px; color:#f9e2af; font-size:13px;">📋 {r['Reasons']}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+
 def ai_band_picker_ui():
     st.markdown("---")
-    st.header("🌊 波段做T选股助手")
-    st.caption("筛选突破整理平台+放量的波段启动股，并预警顶背离/跌破支撑等波段结束信号（排除科创/创业板/北交所/ST）")
+    st.header("🌊 波段做T选股")
+    st.caption("筛选突破整理平台+放量的波段启动股，并预警顶背离/跌破支撑等波段结束信号"
+               "（排除科创/创业板/北交所/ST）。扫描结果按**波段状态分组**，"
+               "下面是唯一的「跟踪清单」——同一只票全页只出现一次。")
 
     with st.expander("📖 选股逻辑说明", expanded=False):
         st.markdown("""
@@ -3913,49 +4033,47 @@ def ai_band_picker_ui():
                 st.caption(f"上次扫描时间: {st.session_state.scan_time}")
             if 'scan_stats' in st.session_state:
                 st.caption(f"📊 扫描漏斗: {st.session_state.scan_stats}")
-            for _, r in df_r.iterrows():
-                chg_color = "#ff4b4b" if r['ChangePct'] >= 0 else "#00cc66"
-                st.markdown(f"""
-                <div style="background:#1e1e2e; border-radius:10px; padding:14px 18px; margin-bottom:10px; border-left:4px solid {r['StatusColor']};">
-                    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
-                        <div><span style="font-size:18px; font-weight:bold; color:#f0f2f6;">{r['Name']}</span>
-                        <span style="color:#89b4fa; font-size:14px; margin-left:8px;">({r['Code']})</span>
-                        <span style="color:{chg_color}; font-size:14px; margin-left:10px;">{r['ChangePct']:+.2f}%</span></div>
-                        <div style="text-align:right;"><span style="color:{r['StatusColor']}; font-size:16px; font-weight:bold;">{r['Status']}</span></div>
-                    </div>
-                    <div style="margin-top:8px; color:#c9d1d9; font-size:13px; line-height:1.8;">
-                        <span style="color:#89b4fa;">价格:</span> {r['Price']:.2f} | <span style="color:#89b4fa;">20日线:</span> {r['MA20']:.2f} | <span style="color:#89b4fa;">平台上沿:</span> {r['PlatformHigh']:.2f} | <span style="color:#89b4fa;">量比:</span> {r['VolRatio']:.1f} | <span style="color:#89b4fa;">250日分位:</span> {r['Position250']:.0f}%
-                    </div>
-                    <div style="margin-top:6px; color:#f9e2af; font-size:13px;">📋 {r['Reasons']}</div>
-                </div>
-                """, unsafe_allow_html=True)
+            # ★ 按波段状态分组，而不是一长串平铺 —— 原来启动/预警/进行中混在一起，
+            #   一眼看不出「今天该先看哪几只」。分组顺序＝处理优先级。
+            try:
+                _tracked = set((load_band_memory().get('stocks') or {}).keys())
+            except Exception as e:
+                _log("ai_band_picker_ui/tracked", e)
+                _tracked = set()
+            _groups = [
+                ("🚀 波段启动确认", ('波段启动确认',)),
+                ("⚠️ 结束信号（顶背离 / 跌破支撑）", ('顶背离预警', '跌破支撑')),
+                ("🔄 波段进行中", ('波段进行中',)),
+                ("… 波段未形成", ('波段未形成',)),
+            ]
+            _seen = set()
+            for _gtitle, _gsts in _groups:
+                _sub = df_r[df_r['Status'].isin(_gsts)]
+                if _sub.empty:
+                    continue
+                _seen.update(_sub['Code'].astype(str).tolist())
+                st.markdown(f"#### {_gtitle}（{len(_sub)} 只）")
+                for _, r in _sub.iterrows():
+                    _render_band_card(r, _tracked)
+            # 兜底：万一以后加了新状态、或状态文案改了，剩下的一律照常显示，绝不静默丢弃
+            _rest = df_r[~df_r['Code'].astype(str).isin(_seen)]
+            if not _rest.empty:
+                st.markdown(f"#### 其他状态（{len(_rest)} 只）")
+                for _, r in _rest.iterrows():
+                    _render_band_card(r, _tracked)
 
-    # 波段记忆面板（记住选过的票 + 跟踪状态变化 + 云端推送）
+    # ★ 2026-09-19 重排：这里原先紧接着渲染「波段记忆 / 策略复盘 / 逻辑有效性验证」
+    #   三个面板，导致选股页越拖越长；而记忆清单又会把刚扫出来的启动股再列一遍，
+    #   看上去就像两块内容重复。现在选股只负责回答「今天扫到了什么」，
+    #   跟踪/复盘/验证各自回到自己的页签（见主流程的 st.tabs）。
     try:
-        band_memory_ui()
+        _m_quick = load_band_memory()
+        _s_quick = band_memory_stats(_m_quick)
+        st.caption(f"📋 跟踪清单就在下方「🧠 波段记忆」（在跟踪 {_s_quick['active']} 只："
+                   f"启动 {_s_quick['entry']} ／ 结束预警 {_s_quick['alert']}）；"
+                   f"策略复盘与逻辑有效性验证在「📊 复盘与验证」页签。")
     except Exception as e:
-        _log("band_memory_ui", e)
-        st.warning("波段记忆面板渲染出错（已拦截，不影响上方选股功能）")
-        with st.expander("查看错误详情"):
-            st.code(traceback.format_exc(), language="python")
-
-    # 策略复盘面板（批次 / 结案 / 归因 —— 只统计，不改选股参数）
-    try:
-        band_review_ui()
-    except Exception as e:
-        _log("band_review_ui", e)
-        st.warning("策略复盘面板渲染出错（已拦截，不影响其他功能）")
-        with st.expander("查看错误详情"):
-            st.code(traceback.format_exc(), language="python")
-
-    # 逻辑有效性验证面板（机器自采样本 —— 与上面的记忆名单完全分开）
-    try:
-        band_sample_ui()
-    except Exception as e:
-        _log("band_sample_ui", e)
-        st.warning("逻辑验证面板渲染出错（已拦截，不影响其他功能）")
-        with st.expander("查看错误详情"):
-            st.code(traceback.format_exc(), language="python")
+        _log("ai_band_picker_ui/quick_stats", e)
 
 # ================= 11. 动态股票池系统 =================
 @st.cache_data(ttl=180)
@@ -4373,31 +4491,85 @@ try:
         for f in fired: st.toast(f, icon="🔔")
     elif st.session_state.get('send_key') and not is_trading_time():
         st.session_state.last_monitor_count = 0
-    st.markdown(f'<div class="report-box">{report}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="ai-advice-box">🤖 <b>AI 实时建议</b><br>{ai_advice}</div>', unsafe_allow_html=True)
-    col_g, col_p = st.columns(2)
-    with col_g: st.markdown(f'<div class="guide-box">🎯 <b>今日做T指引</b><br>{t_guide}</div>', unsafe_allow_html=True)
-    with col_p: st.markdown(f'<div class="predict-box">📊 <b>日内极值预测</b><br>{predict_text}</div>', unsafe_allow_html=True)
-    col_title1, col_btn1 = st.columns([9, 1])
-    with col_title1: st.subheader(f"📈 {current_name} ({symbol}) 日线级别走势")
-    with col_btn1:
-        if st.button("🔄 复位", use_container_width=True, key="reset_daily_chart"): st.session_state.chart_reset_key += 1; st.rerun()
-    ma_html = f"""<div class="ma-bar"><span style="color:#ffffff">M5: {latest['MA5']:.3f}</span><span style="color:#ffff00">M10: {latest['MA10']:.3f}</span><span style="color:#ff00ff">M20: {latest['MA20']:.3f}</span><span style="color:#00ff00">M30: {latest['MA30']:.3f}</span><span style="color:#00ccff">年线: {latest['MA250']:.3f}</span></div>"""
-    st.markdown(ma_html, unsafe_allow_html=True)
-    st.plotly_chart(plot_daily_chart(df_daily.tail(120), symbol, latest, st.session_state.chart_reset_key), use_container_width=True, config=PLOTLY_CONFIG_DAILY)
-    st.caption("💡 **放大**：在图上按住左键拖出矩形框，松开即放大该区域（主图与成交量**同步缩放**，在哪个子图上拖都可以）；"
-               "右上角工具栏有缩放 / 平移 / 自动缩放 / 重置按钮；双击图表或点「🔄 复位」回到初始视图。")
-    col_title2, col_btn2 = st.columns([9, 1])
-    with col_title2: st.subheader(f"⏱️ {current_name} ({symbol}) 分时级别走势（同花顺风格）")
-    with col_btn2:
-        if st.button("🔄 复位", use_container_width=True, key="reset_minute_chart"): st.session_state.chart_reset_key += 1; st.rerun()
-    if df_minute is not None and not df_minute.empty:
-        st.plotly_chart(plot_minute_chart_ths(df_minute, buy_points, sell_points, symbol, prev_close, st.session_state.chart_reset_key), use_container_width=True, config=PLOTLY_CONFIG_CLEAN)
-        st.caption("操作说明：分时图只显示 09:30-15:00 交易时段，锁定缩放。")
-    else: st.warning("暂无分时数据")
-    ai_band_picker_ui()
-    dynamic_pool_ui()
-    with st.container():
+    # ================= ★ 页面重排（2026-09-19）=================
+    # 原来是一条长滚动：日内信号 → 日线图 → 分时图 → 选股 → 记忆 → 复盘 → 验证 → 动态池 → AI，
+    # 十块内容一路排下去。问题有三个：
+    #   ① 越往下越长，盘中要看的日内信息被埋在中间；
+    #   ② 「选股 / 波段记忆 / 策略复盘 / 逻辑验证」四块挨在一起，视觉上像在重复说一件事；
+    #   ③ 找不到东西 —— 想复盘要滚很久。
+    # 现在按「你正在干什么」分成四段，每件事只出现在一个地方：
+    #   今日看盘（盘中最常用，最干净）｜选股与跟踪｜复盘与验证｜AI 与设置
+    # ★ 用 st.tabs 不会增加任何计算量：Streamlit 只是把元素分到不同容器里，
+    #   所有分栏内容都会照常执行（和重排前一样），只是显示时按需切换。
+    _tab_today, _tab_pick, _tab_review, _tab_ai = st.tabs(
+        ["🎯 今日看盘", "🌊 选股与跟踪", "📊 复盘与验证", "💬 AI 与设置"])
+
+    with _tab_today:
+        st.markdown(f'<div class="report-box">{report}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="ai-advice-box">🤖 <b>AI 实时建议</b><br>{ai_advice}</div>', unsafe_allow_html=True)
+        col_g, col_p = st.columns(2)
+        with col_g: st.markdown(f'<div class="guide-box">🎯 <b>今日做T指引</b><br>{t_guide}</div>', unsafe_allow_html=True)
+        with col_p: st.markdown(f'<div class="predict-box">📊 <b>日内极值预测</b><br>{predict_text}</div>', unsafe_allow_html=True)
+        # ★ 分时图放最前：盘中真正盯着看的是它；日线图 120 根是「确认大势」用的，
+        #   收进展开项，少占一屏。
+        col_title2, col_btn2 = st.columns([9, 1])
+        with col_title2: st.subheader(f"⏱️ {current_name} ({symbol}) 分时级别走势（同花顺风格）")
+        with col_btn2:
+            if st.button("🔄 复位", use_container_width=True, key="reset_minute_chart"): st.session_state.chart_reset_key += 1; st.rerun()
+        if df_minute is not None and not df_minute.empty:
+            st.plotly_chart(plot_minute_chart_ths(df_minute, buy_points, sell_points, symbol, prev_close, st.session_state.chart_reset_key), use_container_width=True, config=PLOTLY_CONFIG_CLEAN)
+            st.caption("操作说明：分时图只显示 09:30-15:00 交易时段，锁定缩放。")
+        else:
+            st.warning("暂无分时数据")
+        with st.expander(f"📈 {current_name}（{symbol}）日线级别走势（120 根）", expanded=False):
+            col_title1, col_btn1 = st.columns([9, 1])
+            with col_title1: st.caption("点开即用；不放首页是因为盘中主要看分时。")
+            with col_btn1:
+                if st.button("🔄 复位", use_container_width=True, key="reset_daily_chart"): st.session_state.chart_reset_key += 1; st.rerun()
+            ma_html = f"""<div class="ma-bar"><span style="color:#ffffff">M5: {latest['MA5']:.3f}</span><span style="color:#ffff00">M10: {latest['MA10']:.3f}</span><span style="color:#ff00ff">M20: {latest['MA20']:.3f}</span><span style="color:#00ff00">M30: {latest['MA30']:.3f}</span><span style="color:#00ccff">年线: {latest['MA250']:.3f}</span></div>"""
+            st.markdown(ma_html, unsafe_allow_html=True)
+            st.plotly_chart(plot_daily_chart(df_daily.tail(120), symbol, latest, st.session_state.chart_reset_key), use_container_width=True, config=PLOTLY_CONFIG_DAILY)
+            st.caption("💡 **放大**：在图上按住左键拖出矩形框，松开即放大该区域（主图与成交量**同步缩放**，在哪个子图上拖都可以）；"
+                       "右上角工具栏有缩放 / 平移 / 自动缩放 / 重置按钮；双击图表或点「🔄 复位」回到初始视图。")
+
+    with _tab_pick:
+        # 扫描（今天扫到什么，按状态分组）→ 跟踪清单（我记住的票，唯一一处）→ 动态池
+        ai_band_picker_ui()
+        try:
+            band_memory_ui()
+        except Exception as e:
+            _log("band_memory_ui", e)
+            st.warning("跟踪清单渲染出错（已拦截，不影响上方选股功能）")
+            with st.expander("查看错误详情"):
+                st.code(traceback.format_exc(), language="python")
+        try:
+            dynamic_pool_ui()
+        except Exception as e:
+            _log("dynamic_pool_ui", e)
+            st.warning("动态股票池渲染出错（已拦截，不影响其他功能）")
+            with st.expander("查看错误详情"):
+                st.code(traceback.format_exc(), language="python")
+
+    with _tab_review:
+        # 事后统计都归这里：批次复盘 + 归因、以及机器自采样本的逻辑有效性验证
+        try:
+            band_review_ui()
+        except Exception as e:
+            _log("band_review_ui", e)
+            st.warning("策略复盘面板渲染出错（已拦截，不影响其他功能）")
+            with st.expander("查看错误详情"):
+                st.code(traceback.format_exc(), language="python")
+        try:
+            band_sample_ui()
+        except Exception as e:
+            _log("band_sample_ui", e)
+            st.warning("逻辑验证面板渲染出错（已拦截，不影响其他功能）")
+            with st.expander("查看错误详情"):
+                st.code(traceback.format_exc(), language="python")
+
+    with _tab_ai:
+        st.caption("自选股、参数、AI Key、微信提醒、波段记忆同步都在**左侧边栏**；"
+                   "这里只放日常问盘面的对话框。")
         st.subheader("💬 DeepSeek AI")
         if 'messages' not in st.session_state: st.session_state.messages = []
         if 'history_questions' not in st.session_state: st.session_state.history_questions = []
