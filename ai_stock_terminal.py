@@ -2159,8 +2159,6 @@ def band_batch_create(batches, codes, source, note='', rule_version=REVIEW_RULE_
     }
     return batch_id
 
-_BENCH_CACHE = {}
-
 def _get_index_history(full_symbol, limit=300):
     """指数日线。**必须传完整符号**（如 sh000300）——指数不能走 _quote_prefix，
     因为 000300 会被判成 sz000300（那是个不存在的股票代码）。仍复用统一取数层。
@@ -2179,16 +2177,46 @@ def _get_index_history(full_symbol, limit=300):
             continue
     return None
 
+def _clear_bench_cache():
+    """清掉基准缓存。测试里的 st 替身把 cache_data 做成了透传装饰器（没有 .clear），
+    所以这里要容忍 AttributeError。"""
+    try:
+        _bench_history_fetch.clear()
+    except AttributeError as e:
+        _log("_clear_bench_cache", e)
+
+
 def _bench_history(force=False):
-    """基准（沪深300）日线，按自然日缓存，同一天内多处调用只取一次。
-    取数失败**不写缓存**，否则一次网络抖动会让当天所有复盘都拿不到基准。"""
-    key = now_cn().strftime('%Y-%m-%d')
-    if not force and _BENCH_CACHE.get('key') == key and _BENCH_CACHE.get('df') is not None:
-        return _BENCH_CACHE['df']
+    """基准（沪深300）日线。**跨重跑**按自然日缓存：同一天里多处调用 / 反复交互都只取一次。
+    取数失败**不写缓存**（抛异常绕过缓存），下一次调用会重试。
+
+    ★ 这里踩过一个大坑：原来用模块级 dict `_BENCH_CACHE` 记缓存 —— 但 Streamlit 每次交互
+      都会**重新 exec 整个脚本**，模块级变量跟着被重置，那份"按自然日缓存"其实只在
+      一个重跑周期内有效。结果就是用户**每点一次按钮都真去拉一次沪深300日线**，
+      实测 0.76s/次，占掉一次重跑的四分之一（2026-09-20 用 cProfile 量出来的）。
+      **凡是"想跨越重跑活下来"的状态，都必须交给 st.cache_data / st.session_state。**
+    """
+    try:
+        if force:
+            _clear_bench_cache()
+        return _bench_history_fetch(now_cn().strftime('%Y-%m-%d'))
+    except Exception as e:
+        _log("_bench_history", e)
+        return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _bench_history_fetch(day_key):
+    """真正去取数的那一层。`day_key` 只为让缓存按自然日失效，不参与取数。
+
+    ★ 取名**不要加下划线前缀**：Streamlit 会把下划线开头的参数**排除出缓存键**，
+      那样跨天也不会重新取，一直拿昨天的基准。
+    ★ 取数失败必须 **raise**：st.cache_data 不缓存抛异常的调用，但**会**缓存 None ——
+      直接返回 None 会让一次网络抖动污染当天所有复盘。
+    """
     df = _get_index_history(REVIEW_BENCH_SYMBOL)
-    if df is not None:
-        _BENCH_CACHE['key'] = key
-        _BENCH_CACHE['df'] = df
+    if df is None or len(df) < 60:
+        raise RuntimeError("基准（沪深300）日线取数失败")
     return df
 
 def _bench_above_ma20(bench_df):
@@ -3681,30 +3709,54 @@ def band_samples_harvest(codes, source='backfill', lookback_days=0, fetch=None,
 # ---------------- 存储：本地 JSONL.gz（原始行是唯一事实来源，聚合一律从它现算）----------------
 
 def load_band_samples(path=None, cap=None):
-    """读样本库，返回 {key: row}。文件不存在返回空 dict（首次运行是正常情况，不是错误）。"""
+    """读样本库，返回 {key: row}。文件不存在返回空 dict（首次运行是正常情况，不是错误）。
+
+    ★ 解析结果按 (路径, cap, 文件 mtime+size) 缓存：这份语料是数 MB 的 gzip JSONL，
+      解压+解析实测约 0.57s，而 Streamlit **每次交互都会重跑整个脚本** ——
+      不缓存的话用户每点一个按钮都要白付一次（实测占一次重跑的 ~18%）。
+      用 mtime+size 当缓存键：采集进程写完文件后自动失效，不需要谁记得手动清缓存。
+    """
     p = path or SAMPLE_FILE
-    out = {}
     if not os.path.exists(p):
-        return out
+        return {}
     try:
-        with gzip.open(p, "rt", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except Exception as e:
-                    _log("load_band_samples/line", e)
-                    continue
-                if not isinstance(row, dict) or not row.get("code") or not row.get("date"):
-                    continue
-                out[_sample_key(row["code"], row["date"], row.get("source"))] = row
-                if cap and len(out) >= cap:
-                    break
+        _st_ = os.stat(p)
+        _stamp = "%d:%d" % (_st_.st_mtime_ns, _st_.st_size)
+    except OSError as e:
+        _log("load_band_samples/stat", e)
+        _stamp = "unknown"
+    try:
+        return _load_band_samples_parsed(p, cap, _stamp)
     except Exception as e:
         _log("load_band_samples", e)
         return {}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _load_band_samples_parsed(p, cap, stamp):
+    """解压 + 解析 JSONL.gz。`stamp` 不参与解析，只是缓存键的一部分。
+
+    ★ 参数别加下划线前缀：Streamlit 会把下划线开头的参数排除出缓存键，
+      那样文件更新了也永远读到旧结果。
+    ★ 让异常**抛出去**（外层 load_band_samples 兜住）：st.cache_data 不缓存抛异常的调用，
+      所以损坏的文件不会被缓存成「空库」而长期显现为「没有样本」。
+    """
+    out = {}
+    with gzip.open(p, "rt", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception as e:
+                _log("load_band_samples/line", e)
+                continue
+            if not isinstance(row, dict) or not row.get("code") or not row.get("date"):
+                continue
+            out[_sample_key(row["code"], row["date"], row.get("source"))] = row
+            if cap and len(out) >= cap:
+                break
     return out
 
 
