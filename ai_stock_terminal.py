@@ -4764,11 +4764,23 @@ def band_memory_ui():
                 save_band_memory(mem)
                 band_memory_push_github(mem)
                 st.rerun()
-            if n3.button("🗑️ 从记忆中删除", use_container_width=True, key=f"bandmem_del_{code}"):
+            if n3.button("🗑️ 从记忆中删除", use_container_width=True, key=f"bandmem_del_{code}",
+                         help="从本地和云端清单里一起移除，之后不再监控这只票"):
+                # ★★ 这里必须是 merge_remote=False（同「🧹 清理记忆」那处）。
+                #   默认 True 会先拉云端那份再合并，而 band_memory_merge_digest 对
+                #   「云端有、本地没有」的条目是**整节点照抄** → 刚删掉的票立刻被复活，
+                #   还顺手 _save_json 写回本地 → 用户看到的就是「点了删除没反应」（2026-09-20 实测）。
+                _del_name = node.get('name') or code
                 mem['stocks'].pop(code, None)
                 save_band_memory(mem)
-                band_memory_push_github(mem)
-                st.session_state.band_memory_sync_msg = f"已删除 {node.get('name')}（{code}）"
+                _del_ok, _del_msg = band_memory_push_github(mem, merge_remote=False)
+                if _del_ok:
+                    st.session_state.band_memory_sync_msg = f"已删除 {_del_name}（{code}）"
+                else:
+                    # ★ 同步失败就别报「已删除」：云端那份还在，下次合并会把它拉回来。
+                    st.session_state.band_memory_sync_msg = (
+                        f"⚠️ 已在本地删除 {_del_name}（{code}），但云端同步失败（{_del_msg}）——"
+                        "下次同步时它可能被云端那份合并回来，请检查 GITHUB_TOKEN")
                 st.rerun()
 
     with st.expander("☁️ 云端推送（微信）怎么配", expanded=False):
