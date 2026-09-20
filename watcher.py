@@ -75,6 +75,8 @@ _HTTP_HEADERS = {
     "Accept": "*/*",
 }
 _QQ_HOSTS = ["https://web.ifzq.gtimg.cn", "https://ifzq.gtimg.cn"]   # 腾讯主/备域名
+# 备用日线源（与网页端同顺序）：东财前复权（与腾讯同口径）→ 新浪不复权（最后兜底）
+_EM_KLINE_HOSTS = ["https://push2his.eastmoney.com", "https://push2.eastmoney.com"]
 
 def http_get(url, timeout=(5, 10), retries=2, encoding=None):
     """带 UA / 超时 / 重试的 GET。返回 (ok, text, err)，绝不抛异常。
@@ -111,6 +113,22 @@ def http_get_json(url, timeout=(5, 10), retries=2):
 # 若被误判成 sz 前缀，接口会返回空数据，监控将静默跳过该股票。
 _BJ_PREFIXES = ('43', '83', '87', '88', '92')
 _SH_BOND_PREFIXES = ('110', '111', '113', '118', '119')
+
+def em_secid(code):
+    """东财 secid：沪市 `1.`，深市 / 北交所 `0.`。
+
+    ⚠️ 必须与 ai_stock_terminal.py 的 `_em_secid` 保持完全一致（两边都在查东财，
+    规则漂移会让网页端能取到、巡检取不到 —— 那就成了「网页正常、微信不动」）。
+    """
+    s = str(code).strip().lower()
+    if s.startswith("sh"):
+        return "1." + s[2:]
+    if s.startswith(("sz", "bj")):
+        return "0." + s[2:]
+    if s.startswith(("5", "6", "9", "110", "111", "113", "118", "119")):
+        return "1." + s
+    return "0." + s
+
 
 def quote_prefix(symbol):
     s = str(symbol).strip()
@@ -268,11 +286,42 @@ def get_minute_data(code):
 
 # ============ 日线数据（用于波段结束预警）============
 
-def _get_daily_history(symbol):
-    """获取日线前复权数据（波段结束预警用）。腾讯主/备域名轮询，返回至少 60 条。
+def _kline_rows_to_df(kline):
+    """把「日期,开,收,高,低,量」的行列表规整成日线 DataFrame（腾讯/东财共用）。
 
-    原先只打单个域名且 prefix 用 startswith 硬判，北交所/沪市转债会拿不到数据。"""
+    返回 df 或 None；**不抛异常**（列数不对、全脏值都只是 None，由调用方继续试下一个源）。
+    不足 60 条也返回 None —— 波段判定需要 60 日窗口，凑不够就当没拿到。
+    """
+    try:
+        df = pd.DataFrame(kline)
+        if df.shape[1] < 6:
+            return None
+        df = df.iloc[:, :6]
+        df.columns = ['Date', 'Open', 'Close', 'High', 'Low', 'Volume']
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        for col in ['Open', 'Close', 'High', 'Low', 'Volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.dropna(subset=['Date', 'Close']).sort_values('Date').reset_index(drop=True)
+        return df if len(df) >= 60 else None
+    except Exception as e:
+        print(f"  日线解析失败: {e}")
+        return None
+
+
+def _get_daily_history(symbol):
+    """获取日线（波段结束预警用）。腾讯 → 东财 → 新浪 依次兜底，凑够 60 条才返回。
+
+    ★★ 2026-09-20 补兜底（这是「波段提醒静默停摆」的已知缺口）：
+      原先只轮询腾讯 `_QQ_HOSTS`，而腾讯的前复权(qfq)接口会**间歇性 HTTP 200 + 空 body** ——
+      一抖就整轮巡检评不出状态、什么都不推，**并且日志里看不出异常**（接口没报错，只是空）。
+      网页端早就有兜底、巡检没有，于是出现「网页正常、微信不动」这种最难查的形态。
+      现在两边顺序一致：东财(前复权，与腾讯同口径) 第二，新浪(不复权) 最后。
+    ⚠️ 用新浪兜底时会打印警告：不复权在除权日会出现价格断层，可能误判「跌破支撑」。
+    原先只打单个域名且 prefix 用 startswith 硬判，北交所/沪市转债会拿不到数据。
+    """
     code = get_code(symbol)
+
+    # ---- 源 1：腾讯（前复权，主/备域名轮询）----
     for host in _QQ_HOSTS:
         ok, js, err = http_get_json(f"{host}/appstock/app/fqkline/get?param={code},day,,,260,qfq")
         if not ok:
@@ -285,21 +334,54 @@ def _get_daily_history(symbol):
         if not kline:
             print(f"  日线为空 {code}（该代码可能不受腾讯支持）")
             continue
-        try:
-            df = pd.DataFrame(kline)
-            if df.shape[1] < 6:
-                continue
-            df = df.iloc[:, :6]
-            df.columns = ['Date', 'Open', 'Close', 'High', 'Low', 'Volume']
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-            for col in ['Open', 'Close', 'High', 'Low', 'Volume']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            df = df.dropna(subset=['Date', 'Close']).sort_values('Date').reset_index(drop=True)
-        except Exception as e:
-            print(f"  日线解析失败 {code}: {e}")
-            continue
-        if len(df) >= 60:
+        df = _kline_rows_to_df(kline)
+        if df is not None:
             return df
+
+    # ---- 源 2：东方财富（前复权，与腾讯同口径）----
+    for host in _EM_KLINE_HOSTS:
+        # ★ 不传 beg：带上 `beg=0` 东财会忽略 lmt、把 1999 年至今全部历史都吐回来（实测）
+        ok, js, err = http_get_json(
+            f"{host}/api/qt/stock/kline/get?secid={em_secid(code)}&klt=101&fqt=1"
+            f"&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56"
+            f"&end=20500101&lmt=260")
+        if not ok:
+            print(f"  东财日线不可用 {host}: {err}")
+            continue
+        data = (js or {}).get("data") if isinstance(js, dict) else None
+        klines = (data or {}).get("klines") if isinstance(data, dict) else None
+        if not klines:
+            print(f"  东财日线为空 {code}")
+            continue
+        _rows = []
+        for _line in klines:
+            _p6 = str(_line).split(",")
+            if len(_p6) >= 6:
+                _rows.append([_p6[0], _p6[1], _p6[2], _p6[3], _p6[4], _p6[5]])
+        df = _kline_rows_to_df(_rows)
+        if df is not None:
+            print("  ℹ️ 日线来自东财（前复权，与腾讯同口径）")
+            return df
+
+    # ---- 源 3：新浪（**不复权**，最后兜底；除权日可能误判，必须留痕）----
+    _ok, _js, _err = http_get_json(
+        "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        f"CN_MarketData.getKLineData?symbol={code}&scale=240&ma=no&datalen=260")
+    if _ok and isinstance(_js, list) and _js:
+        _rows = []
+        for _it in _js:
+            if isinstance(_it, dict):
+                _rows.append([_it.get('day'), _it.get('open'), _it.get('close'),
+                              _it.get('high'), _it.get('low'), _it.get('volume')])
+        df = _kline_rows_to_df(_rows)
+        if df is not None:
+            print("  ⚠️ 日线来自新浪（**不复权**）—— 除权日可能出现价格断层，"
+                  "若本条预警看起来不合理请以券商行情为准")
+            return df
+    else:
+        print(f"  新浪日线不可用: {_err}")
+
+    print(f"  ⛔ {code} 三个源都拿不到日线（腾讯/东财/新浪）—— 本次无法评估波段状态")
     return None
 
 
