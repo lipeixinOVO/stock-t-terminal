@@ -61,12 +61,17 @@ CACHE_DIR = os.environ.get("SAMPLE_CACHE_DIR") or os.path.join(HERE, ".sample_ca
 PART_FMT = os.path.join(CACHE_DIR, "_part_{i}.jsonl.gz")
 FORWARD_FILE = os.path.join(HERE, "band_samples_forward.enc")  # 前瞻语料快照（发布给网页端读）
 
-# 前瞻语料快照的条数上限。★ 为什么只导出 forward、还要设上限：
+# 前瞻语料快照的条数上限。★ 为什么只导出 forward、上限又是多少（实测口径，别凭感觉改）：
 #   ① forward 才是「真实判断、能当成绩用」的那一类，backfill 自带前视/生存者偏差，
 #      只能提假设 —— 网页端统计前瞻那几栏只需要它；
-#   ② 快照每天都会被发布一次，条数越多传输越慢，而超过一定量之后统计口径不再变化
-#      （band_sample_lift 要的是分桶样本量，不是全部历史）。超限时保留**最新**的那批。
-FORWARD_EXPORT_MAX = 20000
+#   ② **一次全市场前瞻采集 ≈ 3711 条**（实测 2026-09-18 那批：一只股票一条横截面，
+#      分层 base_ctrl 2251 / trend_ctrl 961 / near_vol 467 / signal 22 / near_break 10）。
+#      ★ 这里曾按回填的"每天 40~80 条"估算，那是错的：回填的每日条数被"预筛 + 1/N 抽样"
+#        压过，而前瞻是**整段横截面**，两者量级差两个数量级。
+#   ③ 上限按「约 16 个交易日」定：3711 × 16 ≈ 6 万。太小（比如 2 万 ≈ 5 天）会让
+#      band_sample_lift 的 70/30 时间切分只覆盖一周，样本外结论没有意义；
+#      太大则网页每次打开要下十几 MB、容器内存也吃紧。超限时保留**最新**的那批。
+FORWARD_EXPORT_MAX = 60000
 
 # ---------- 要从主应用里抽出来执行的符号（与 _debug_probe 的回归测试同一套集合）----------
 NET_FUNCS = {
