@@ -1,0 +1,97 @@
+name: 每日全量日报（微信）
+
+# 定位：每天收盘后（北京 18:00，周一至周五）推一条「今天干了什么、有什么发现」的汇总。
+#
+# 与 notify.yml 的分工：notify 每 5 分钟跑，只负责「盘中命中就立刻推」，要的是及时；
+# 这里一天只跑一次，负责**日终汇总**：语料攒了多少、逻辑有没有出现超额、记忆里有哪些变化、
+# 今天推了多少条、数据源健康不健康。
+#
+# 数据从哪来（都是只读，本工作流**不回写任何文件**）：
+#   ① 语料：承接 sample-harvest 的缓存 band_samples.enc（加密，需要 BAND_KEY）
+#   ② 波段摘要：仓库里的 band_watch.json（由网页端/巡检维护）
+#   ③ 今日推送：承接 notify.yml 的缓存 notify_log.json
+#   ④ 自己的状态：digest_state.json，用来算「相对昨天有哪些变化」
+
+on:
+  schedule:
+    # 北京 18:00 = UTC 10:00（周一至周五）
+    - cron: "0 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      dry:
+        description: "只生成不推送（调试用）"
+        required: false
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-digest
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install requests pandas numpy cryptography
+
+      - name: 计算缓存键（北京日期）
+        id: ckey
+        run: echo "key=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      - name: 恢复语料（承接盘后采集的结果）
+        uses: actions/cache/restore@v4
+        with:
+          path: band_samples.enc
+          key: band-samples-${{ steps.ckey.outputs.key }}-${{ github.run_id }}
+          restore-keys: |
+            band-samples-
+
+      - name: 恢复今日推送记录（承接巡检的结果）
+        uses: actions/cache/restore@v4
+        with:
+          path: notify_log.json
+          key: notify-log-${{ steps.ckey.outputs.key }}-${{ github.run_id }}
+          restore-keys: |
+            notify-log-
+
+      - name: 恢复日报状态（用来算「今日变化」）
+        uses: actions/cache/restore@v4
+        with:
+          path: digest_state.json
+          key: digest-state-${{ steps.ckey.outputs.key }}-${{ github.run_id }}
+          restore-keys: |
+            digest-state-
+
+      - name: 生成并推送日报
+        env:
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          BAND_KEY: ${{ secrets.BAND_KEY }}
+          DIGEST_DRY: ${{ github.event.inputs.dry == '1' && '1' || '0' }}
+        run: python daily_digest.py
+
+      - name: 保证状态文件存在
+        if: always()
+        run: |
+          if [ ! -f digest_state.json ]; then echo '{}' > digest_state.json; fi
+          echo "---- 日报状态 ----"
+          cat digest_state.json
+
+      - name: 保存日报状态（供明天对比）
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: digest_state.json
+          key: digest-state-${{ steps.ckey.outputs.key }}-${{ github.run_id }}
