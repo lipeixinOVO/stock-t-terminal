@@ -163,12 +163,14 @@ DYNAMIC_POOL_FILE = os.path.join(BASE_DIR, "dynamic_pool.json")
 NOTIFY_LOG_FILE = os.path.join(BASE_DIR, "notify_log.json")
 BAND_MANUAL_FILE = os.path.join(BASE_DIR, "band_manual_list.json")
 # 波段记忆：把扫描出的「值得跟踪」的股票持久化，并记录状态变化轨迹。
-# ⚠️ 本文件含隐私（手写备注、入选价），**只留在本地容器，禁止提交**（已加入 .gitignore）。
-#    巡检需要的脱敏摘要另存为仓库里的 band_watch.json，见 _band_memory_digest()。
+# 本文件是本地权威副本（含手写备注、入选价），不单独提交（已加入 .gitignore）。
+# ★ 仓库里的 band_watch.json 是它的**完整镜像**（不再做字段裁剪），见 _band_memory_digest()。
 BAND_MEMORY_FILE = os.path.join(BASE_DIR, "band_memory.json")
 # 策略复盘的批次档案（哪一批选了哪些票、每笔结案结果与归因）。
-# ⚠️ 同 band_memory.json 一样含隐私（批次名单、收益率、胜率），**只留本地，禁止提交**。
-#    刻意不进 band_watch.json 的脱敏摘要：收益率曲线属于交易绩效，公开了等于公开持仓表现。
+# 本地文件，不单独提交；目前**也**没有并进 band_watch.json —— 理由不是保密，而是：
+#   ① 结案结果是按日线回溯重算出来的，点一下「🔄 重算」就能复现，不存在"丢了就找不回"；
+#   ② 多一条同步链路就多一处冲突要处理。
+# 真要它也跨容器存活，把 `batches` 一起并进 _band_memory_digest() 即可。
 BAND_BATCHES_FILE = os.path.join(BASE_DIR, "band_batches.json")
 
 def _load_json(path, default):
@@ -1633,8 +1635,9 @@ VERDICT_LABEL = {
 }
 
 GITHUB_REPO = "lipeixinOVO/stock-t-terminal"
-# 提交到仓库的是「脱敏摘要」；完整记忆（含备注/入选价）只留在本地容器。
-# ⚠️ 本仓库是 public，所以两个文件职责必须严格区分，不要把 band_memory.json 提交上去。
+# 提交到仓库的是 band_watch.json —— 它是本地完整记忆的**完整镜像**（2026-09-20 起不再裁剪字段）；
+# 本地那份 band_memory.json 本身仍旧不提交（避免同一份数据两条提交链路互相踩）。
+# ⚠️ 本仓库是 public：想保密就配 BAND_KEY（提交上去的是密文），**不要靠删字段**。
 GITHUB_WATCH_PATH = "band_watch.json"
 
 
@@ -2234,14 +2237,16 @@ def _github_headers(token):
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "stock-t-terminal"}
 
-# ============ 波段摘要加密（可选，用于隐藏「关注了哪些股票」）============
-# 背景：本仓库是 public。脱敏摘要虽然不含备注/入选价，但仍含股票代码清单。
+# ============ 波段记忆同步加密（可选，用于隐藏「关注了哪些股票」）============
+# 背景：本仓库是 public。提交上去的 band_watch.json 现在是**完整记忆**（含备注/入选价），
+# 所以「加密」不再只是可选项，而是**唯一的保密手段** —— 字段裁剪那套已经废掉了
+# （见 _band_memory_digest 的说明：删字段挡不住想读的人，却会把功能砍掉一半）。
 # 为什么不直接改成 Private：public 仓库的 Actions 完全免费、不限分钟；private 仓库只有
 # 2000 分钟/月，而本项目「定时巡检 + 保活」约需 7800 分钟/月，额度烧穿后 GitHub 会
 # **静默停掉**定时任务 —— 那样你反而收不到任何提醒。所以正确做法是保持 public，
-# 把摘要文件**加密**后再提交：Streamlit Secrets 与 GitHub Actions Secrets 各加一个
+# 把文件**加密**后再提交：Streamlit Secrets 与 GitHub Actions Secrets 各加一个
 # 同名的 BAND_KEY（两边值必须一致）。未配置 BAND_KEY 时保持明文（与历史行为一致），
-# 页面会明确提示「摘要未加密」。
+# 页面会明确提示「云端摘要未加密」。
 
 _ENC_FIELD = "enc"
 _ENC_VERSION = 1
@@ -2328,40 +2333,47 @@ def generate_band_key():
     return Fernet.generate_key().decode("ascii")
 
 def _band_memory_digest(mem):
-    """从完整记忆里提取「可公开」的最小摘要，用于提交到仓库。
+    """把本地完整记忆导出成「提交到仓库」的那一份 —— **整节点原样导出，不做任何字段裁剪**。
 
-    ⚠️ 为什么必须脱敏：本项目的 GitHub 仓库是 **public** 的。完整记忆里包含
-    用户手写的备注（例如「14.20 买了2成」这一类的持仓信息）和入选价、扫描快照，
-    这些东西一旦提交就等于公开自己的持仓思路。所以只同步巡检真正需要的字段：
-    代码、名称、当前状态、状态时间、轨迹（时间/状态/当时市价）、去重记录。
-    市价是公开行情数据，不涉及隐私；备注与入选价永远留在本地容器。"""
-    digest = {"version": BAND_MEMORY_VERSION, "updated_at": now_cn_str(), "stocks": {}}
+    ★ 2026-09-20 改，别再改回去：这里原来做「脱敏」—— 只挑 code/name/status/status_ts/
+      last_check/closed/alerts/history 这 8 个白名单字段，把 note（手写备注）、
+      added_price（入选价）、platform_high（平台高点）、snapshot、added_at/added_source
+      全部丢掉，理由是"仓库是 public"。
+
+      代价是**真的丢数据**，而且丢的都是本地没有第二份的东西：
+        · 手写备注只在本地容器里 → 容器一重启就**永久消失**（云端那份里根本没这个字段）；
+        · platform_high 不在导出里 → 恢复后只能显示「暂缺：还没刷新过，拿不到平台高点」；
+        · added_price 不在导出里 → 启动价只能靠入册轨迹推算，界面上得标「（推算）」。
+      而且白名单本身就是一类静默故障源：漏一个字段不会报错，只是悄悄少个值
+      —— platform_high 就是这么漏的，靠人工比对才发现。
+
+      现在的口径（用户明确表示**保密性不重要、只看功能**）：
+        **仓库那份 = 完整记忆，两端结构完全一致。**
+      想保密就交给 Fernet 加密（配了 BAND_KEY，提交上去的就是密文），**而不是靠删字段**：
+      删字段挡不住真想看的人（代码清单照样是公开的），却会把功能砍掉一半。"""
+    out = {"version": BAND_MEMORY_VERSION, "updated_at": now_cn_str(), "stocks": {}}
     for code, node in (mem.get('stocks') or {}).items():
         if not isinstance(node, dict):
             continue
-        hist = []
-        for h in (node.get('history') or []):
-            if not isinstance(h, dict):
-                continue
-            hist.append({k: h.get(k) for k in ("ts", "status", "price", "ma20", "event")
-                         if h.get(k) is not None})
-        digest["stocks"][code] = {
-            "code": node.get("code", code),
-            "name": node.get("name", ""),
-            "status": node.get("status", ""),
-            "status_ts": node.get("status_ts", ""),
-            "last_check": node.get("last_check", ""),
-            "closed": bool(node.get("closed")),
-            "alerts": dict(node.get("alerts") or {}),
-            "history": hist,
-        }
-    return digest
+        try:
+            # 本地记忆本来就靠 _save_json(json.dump) 落盘，所以节点几乎必然已是 JSON 安全的；
+            # 这一探只为「万一有怪值」时留下可定位的日志，而不是让整次同步莫名失败。
+            json.dumps(node, ensure_ascii=False)
+            out["stocks"][code] = dict(node)
+        except Exception as e:
+            _log("_band_memory_digest:node", e)
+            out["stocks"][code] = json.loads(json.dumps(node, ensure_ascii=False, default=str))
+    return out
 
 def band_memory_merge_digest(local, digest):
-    """把仓库里的摘要合并回本地完整记忆。
+    """把仓库里那一份（完整镜像）合并回本地完整记忆。
 
-    只吸收「状态 / 状态时间 / 轨迹 / 归档」这些巡检能产出的信息；
-    **备注、入选价、扫描快照一律保留本地值**，绝不被云端覆盖。
+    冲突口径（★ 别改，这是两端不互相踩的前提）：
+      · 状态/状态时间 → 取 `status_ts` 较新的一方（巡检可能比网页端新）；
+      · 轨迹、各告警的最近推送时间 → 并集去重；
+      · `closed` → **本地说了算**（用户手动归档的意图不能被云端覆盖）；
+      · 其余字段（备注/入选价/平台高点/快照/复盘结果…）→ **本地非空以本地为准**，
+        本地为空才用云端的值补上（容器重启后本地只剩个壳，能补就补，省得界面显示「暂缺」）。
     """
     out = _band_memory_empty()
     local_stocks = dict((local or {}).get('stocks') or {})
@@ -2373,19 +2385,29 @@ def band_memory_merge_digest(local, digest):
             continue
         l_node = local_stocks.get(code)
         if l_node is None:
-            # 云端有、本地没有（一般是容器重启后本地丢过）：按摘要重建一条最小记录
-            node = {
-                "code": code, "name": r_node.get("name") or code,
-                "added_at": r_node.get("status_ts") or "",
-                "added_price": None, "added_status": r_node.get("status") or "",
-                "added_source": "云端巡检", "snapshot": {}, "note": "",
-                "closed": bool(r_node.get("closed")),
-                "status": r_node.get("status") or "", "status_ts": r_node.get("status_ts") or "",
-                "price": None, "history": [],
-            }
-            for h in (r_node.get("history") or []):
-                if isinstance(h, dict):
-                    node["history"].append(dict(h))
+            # 云端有、本地没有（一般是容器重启后本地丢过）：**整节点照抄云端**。
+            # ★ 以前这里只搬写死的白名单字段、note/added_price 一律置空 → 手写备注只要本地
+            #   丢了就永久找不回来（而云端那份里明明是有的）；而且清单是硬编码的，
+            #   漏一个字段不报错、只是悄悄少个值。所以这里改成 dict(r_node) 整体照抄，
+            #   下面几个 setdefault 只负责把**缺的结构性字段**补成合法默认值。
+            node = dict(r_node)
+            node["code"] = r_node.get("code") or code
+            node["name"] = r_node.get("name") or code
+            # added_at：新格式里云端直接有；没有时退回 status_ts（旧版本留下的副本没这个字段）
+            node["added_at"] = r_node.get("added_at") or r_node.get("status_ts") or ""
+            node.setdefault("added_price", None)
+            node["added_status"] = (r_node.get("added_status")
+                                    or r_node.get("status") or "")
+            node["added_source"] = r_node.get("added_source") or "云端巡检"
+            node.setdefault("snapshot", {})
+            node.setdefault("note", "")
+            node["closed"] = bool(r_node.get("closed"))
+            node.setdefault("status", "")
+            node.setdefault("status_ts", "")
+            node.setdefault("last_check", "")
+            node.setdefault("price", None)
+            node["history"] = [dict(h) for h in (r_node.get("history") or [])
+                               if isinstance(h, dict)]
             out['stocks'][code] = node
             continue
 
@@ -2416,6 +2438,20 @@ def band_memory_merge_digest(local, digest):
             if k not in alerts or str(v) > str(alerts[k]):
                 alerts[k] = v
         l_node["alerts"] = alerts
+        # ★ 吸收「本地空着、云端有值」的字段：容器重启后本地可能只剩个壳，而这些值云端
+        #   那份里现在也有（导出不再裁剪），能补就补，省得界面显示「暂缺」。
+        #   只在本地确实为空时才补 —— 本地非空永远以本地为准（本地是权威副本）。
+        #   ⚠️ 写成通用循环、不列字段名：写死清单就是静默故障源（漏一个不报错，只是悄悄
+        #   少个值 —— platform_high 当年就是这么漏的）。新增节点字段会自动覆盖。
+        #   排除集 = 上面已经按各自规则处理过、或必须由本地说了算的字段：
+        #     code/name 身份、status/status_ts/last_check 走时间戳仲裁、
+        #     history/alerts 走并集、closed 由用户归档意图决定。
+        _keep_local = {"code", "name", "status", "status_ts", "last_check",
+                       "history", "alerts", "closed"}
+        for _f in (set(r_node) - _keep_local):
+            if not l_node.get(_f) and r_node.get(_f) is not None:
+                _v = r_node[_f]
+                l_node[_f] = dict(_v) if isinstance(_v, dict) else _v
         # closed 以本地为准（用户手动归档的意图不能被云端覆盖）
     return out
 
@@ -2511,13 +2547,13 @@ def band_memory_autosync(mem):
 
 
 def band_memory_push_github(mem, merge_remote=True):
-    """把「脱敏摘要」提交到仓库。返回 (ok, msg)。
+    """把记忆提交到仓库（`band_watch.json`）。返回 (ok, msg)。
 
-    merge_remote=True 时先拉取云端摘要并合并（原地更新 mem），这样巡检脚本写入的
+    merge_remote=True 时先拉取云端那份并合并（原地更新 mem），这样巡检脚本写入的
     状态变化不会被网页端覆盖。冲突（409/422）时重取 sha 再试一次。
 
-    ⚠️ 提交的是 `_band_memory_digest(mem)`，**不含备注/入选价**（仓库是 public 的）。
-    若配置了 BAND_KEY，还会再用 Fernet 整段加密后才提交，连代码清单也一并隐藏。"""
+    提交的是 `_band_memory_digest(mem)` —— **完整记忆、不做字段裁剪**（2026-09-20 起）。
+    若配置了 BAND_KEY，还会再用 Fernet 整段加密后才提交（此时连代码清单都是密文）。"""
     token = _github_token()
     if not token:
         return False, "未配置 GitHub Token（在 Streamlit Secrets 加 GITHUB_TOKEN 即可自动同步）"
@@ -2646,11 +2682,12 @@ def _band_num(v):
 def band_start_price(node):
     """取该股的启动价（= 入选价 added_price），取不到时用轨迹兜底。
 
-    ★ 为什么需要兜底（别删）：云端摘要 `band_watch.json` **不包含 added_price**
-      （隐私字段一律不上传），所以容器一旦重启、本地记忆丢失后从云端重建，
-      `added_price` 就是 None —— 阶段进度会永远显示不出来。
-      但 `history` 是**会同步**的、且每条都带 `price`，入册那一条的 price 即启动价。
-      所以「轨迹里最早一条的价格」是可靠的近似来源（轨迹上限 40 条，正常远够不到）。
+    ★ 为什么保留兜底（别删）：2026-09-20 起 `band_watch.json` 已是完整镜像、
+      `added_price` 会一起同步，所以正常情况下走不到兜底分支了。
+      但兜底仍有价值：① 升级前留下的旧云端副本没有这个字段；
+      ② 节点不完整（手工编辑/半途写入）时不能把「阶段进度」直接判死 —— 显示不出来用户
+      根本没法用。`history` 里入册那一条的 `price` 就是启动价，是可靠的近似来源
+      （轨迹上限 40 条，正常远够不到）。
     """
     p = _band_num(node.get("added_price"))
     if p > 0:
@@ -4056,8 +4093,9 @@ def band_memory_ui():
     st.header("🧠 波段记忆")
     st.caption("扫描到**波段启动确认**才会自动记在这里（结束预警只更新已在册的股票，"
                "不会新建条目）；记录入选时间、入选价和之后每一次状态变化。")
-    st.caption("🔒 备注与入选价**只存在本地容器**；同步到仓库的只是「代码 + 状态」摘要"
-               "（你的仓库是公开的，所以隐私字段一律不上传）。")
+    st.caption("☁️ 同步到仓库的是**完整记忆**（含备注、入选价、平台高点），不是裁剪版 —— "
+               "这样容器重启后手写备注也能找回来。配了 BAND_KEY 时提交上去的是**密文**；"
+               "没配就是明文（你的仓库是公开的，请自行取舍）。")
 
     # ---- 首次进入本会话时静默拉取云端记忆，避免本地文件被容器重启清空后一无所知 ----
     if not st.session_state.get('band_memory_pulled_once'):
@@ -4413,8 +4451,10 @@ def band_memory_ui():
         每 5 分钟读一次，发现状态**变差**（→ 顶背离预警 / 跌破支撑）就推送微信，
         你关掉本页也能收到。
 
-        **隐私说明（重要）**：本仓库是 **public**，所以提交上去的只有
-        代码、名称、当前状态、状态时间和轨迹，**不含**你写的备注、入选价和扫描快照。
+        **同步说明**：提交到仓库的是**完整记忆** —— 代码、名称、当前状态、轨迹，
+        以及你写的备注、入选价、平台高点，**不再做字段裁剪**（这样容器重启后备注不会丢）。
+        配了 `BAND_KEY` 时提交的是**密文**，仓库公开也读不出内容；
+        没配 `BAND_KEY` 提交的就是明文，请自行取舍。
 
         ⚠️ **不要直接把仓库改成 Private**。本项目的定时巡检（每 5 分钟一次）
         加保活（每 10 分钟一次），合计约 **7800 分钟/月**，而 private 仓库的免费额度
