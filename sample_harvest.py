@@ -78,6 +78,11 @@ NET_FUNCS = {
     "_log", "_http_get_json", "_http_get_text", "_quote_prefix", "_get_code",
     "_safe_float", "_safe_float_or_none", "_is_st_or_risk", "_diff_to_list",
     "fetch_market_page", "_normalize_kline_rows", "_fetch_kline_qq", "_fetch_kline_sina",
+    # ★ 2026-09-20 加东方财富备用源后新增的依赖：`_get_daily_history` 会依次调
+    #   `_fetch_kline_qq → _fetch_kline_em → _fetch_kline_sina`，并过一遍熔断器。
+    #   漏了 `_feed_alive/_feed_note` → 熔断静默失效（每次仍为死源付超时）；
+    #   漏了 `_fetch_kline_em` → 第二源静默失效，等于白加。
+    "_fetch_kline_em", "_em_secid", "_feed_alive", "_feed_note",
     "_get_daily_history", "_load_json",
     # ★ `_http_get_json/_http_get_text` 内部会调 `_http_session()`；不抽它出来，
     #   这两个函数在**本文件（Actions 夜跑）**里每次请求都会 NameError，
@@ -87,6 +92,9 @@ NET_FUNCS = {
 }
 NET_CONSTS = {"_REQUEST_HEADERS", "_EM_HOSTS", "_HTTP_HEADERS", "_QQ_APP_HOSTS",
               "KLINE_CACHE_FILE", "BASE_DIR", "CONFIG_FILE", "_ENC_FIELD", "_ENC_VERSION",
+              # 备用源域名池 + 熔断器常量（`_fetch_kline_em` / `_feed_alive` / `_feed_note` 依赖）
+              "_EM_KLINE_HOSTS", "FEED_HEALTH", "FEED_DEAD_AFTER", "FEED_DEAD_SECONDS",
+              "_FEED_CODE_LEVEL",
               "_TLS_LOCAL"}
 METRIC_FUNCS = {"_calculate_band_metrics", "_band_score", "_band_status", "_band_evaluate"}
 
@@ -335,7 +343,9 @@ def market_universe(ns, verbose=True):
 def fetch_bench(ns, verbose=True):
     """基准（沪深300）日线。取不到必须**显式告知** —— 没有它就永远算不出超额收益。"""
     sym = ns["REVIEW_BENCH_SYMBOL"]
-    for fn in (ns["_fetch_kline_qq"], ns["_fetch_kline_sina"]):
+    # ★ 与网页端同顺序：腾讯(前复权) → 东财(前复权) → 新浪(不复权)。
+    #   基准按自然日只取一次，抖动一次就让整批样本的超额收益全变 None，所以必须多一个源。
+    for fn in (ns["_fetch_kline_qq"], ns["_fetch_kline_em"], ns["_fetch_kline_sina"]):
         try:
             df, src, _e = fn(sym, limit=700)
             if df is not None and len(df) >= 60:
