@@ -1714,13 +1714,19 @@ def _analyze_band(row):
         _log(f"_analyze_band/{row.get('Code', '?')}", e)
         return None
 
-def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None):
-    """波段选股主函数：全市场扫描或基于自定义股票列表，筛选突破平台+放量的波段启动股，并预警结束信号。"""
+def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None, price_cap=0.0):
+    """波段选股主函数：全市场扫描或基于自定义股票列表，筛选突破平台+放量的波段启动股，并预警结束信号。
+
+    price_cap：单股价格上限（元）。>0 时把买不起的票在**初筛阶段**就剔掉 ——
+      不光为了结果干净，更是省时间：深度分析要逐只拉 300 根日线，
+      过滤放在前面，那部分请求就完全不用发。
+    """
     progress = st.progress(0, text="正在获取股票列表...")
     # 原始结果（list[dict]）留给「波段记忆」做自动入册；DataFrame 只用于展示
     st.session_state.band_last_raw = []
 
     candidates = []; all_stocks = []
+    capped = 0                      # 被价格上限过滤掉的数量（必须写进漏斗，否则像 bug）
     if custom_codes:
         # 自定义模式：仅分析用户指定的股票
         seen = set()
@@ -1738,8 +1744,11 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None):
                 if len(parts) > 45:
                     price = _safe_float(parts[3]); change_pct = _safe_float(parts[32])
                     if price > 0:
-                        candidates.append({'Code': code_, 'Name': name, 'Price': price, 'ChangePct': change_pct,
-                                           'TotalMv': 0.0, 'MainFlow': 0.0})
+                        if price_cap and price > price_cap:
+                            capped += 1
+                        else:
+                            candidates.append({'Code': code_, 'Name': name, 'Price': price, 'ChangePct': change_pct,
+                                               'TotalMv': 0.0, 'MainFlow': 0.0})
                 else:
                     _log("screen_band_stocks/quote", f"{code_} 行情不可用（{err or '返回字段不足'}）")
             except Exception as e:
@@ -1769,17 +1778,29 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None):
             total_mv = _safe_float(s.get("f20")) / 1e8
             if price <= 0 or total_mv <= 10:
                 continue
+            if price_cap and price > price_cap:
+                capped += 1
+                continue
             change_pct = _safe_float(s.get("f3"))
             if abs(change_pct) >= 9.5:
                 continue
             candidates.append({'Code': code_, 'Name': name, 'Price': price, 'ChangePct': change_pct,
                                'TotalMv': total_mv, 'MainFlow': _safe_float(s.get("f62")) / 1e8})
 
+    # 价格上限的过滤结果必须写进漏斗 —— 否则用户看到"明明有票却扫不到"会以为是 bug
+    _cap_txt = (f"（价格上限 ≤{price_cap:.2f} 元过滤掉 {capped} 只）"
+                if (price_cap and capped) else "")
     total_cand = len(candidates)
     if not candidates:
         progress.empty()
-        st.session_state.scan_stats = "未获取到候选股票，请检查输入或稍后重试"
-        st.warning("未获取到候选股票，请检查输入或稍后重试。")
+        if capped:
+            # ★ 全被价格上限吃掉时必须说清楚，绝不能显示成"未获取到候选股票"
+            st.session_state.scan_stats = f"价格上限 ≤{price_cap:.2f} 元过滤掉了全部 {capped} 只候选"
+            st.warning(f"价格上限（≤ {price_cap:.2f} 元）把 {capped} 只候选全过滤掉了 —— "
+                       "把上限调高一些再扫。")
+        else:
+            st.session_state.scan_stats = "未获取到候选股票，请检查输入或稍后重试"
+            st.warning("未获取到候选股票，请检查输入或稍后重试。")
         return pd.DataFrame()
 
     progress.progress(15, text=f"初筛后候选 {total_cand} 只，并发深度分析中...")
@@ -1819,13 +1840,14 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None):
     progress.empty()
 
     if not scored:
-        st.session_state.scan_stats = f"拉取 {len(all_stocks)} 只 → 初筛 {total_cand} 只 → 深度分析 {len(to_scan)} 只（失败 {no_data} 只）→ 无有效结果"
+        st.session_state.scan_stats = (f"拉取 {len(all_stocks)} 只 → 初筛 {total_cand} 只{_cap_txt} → "
+                                       f"深度分析 {len(to_scan)} 只（失败 {no_data} 只）→ 无有效结果")
         return pd.DataFrame()
 
     # 排序：结束预警优先（需要关注），然后按分数降序
     status_order = {'顶背离预警': 0, '跌破支撑': 1, '波段启动确认': 2, '波段进行中': 3, '波段未形成': 4}
     scored_sorted = sorted(scored, key=lambda x: (status_order.get(x['Status'], 5), -x['Score']))
-    st.session_state.scan_stats = (f"拉取 {len(all_stocks)} 只 → 初筛 {total_cand} 只 → "
+    st.session_state.scan_stats = (f"拉取 {len(all_stocks)} 只 → 初筛 {total_cand} 只{_cap_txt} → "
                                    f"深度分析 {len(to_scan)} 只（K线失败 {no_data} 只）→ 有效 {len(scored)} 只")
     df = pd.DataFrame(scored_sorted).head(max_results).reset_index(drop=True)
     df.index = df.index + 1
@@ -1956,6 +1978,39 @@ def _band_alert_decision(old_status, new_status):
     return None
 
 
+def _band_memory_new_node(r, source, batch_id=None, bench_above=None):
+    """按**唯一一份字段表**新建一条记忆条目，返回 node。
+
+    ★ 抽出来的唯一理由：自动入册与「手动加入」必须生成**完全同构**的条目。
+      两处各抄一份字面量的话，早晚会漂移（少一个 snapshot 字段、漏掉 entry_context），
+      而这种漂移在页面上看不出来 —— 只会在几周后复盘时发现某几只票的归因是空的。
+    """
+    code = str(r.get('Code') or '').strip()
+    return {
+        "code": code, "name": r.get('Name') or code,
+        "added_at": now_cn_str(), "added_price": float(r.get('Price') or 0.0),
+        "added_status": r.get('Status'), "added_source": source,
+        "batch_id": batch_id or "",
+        "entry_context": _band_entry_context(r, bench_above),
+        "snapshot": {
+            "score": r.get('Score', 0), "ma20": r.get('MA20', 0.0),
+            "ma60": r.get('MA60', 0.0),
+            "platform_high": r.get('PlatformHigh', 0.0),
+            "vol_ratio": r.get('VolRatio', 0.0),
+            "position250": r.get('Position250', 0.0),
+            "reasons": r.get('Reasons', ''),
+        },
+        "note": "", "closed": False, "alerts": {},
+        # platform_high：动态目标价（每次刷新重算，这里先落一个入册时的值）
+        # alert_ack：「已看过该预警」的标记，值 = 当时的 status_ts。
+        #   ★ 2026-09-20 起它会随**完整镜像**一起同步（以前做字段裁剪时才不同步），
+        #   所以容器重启后**不会**再把同一条预警重复展开。
+        "platform_high": float(r.get('PlatformHigh') or 0.0),
+        "alert_ack": "",
+        "history": [],
+    }
+
+
 def band_memory_record(mem, rows, source, batch_id=None, bench_above=None):
     """把本次扫描结果中「值得跟踪」的股票写入记忆。返回新增代码列表。
 
@@ -1980,29 +2035,7 @@ def band_memory_record(mem, rows, source, batch_id=None, bench_above=None):
         if node is None:
             if status not in BAND_ENTRY_STATUSES:
                 continue                  # ← 关键：预警状态不得新建条目
-            node = {
-                "code": code, "name": r.get('Name') or code,
-                "added_at": now_cn_str(), "added_price": float(r.get('Price') or 0.0),
-                "added_status": status, "added_source": source,
-                "batch_id": batch_id or "",
-                "entry_context": _band_entry_context(r, bench_above),
-                "snapshot": {
-                    "score": r.get('Score', 0), "ma20": r.get('MA20', 0.0),
-                    "ma60": r.get('MA60', 0.0),
-                    "platform_high": r.get('PlatformHigh', 0.0),
-                    "vol_ratio": r.get('VolRatio', 0.0),
-                    "position250": r.get('Position250', 0.0),
-                    "reasons": r.get('Reasons', ''),
-                },
-                "note": "", "closed": False, "alerts": {},
-                # platform_high：动态目标价（每次刷新重算，这里先落一个入册时的值）
-                # alert_ack：「已看过该预警」的标记，值 = 当时的 status_ts。
-                #   ★ 2026-09-20 起它会随**完整镜像**一起同步（以前做字段裁剪时才不同步），
-                #   所以容器重启后**不会**再把同一条预警重复展开。
-                "platform_high": float(r.get('PlatformHigh') or 0.0),
-                "alert_ack": "",
-                "history": [],
-            }
+            node = _band_memory_new_node(r, source, batch_id, bench_above)
             mem['stocks'][code] = node
             added.append(code)
             _band_memory_apply(node, r, event=f"入选记忆（{source}）")
@@ -2012,6 +2045,29 @@ def band_memory_record(mem, rows, source, batch_id=None, bench_above=None):
             # 已记住的：后续扫描发现状态变化（例如 启动确认 → 跌破支撑）也要记下来
             _band_memory_apply(node, r, event=f"扫描刷新（{source}）")
     return added
+
+def band_memory_add_manual(mem, r, source="手动加入"):
+    """手动把一只票放进「波段记忆」全程监控。返回 (是否新建条目, 代码)。
+
+    ★ 与自动入册**只差一条：不看状态**。
+      自动入册只认「波段启动确认」，是因为全市场扫描会把几百只预警票一次灌进记忆；
+      但这里是用户**自己按下的按钮** —— 他已经决定要盯这只（很可能已经买了），
+      规则不该替他否决。
+    ★ 已在册时不覆盖 `added_price`（`_band_memory_apply` 不碰该字段）：
+      入场价必须留在入选那一天，否则「相对入选价涨了多少」这个判断就废了。
+    """
+    code = str(r.get('Code') or '').strip()
+    if not code:
+        return False, ""
+    stocks = mem.setdefault('stocks', {})
+    node = stocks.get(code)
+    if node is None:
+        node = _band_memory_new_node(r, source)
+        stocks[code] = node
+        _band_memory_apply(node, r, event=f"手动加入记忆（{source}）")
+        return True, code
+    _band_memory_apply(node, r, event=f"手动刷新（{source}）")
+    return False, code
 
 def band_memory_purge(mem, mode="never_started"):
     """清理记忆，返回 (mem, 删除数量)。
@@ -4786,6 +4842,30 @@ def band_memory_ui():
             st.caption("把上面这串原样复制到两处 Secrets（Streamlit 与 GitHub Actions），一字都不能差。")
 
 
+def _add_band_to_memory(r, source="手动加入"):
+    """把一张选股卡片写进「波段记忆」，并**立刻**同步到云端。返回给用户看的提示语。
+
+    ★ 为什么点一下就要 push，不能只写本地：用户按这个按钮的全部意义是
+      「让云端巡检开始盯它、出现结束信号推我微信」。只写本地的话，要等下一次
+      别的原因触发同步才生效 —— 对"及时提醒"来说那就是失效。
+    """
+    try:
+        mem = load_band_memory()
+        is_new, code = band_memory_add_manual(mem, r, source=source)
+        if not code:
+            return "❌ 代码为空，未加入记忆。"
+        save_band_memory(mem)
+        _ok, _m = band_memory_push_github(mem)
+        _name = r.get('Name') or code
+        _head = (f"✅ 已加入记忆并开始监控：**{_name}（{code}）**" if is_new
+                 else f"✅ 已在跟踪清单里，已刷新状态：**{_name}（{code}）**")
+        return _head + ("　云端巡检已接手，出现顶背离 / 跌破支撑会推微信。"
+                        if _ok else f"　（本地已记住；云端同步未完成：{_m}）")
+    except Exception as e:
+        _log("_add_band_to_memory", e)
+        return f"❌ 加入记忆失败：{type(e).__name__}: {str(e)[:120]}"
+
+
 def _render_band_card(r, tracked=None):
     """渲染一张波段选股结果卡片。
 
@@ -4810,6 +4890,25 @@ def _render_band_card(r, tracked=None):
                     <div style="margin-top:6px; color:#f9e2af; font-size:13px;">📋 {r['Reasons']}</div>
                 </div>
                 """, unsafe_allow_html=True)
+    # ---- 一键进「波段记忆」----
+    # ★ 按钮只能放在卡片**下方**：Streamlit 的控件没法塞进上面那段 raw HTML 里。
+    _code = str(r['Code'])
+    _lot = float(r['Price'] or 0) * 100
+    _c_act, _c_hint = st.columns([1.15, 3.4])
+    with _c_act:
+        if _code in tracked:
+            st.caption("✅ 已在跟踪清单")
+        elif st.button("➕ 加入记忆", key=f"memo_add_{_code}", use_container_width=True,
+                       help="放进「🧠 波段记忆」全程监控：云端巡检每 5 分钟看一次，"
+                            "出现顶背离 / 跌破支撑会推微信提醒。已买入的票点一下就行。"):
+            st.session_state.band_memory_manual_msg = _add_band_to_memory(r)
+            st.rerun()
+    with _c_hint:
+        if _code in tracked:
+            st.caption(f"1 手（100 股）≈ ¥{_lot:,.0f}　·　可在「🧠 波段记忆」页签里备注 / 删除。")
+        else:
+            # 买不买得起一眼看得到 —— 用户反馈过"有的票 1 手都买不起"
+            st.caption(f"1 手（100 股）≈ ¥{_lot:,.0f}")
 
 
 def ai_band_picker_ui():
@@ -4877,6 +4976,35 @@ def ai_band_picker_ui():
         else:
             st.warning(f"未能加载「{board_name}」板块成分股，将回退到全市场扫描")
 
+    # ---- 价格上限（买得起才看）----
+    # 为什么放在选股页而不是设置页：它是**每次选股都要调的参数**，不是全局设置。
+    # 为什么值得持久化：存在本地 config.json（已 gitignore），设一次就记住。
+    if 'band_price_cap' not in st.session_state:
+        try:
+            st.session_state.band_price_cap = float(load_config().get('band_price_cap') or 0.0)
+        except Exception as _e:
+            _log("ai_band_picker_ui/price_cap_load", _e)
+            st.session_state.band_price_cap = 0.0
+
+    def _save_price_cap():
+        try:
+            save_config({**load_config(), 'band_price_cap': float(st.session_state.band_price_cap)})
+        except Exception as _e:
+            _log("ai_band_picker_ui/price_cap_save", _e)
+
+    _c_cap, _c_cap_hint = st.columns([1, 2.6])
+    with _c_cap:
+        _price_cap = st.number_input("价格上限（元/股，0 = 不限）", min_value=0.0, max_value=9999.0,
+                                     step=1.0, key="band_price_cap", on_change=_save_price_cap,
+                                     help="只扫不超过这个价格的票。A 股 1 手 = 100 股，"
+                                          "上限 20 元 ⇒ 1 手最多约 ¥2000。")
+    with _c_cap_hint:
+        if _price_cap:
+            st.caption(f"已开启：只看 ≤ {_price_cap:.2f} 元的票（1 手约 ≤ ¥{_price_cap * 100:,.0f}）。"
+                       "过滤掉多少只会写进下面的「扫描漏斗」。")
+        else:
+            st.caption("未设上限。设一个能过滤掉买不起的票（例如 20 元 ⇒ 1 手最多约 ¥2000）。")
+
     scan_label = "🔍 扫描波段启动股"
     if scan_scope == "仅手动自选":
         scan_label = "🔍 扫描手动自选"
@@ -4885,7 +5013,8 @@ def ai_band_picker_ui():
     if long_button(scan_label, key="scan_stocks", type="primary", use_container_width=True):
         try:
             with st.spinner("正在拉取行情并分析波段状态..."):
-                st.session_state.scan_results = screen_band_stocks(custom_codes=custom_codes)
+                st.session_state.scan_results = screen_band_stocks(custom_codes=custom_codes,
+                                                                   price_cap=float(_price_cap))
                 st.session_state.scan_time = now_cn_str('%Y-%m-%d %H:%M:%S')
                 # 自动入册：本次扫描中「波段启动确认」的股票写进记忆（预警状态只更新已有条目，
                 # 不新建 —— 否则全市场扫描会把几百只跌破 20 日线的股票一次性灌进来），
@@ -4901,6 +5030,11 @@ def ai_band_picker_ui():
         except Exception:
             st.error("选股扫描出错（已自动拦截，不影响页面其他功能）：")
             st.code(traceback.format_exc(), language="python")
+
+    _manual_msg = st.session_state.get('band_memory_manual_msg')
+    if _manual_msg:
+        st.success(_manual_msg)
+        st.session_state.band_memory_manual_msg = None      # 只提示一次
 
     if 'scan_results' in st.session_state:
         df_r = st.session_state.scan_results
@@ -4936,6 +5070,11 @@ def ai_band_picker_ui():
                     continue
                 _seen.update(_sub['Code'].astype(str).tolist())
                 st.markdown(f"#### {_gtitle}（{len(_sub)} 只）")
+                if _gsts == ('波段启动确认',):
+                    st.caption("**这一组才是买入信号**（突破 60 日平台 + 放量）。"
+                               "它们已自动进入「🧠 波段记忆」；若你已买入某只，"
+                               "点它下方的「➕ 加入记忆」即可开始全程监控"
+                               "（会立刻同步到云端，出现顶背离 / 跌破支撑推微信）。")
                 for _, r in _sub.iterrows():
                     _render_band_card(r, _tracked)
             # 兜底：万一以后加了新状态、或状态文案改了，剩下的一律照常显示，绝不静默丢弃
