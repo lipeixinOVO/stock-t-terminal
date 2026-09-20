@@ -370,6 +370,137 @@ def _quote_prefix(symbol):
 # 腾讯日线/分时多域名容错
 _QQ_APP_HOSTS = ["https://web.ifzq.gtimg.cn", "https://ifzq.gtimg.cn"]
 
+# 东方财富日K的多域名池 —— **备用日线源**。
+# ★ 为什么选它当第二源：它同样提供**前复权**日线（fqt=1），与腾讯同口径、可直接互换；
+#   而新浪是**不复权**，除权/分红当天会出现价格断层 → 假的「跌破 20 日线」，
+#   所以新浪只能压到最后的在线兜底位置，不能顶上来。
+_EM_KLINE_HOSTS = ["https://push2his.eastmoney.com", "https://push2.eastmoney.com"]
+
+# ★★ 源健康熔断：某个源连续失败若干次后，**本进程内**一段时间不再尝试它。
+#   为什么必须有：全市场扫描要为几百只票逐个取数。若此时某个源是死的，不做熔断就等于
+#   「每只票都为它付一次超时 + 重试」→ 扫描时间成倍膨胀，还会把剩下那个好源也拖进限流。
+#   （实测踩过的形态：主源抖动时整轮扫描慢到被页面 60 秒自动刷新掐断，结果全丢。）
+#   为什么打包成一个字典而不是几个全局变量：AST 加载器只抽取列进抽取集合的名字，
+#   **名字越少越不容易漏**；漏一个 → NameError 被兜底吞掉 → 测试照样绿、功能静默失效。
+FEED_HEALTH = {}                 # {源名: {"fails": 连续失败次数, "dead_until": 解禁时间戳}}
+FEED_DEAD_AFTER = 3              # 连续失败几次算「暂时不可用」
+FEED_DEAD_SECONDS = 600          # 熔断时长：10 分钟，足够跨过一次接口抖动
+# 「这个代码它本来就没有数据」类错误 —— **不能**计入源健康，
+# 否则连扫 3 只北交所股票（腾讯不提供北交所日线）就会把好端端的腾讯源熔断掉。
+_FEED_CODE_LEVEL = ("空日线", "不受支持", "无数据", "有效数据不足", "列数不足")
+
+
+def _feed_alive(name):
+    """该源现在是否值得尝试（熔断器）。熔断到期会自动解禁并重新计数。"""
+    try:
+        st = FEED_HEALTH.get(name) or {}
+        until = float(st.get("dead_until") or 0)
+        if until and _time_module.time() < until:
+            return False
+        if until:
+            FEED_HEALTH.pop(name, None)      # 熔断到期 → 清空重来，给它一次机会
+        return True
+    except Exception as e:
+        _log("_feed_alive", e)
+        return True                          # 熔断器自己出错时，宁可照常尝试
+
+
+def _feed_note(name, errs, ok):
+    """记一次源尝试结果。错误全为「代码级」时不惩罚源（见 _FEED_CODE_LEVEL）。"""
+    try:
+        if ok:
+            FEED_HEALTH.pop(name, None)
+            return
+        msgs = [str(m) for _n, m in (errs or [])]
+        if msgs and all(any(h in m for h in _FEED_CODE_LEVEL) for m in msgs):
+            return
+        st = FEED_HEALTH.setdefault(name, {})
+        st["fails"] = int(st.get("fails") or 0) + 1
+        if st["fails"] >= FEED_DEAD_AFTER:
+            st["dead_until"] = _time_module.time() + FEED_DEAD_SECONDS
+    except Exception as e:
+        _log("_feed_note", e)
+
+
+def feed_health():
+    """给 UI / 诊断用：各源现状（连续失败数、是否熔断、还有几秒解禁）。"""
+    out = {}
+    now = _time_module.time()
+    try:
+        for name, st in (FEED_HEALTH or {}).items():
+            until = float((st or {}).get("dead_until") or 0)
+            out[name] = {"fails": int((st or {}).get("fails") or 0),
+                         "dead": bool(until and now < until),
+                         "resume_in": max(0, int(until - now)) if until else 0}
+    except Exception as e:
+        _log("feed_health", e)
+    return out
+
+
+def _em_secid(code):
+    """东财 secid：沪市 `1.`，深市 / 北交所 `0.`。
+
+    ★ 刻意**不复用** `_quote_prefix` —— 那个产出的是腾讯要的 sh/sz/bj，
+      东财只认 0/1 两个市场号；混用会让沪市票去查深市，永远返回空。
+    ★ 也接受**完整符号**（`sh000300` 这种）：指数必须这么传，因为纯数字 000300
+      走前缀规则会被判成深市（那是个不存在的股票代码）。
+    """
+    s = str(code).strip().lower()
+    if s.startswith("sh"):
+        return "1." + s[2:]
+    if s.startswith(("sz", "bj")):
+        return "0." + s[2:]
+    if s.startswith(("5", "6", "9", "110", "111", "113", "118", "119")):
+        return "1." + s
+    return "0." + s
+
+
+def _fetch_kline_em(code, limit=640, timeout=(5, 10), retries=2):
+    """东方财富日线（**前复权**）—— 腾讯整体不可用时的第二源。
+
+    接口返回的 klines 每条形如 "日期,开,收,高,低,量,额,振幅,涨跌幅,涨跌额,换手率"，
+    列序与 `_normalize_kline_rows` 要求的一致，取前 6 项即可。
+    返回 (df|None, 源名, 错误列表)，与 `_fetch_kline_qq` 同接口，可直接互换。
+    """
+    errs = []
+    secid = _em_secid(code)
+    for host in _EM_KLINE_HOSTS:
+        short = host.split("//")[1]
+        ok, js, err = _http_get_json(
+            f"{host}/api/qt/stock/kline/get",
+            # ★ 参数陷阱（2026-09-20 实测）：只要带上 `beg=0`，东财就会**忽略 lmt** ——
+            #   明明是 lmt=60，却把 1999 年至今全部 6526 条一起吐回来。
+            #   正确写法是**不传 beg**、只给 `end` + `lmt`，这才是「最近 N 条」。
+            #   传错不会报错，只会让波段选股每只票白拉几十倍数据、整轮扫描被拖慢。
+            params={"secid": secid, "klt": "101", "fqt": "1",
+                    "fields1": "f1,f2,f3,f4,f5,f6",
+                    "fields2": "f51,f52,f53,f54,f55,f56",
+                    "end": "20500101", "lmt": str(limit)},
+            timeout=timeout, retries=retries)
+        if not ok:
+            errs.append((f"东财({short})", err))
+            continue
+        data = (js or {}).get("data") if isinstance(js, dict) else None
+        klines = (data or {}).get("klines") if isinstance(data, dict) else None
+        if not klines:
+            errs.append((f"东财({short})", "返回空日线（该代码不受支持或无数据）"))
+            continue
+        rows = []
+        for line in klines:
+            p6 = str(line).split(",")
+            if len(p6) < 6:
+                continue
+            rows.append([p6[0], p6[1], p6[2], p6[3], p6[4], p6[5]])
+        df = _normalize_kline_rows(rows)
+        if df is None:
+            errs.append((f"东财({short})", f"有效数据不足（原始 {len(rows)} 条）"))
+            continue
+        if limit and len(df) > int(limit):
+            # 兜底：接口若哪天又改了 lmt 语义，至少不会把超量数据灌进上层
+            df = df.tail(int(limit)).reset_index(drop=True)
+        return df, f"东财前复权·{short}", errs
+    return None, "", errs
+
 # 日线磁盘缓存：所有在线源都失败时兜底，避免接口抖动直接让页面瘫痪。
 # 说明：Streamlit Cloud 容器文件系统在应用重启后会清空，但对分钟级的接口抖动足够用；
 # 多会话共享同一文件，写入采用"临时文件 + 原子替换"避免读到半截 JSON。
@@ -436,12 +567,14 @@ def _normalize_kline_rows(rows):
         _log("_normalize_kline_rows", e)
         return None
 
-def _fetch_kline_qq(code, limit=640):
-    """腾讯日线（前复权），主域名失败自动切备用域名。返回 (df|None, 源名, 错误列表)。"""
+def _fetch_kline_qq(code, limit=640, timeout=(5, 10), retries=2):
+    """腾讯日线（前复权），主域名失败自动切备用域名。返回 (df|None, 源名, 错误列表)。
+
+    timeout / retries 可传参：给「数据源体检」用更短的值，免得一次体检要等好几分钟。"""
     errs = []
     for host in _QQ_APP_HOSTS:
         url = f"{host}/appstock/app/fqkline/get?param={code},day,,,{limit},qfq"
-        ok, js, err = _http_get_json(url, timeout=(5, 10), retries=2)
+        ok, js, err = _http_get_json(url, timeout=timeout, retries=retries)
         if not ok:
             errs.append((f"腾讯({host.split('//')[1]})", err))
             continue
@@ -456,11 +589,14 @@ def _fetch_kline_qq(code, limit=640):
         return df, f"腾讯·{host.split('//')[1]}", errs
     return None, "", errs
 
-def _fetch_kline_sina(code, limit=640):
-    """新浪日线备用源（不复权）。腾讯对北交所不提供日线，此处是重要兜底。"""
+def _fetch_kline_sina(code, limit=640, timeout=(5, 10), retries=2):
+    """新浪日线兜底源（**不复权**）。腾讯对北交所不提供日线，此处是重要兜底。
+
+    ⚠️ 不复权的代价：除权/分红当天价格会断层，可能出现假的「跌破 20 日线」。
+    所以它只排在**前复权源都拿不到**时才用（顺序见 `_try_fetch_kline`），别往前提。"""
     url = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
            f"CN_MarketData.getKLineData?symbol={code}&scale=240&ma=no&datalen={limit}")
-    ok, js, err = _http_get_json(url, timeout=(5, 10), retries=2)
+    ok, js, err = _http_get_json(url, timeout=timeout, retries=retries)
     if not ok:
         return None, "", [("新浪", err)]
     if not isinstance(js, list) or not js:
@@ -480,18 +616,32 @@ def _fetch_kline_sina(code, limit=640):
 LAST_FETCH_DIAG = {}
 
 def _try_fetch_kline(code):
-    """腾讯 → 新浪 → 磁盘缓存。成功返回 (df, 源描述)；全部失败抛 DataFetchError。"""
+    """腾讯(前复权) → 东财(前复权) → 新浪(不复权) → 磁盘缓存。成功返回 (df, 源描述)。
+
+    ★ 顺序有两个理由，别随手改：
+      ① **前复权源优先**：新浪不复权，除权日会出现价格断层 → 假的跌破 20 日线；
+         东财与腾讯同为前复权、可直接互换，所以东财排第二、新浪压最后。
+      ② 每个源都过一次熔断器（`_feed_alive`）：某个源死掉时，全市场扫描不该为它反复付超时 ——
+         这一条直接决定「主源抖动时还能不能把整轮扫完」。
+    全部在线源都失败才回退磁盘缓存；连缓存都没有才抛 DataFetchError。"""
     attempts = []
-    for fn in (_fetch_kline_qq, _fetch_kline_sina):
+    for name, fn in (("腾讯", _fetch_kline_qq), ("东财", _fetch_kline_em),
+                     ("新浪", _fetch_kline_sina)):
+        if not _feed_alive(name):
+            attempts.append((name, "已熔断：连续失败过多，本次跳过（约 10 分钟后自动重试）"))
+            continue
         try:
             df, src, errs = fn(code)
             attempts.extend(errs)
             if df is not None and not df.empty:
+                _feed_note(name, errs, True)
                 _cache_kline(code, df)
                 LAST_FETCH_DIAG[code] = {"source": src, "ts": now_cn_str(), "attempts": attempts}
                 return df, src
+            _feed_note(name, errs, False)
         except Exception as e:
             attempts.append((fn.__name__, f"未预期异常 {type(e).__name__}: {str(e)[:100]}"))
+            _feed_note(name, [("异常", str(e))], False)
     df_cache, ts = _load_cached_kline(code)
     if df_cache is not None:
         attempts.append(("本地缓存", f"已回退到 {ts} 的缓存数据"))
@@ -499,6 +649,78 @@ def _try_fetch_kline(code):
         return df_cache, f"本地缓存({ts})"
     LAST_FETCH_DIAG[code] = {"source": "无", "ts": "", "attempts": attempts}
     raise DataFetchError(code, attempts)
+
+def feed_probe(code, limit=80):
+    """逐个源**实测**一遍（无视熔断器），返回可直接显示的行列表。
+
+    给「主源抖动」现场判断用：所以每个源只试 1 次、超时也用得短 ——
+    健康时一两秒就出结果，全挂时最多等半分钟。**不要**在这里把重试和备用域名都跑一遍，
+    否则一次体检要等好几分钟（那就没人愿意点了）。
+    """
+    lines = []
+    for name, fn in (("腾讯", _fetch_kline_qq), ("东财", _fetch_kline_em),
+                     ("新浪", _fetch_kline_sina)):
+        t0 = _time_module.time()
+        try:
+            df, src, errs = fn(code, limit=limit, timeout=(4, 6), retries=1)
+            dt = _time_module.time() - t0
+            if df is not None and len(df) >= 1:
+                lines.append(f"- ✅ **{name}**：拿到 {len(df)} 条，最新 "
+                             f"{str(df['Date'].iloc[-1])[:10]}（{dt:.1f}s，源={src}）")
+            else:
+                why = "；".join(f"{a}→{b}" for a, b in (errs or [])[:3]) or "无返回"
+                lines.append(f"- ❌ **{name}**：失败（{dt:.1f}s）{why}")
+        except Exception as e:
+            lines.append(f"- ❌ **{name}**：异常 {type(e).__name__}: {str(e)[:80]}")
+    _hl = feed_health()
+    if _hl:
+        lines.append("")
+        lines.append("本轮熔断状态：" + "；".join(
+            f"{n} 连败 {d['fails']}" + (f"（{d['resume_in']}s 后重试）" if d['dead'] else "")
+            for n, d in sorted(_hl.items())))
+    return lines
+
+
+def _render_feed_diag(code, diag):
+    """在页面上摊开「数据源现状 + 一键体检」。
+
+    抽成函数是为了在「日线取回来了但是备用源」与「日线彻底取不到」两个分支里复用。
+    ★ 刻意**不自己开 expander** —— 调用方可能已经在 expander 里了，嵌套会直接报错。
+    """
+    _last = st.session_state.get("feed_probe_lines")
+    if _last:
+        st.markdown("**🔌 数据源实测结果**（上次点击「逐个源实测」时）")
+        for _l in _last:
+            st.markdown(_l)
+    _fh = feed_health()
+    if _fh:
+        st.markdown("**本轮取数中出现的源异常**（连续失败会自动熔断，免得拖垮整轮扫描）")
+        for _n, _d in sorted(_fh.items()):
+            _badge = (f"⛔ 已熔断，约 {_d['resume_in']} 秒后自动重试" if _d["dead"] else "✅ 正常")
+            st.markdown(f"- {_n}：连续失败 {_d['fails']} 次　{_badge}")
+    else:
+        st.markdown("三个源都还没出现过连续失败。")
+    _at = ((diag or {}).get("attempts") or [])
+    if _at:
+        st.markdown("**本次逐次尝试记录**")
+        for _i, _a in enumerate(_at, 1):
+            _nm, _rs = (_a if isinstance(_a, (tuple, list)) and len(_a) == 2
+                        else ("尝试", str(_a)))
+            st.markdown(f"    {_i}. **{_nm}** → {_rs}")
+    st.caption("兜底顺序：腾讯(前复权) → 东财(前复权) → 新浪(不复权) → 本地缓存。"
+               "三个源各实测一次，最长约 1 分钟。")
+    # ★ 用 long_button 而不是 st.button：三个源都卡死时最坏约 50 秒，
+    #   已进入顶部全局 60 秒自动刷新的射程 —— 被打断后按钮"按下"状态消失、
+    #   结果也没落盘，用户只能再点一次（见 test_long_task.py）。
+    if long_button("🔌 逐个源实测一遍", key="probe_feeds_now"):
+        try:
+            with st.spinner("正在逐个源实测..."):
+                st.session_state.feed_probe_lines = feed_probe(code)
+        except Exception as _pe:
+            _log("probe_feeds_now", _pe)
+            st.session_state.feed_probe_lines = [f"- 体检失败：{_pe}"]
+        st.rerun()
+
 
 # ================= 4. 辅助函数 =================
 @st.cache_data(ttl=3600)
@@ -1311,15 +1533,27 @@ def fetch_market_page(pn, pz=100):
     return []
 
 def _get_daily_history(symbol):
-    """波段分析用日线（前复权，至少 60 条）。复用统一容错层：腾讯多域名 → 新浪兜底。"""
+    """波段分析用日线（至少 60 条）。腾讯(前复权) → 东财(前复权) → 新浪(不复权) 依次兜底。
+
+    ★ 这是**波段选股**的取数热路径：一次扫描要对几百只票各取一次（16 线程并发）。
+      所以这里必须挂熔断器 —— 某个源死掉时，不做熔断就等于「这几百只票每只都为它付一次
+      超时 + 重试」，整轮扫描会被拖到被页面 60 秒自动刷新掐断（实测形态：结果全丢）。
+    ★ 顺序与 `_try_fetch_kline` 一致：前复权源优先，新浪（不复权）压最后。
+    """
     code = f"{_quote_prefix(symbol)}{str(symbol).strip()}"
-    for fn in (_fetch_kline_qq, _fetch_kline_sina):
+    for name, fn in (("腾讯", _fetch_kline_qq), ("东财", _fetch_kline_em),
+                     ("新浪", _fetch_kline_sina)):
+        if not _feed_alive(name):
+            continue
         try:
-            df, _src, _errs = fn(code, limit=300)
+            df, _src, errs = fn(code, limit=300)
             if df is not None and len(df) >= 60:
+                _feed_note(name, errs, True)
                 return df
+            _feed_note(name, errs, False)
         except Exception as e:
             _log("_get_daily_history", e)
+            _feed_note(name, [("异常", str(e))], False)
             continue
     return None
 
@@ -1873,8 +2107,13 @@ _BENCH_CACHE = {}
 
 def _get_index_history(full_symbol, limit=300):
     """指数日线。**必须传完整符号**（如 sh000300）——指数不能走 _quote_prefix，
-    因为 000300 会被判成 sz000300（那是个不存在的股票代码）。仍复用统一取数层。"""
-    for fn in (_fetch_kline_qq, _fetch_kline_sina):
+    因为 000300 会被判成 sz000300（那是个不存在的股票代码）。仍复用统一取数层。
+
+    ★ 加东财作为第二源：腾讯 qfq 接口一抖，当天所有复盘的基准都会取不到 →
+      超额收益全变 None（复盘直接废掉）。这里**不挂熔断器** —— 它按自然日只取一次
+      （见 `_bench_history`），不值得为它多引一份共享状态。
+    """
+    for fn in (_fetch_kline_qq, _fetch_kline_em, _fetch_kline_sina):
         try:
             df, _src, _errs = fn(full_symbol, limit=limit)
             if df is not None and len(df) >= 60:
@@ -2920,7 +3159,8 @@ SAMPLE_EVENT_DEDUP = True      # 连续「必算」日只保留事件首日，�
 SAMPLE_MAX_STALE_DAYS = 30
 # 成交量单位：腾讯日线按「手」返回（×100 股），新浪按「股」。实测两者算出的成交额一致，
 # 但单位不同 —— 直接用 raw Volume 算成交额会差 100 倍，这里显式声明，不做猜测。
-SAMPLE_VOL_UNIT = {"qq": 100.0, "sina": 1.0}
+# 成交量单位：腾讯、东财都按「手」，新浪按「股」。选错单位成交额会差 100 倍。
+SAMPLE_VOL_UNIT = {"qq": 100.0, "em": 100.0, "sina": 1.0}
 # ★ 采样取数的提速。**这里曾经是"裸 requests.get + 串行"**：全市场 3750 只 × 每只约 1.7 秒
 #   （云端在美国、接口在国内，单次往返就要几百毫秒）≈ **100 分钟**，
 #   而页面顶部的自动刷新「让路」窗口只有 30 分钟 → 跑到一半必被掐断、结果全丢。
@@ -3209,15 +3449,22 @@ def band_sample_build(code, name, df, i, bench_df, source, vol_unit=1.0, market_
 
 def _sample_fetch_kline(code, limit=700):
     """采样专用取数：返回 (df, vol_unit)。**必须同时带回单位**，
-    否则成交额会差 100 倍（腾讯按手、新浪按股）。"""
-    for fn, unit in ((_fetch_kline_qq, SAMPLE_VOL_UNIT['qq']),
-                     (_fetch_kline_sina, SAMPLE_VOL_UNIT['sina'])):
+    否则成交额会差 100 倍（腾讯、东财按手，新浪按股）。
+
+    ★ 服务顺序与主链一致（腾讯 → 东财 → 新浪），但**刻意不碰 `_feed_alive` / `_feed_note`**：
+      这个函数跑在采集线程池里，而熔断器是**共享可写状态**；`_sample_harvest_one`
+      必须保持「无共享可写状态」才能在多线程下安全并发（有 AST 断言守着这条）。
+      采集侧本来就有自己的失败计数与并发限流，不差这一个熔断。
+    """
+    for name, fn, unit in (("腾讯", _fetch_kline_qq, SAMPLE_VOL_UNIT['qq']),
+                           ("东财", _fetch_kline_em, SAMPLE_VOL_UNIT['em']),
+                           ("新浪", _fetch_kline_sina, SAMPLE_VOL_UNIT['sina'])):
         try:
             df, _src, _errs = fn(_get_code(code), limit=limit)
             if df is not None and len(df) >= SAMPLE_MIN_BARS:
                 return df, unit
         except Exception as e:
-            _log(f"_sample_fetch_kline/{code}", e)
+            _log(f"_sample_fetch_kline/{name}/{code}", e)
             continue
     return None, 1.0
 
@@ -5091,8 +5338,13 @@ try:
     if df_daily is not None and not df_daily.empty:
         df_daily = calculate_daily_indicators(df_daily)
         if _daily_src and not _daily_src.startswith("腾讯"):
-            st.warning(f"⚠️ 腾讯主源不可用，本次日线来自 **{_daily_src}**。价格口径可能与实时行情略有差异，"
-                       f"回踩/压力位判断请以券商行情为准。")
+            _degraded = _daily_src.startswith(("本地缓存", "新浪"))
+            st.warning(f"⚠️ 腾讯主源不可用，本次日线来自 **{_daily_src}**。"
+                       + ("**这回退到了本地缓存 / 不复权源**，价格口径可能与实时行情有差异，"
+                          "回踩/压力位判断请以券商行情为准。" if _degraded else
+                          "东财与腾讯同为前复权，口径一致，可以直接用。"))
+            with st.expander("🔌 数据源现状 / 一键体检", expanded=False):
+                _render_feed_diag(code, _diag)
     else:
         st.error(f"❌ 无法获取 {current_name}（{symbol}）的日线数据，主图已暂停渲染。")
         with st.expander("🔍 展开查看失败原因（排查用，可直接截图反馈）", expanded=True):
@@ -5108,6 +5360,8 @@ try:
                 st.markdown("    （无记录）")
             st.caption("常见原因：① 网络或代理拦截了行情接口；② 代码前缀不被数据源支持"
                        "（如北交所 43/83/87/88/92 开头，腾讯不提供日线）；③ 该代码已退市或长期停牌。")
+            st.markdown("---")
+            _render_feed_diag(code, _diag)
         if st.button("🔄 清除数据缓存并重试", key="retry_daily_fetch"):
             get_daily_data.clear(); get_minute_data.clear(); st.rerun()
         st.markdown("---")
