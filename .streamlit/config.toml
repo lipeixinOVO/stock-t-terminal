@@ -1,0 +1,10 @@
+# Streamlit 运行配置（Streamlit Cloud 会从仓库根目录读这个文件）
+#
+# ★ 关掉 magic 语法糖，纯粹为了省时间。
+#   magic 的规则是：脚本里任何一个「光秃秃的表达式」都会被自动 st.write 出来。
+#   本项目 5600+ 行里**一个这样的表达式都没有**（用 AST 扫过 statement 级非调用表达式，
+#   命中 0 处），但 Streamlit 每次交互仍会为此**重新解析并改写整份脚本的 AST**。
+#   实测（AppTest + cProfile，2026-09-20）：一次「点按钮 → 重跑」3.38s → 2.56s，
+#   单这一项白花约 0.8 秒。用户感受就是「点一下按钮要等好几秒」。
+[runner]
+magicEnabled = false
