@@ -183,6 +183,11 @@ def sec_corpus(ns, rows, state):
         tdesc = "、".join(f"{ns['SAMPLE_TIER_LABEL'].get(k, k)} {v}"
                         for k, v in sorted(tiers.items(), key=lambda kv: -kv[1]))
         lines.append(f"- 最近一批（{latest}）**{len(todays)} 条**：{tdesc}")
+        # ★ 数量对不上会被当成 bug：停牌股没有新K线，它的「最后一根」还停在停牌前那天，
+        #   所以按最新日期一数就少几条。口径本身就是「按该股最后一根K线日期记」，是对的。
+        stale_n = len(fwd_rows) - len(todays)
+        if stale_n > 0:
+            lines.append(f"　（另有 {stale_n} 条停牌股，最新K线还停在停牌前那天，故不计入本批）")
     prev_n = state.get("forward_n")
     if isinstance(prev_n, int):
         delta = fwd.get("total", 0) - prev_n
@@ -205,6 +210,19 @@ def sec_lift(ns, rows):
         lines.append(f"- 报表计算失败：{e}")
         return lines
     base = lift.get("baseline") or {}
+    pend_n = sum(1 for r in rows
+                 if r.get("source") == "forward"
+                 and not (r.get("outcome") or {}).get("closed"))
+    if not base.get("n"):
+        # ★ 前瞻样本「入场即最后一根K线」→ 采下来当天必然**全部**是 pending。
+        #   这段文字会连续生效很多天（第一批要几个交易日后才结案），不解释清楚
+        #   用户打开日报只会看到一片空，会以为日报坏了 —— 那比数字难看更糟。
+        lines.append(f"- 已采到前瞻样本 **{fwd_n} 条**，其中 **{pend_n} 条还在等结案**。")
+        lines.append(f"- 前瞻样本必须等入场之后走完行情才结算（止盈 +{ns['REVIEW_TP_PCT']:g}%、"
+                     f"跌破 20 日线、或最多持有 {ns['REVIEW_MAX_HOLD_DAYS']} 个交易日），"
+                     f"所以**刚采下来这批暂时没有成绩，这里空着是正常的、不是出错**。")
+        lines.append(f"- 第一批结案后会自动出现在这里，最晚不超过 {ns['REVIEW_MAX_HOLD_DAYS']} 个交易日。")
+        return lines
     lines.append(f"- 基准率：n={base.get('n', 0)}　胜率 {base.get('win_rate')}%　"
                  f"平均超额 {fmt_pct(base.get('avg_excess'))}　平均收益 {fmt_pct(base.get('avg_ret'))}")
     lines.append(f"- 样本外门槛：只有样本内外同号（stable）的桶才算站得住；样本量下限 {ns['REVIEW_MIN_SAMPLE']}")
