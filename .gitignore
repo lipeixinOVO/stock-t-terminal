@@ -58,5 +58,13 @@ band_samples.jsonl.gz.tmp
 # 它**不是**明文，但也没必要占仓库体积，所以同样忽略。
 band_samples.enc
 band_samples.enc.tmp
+# band_samples_forward.enc = 只含前瞻样本的加密快照，供**网页端**读取。
+# 它由 Actions 每天发布成 data-latest 的 release 资源（release 资源不进 git 历史，
+# 也就不必担心天天提交二进制把仓库撑爆），本地生成的同名文件同样不进仓库树。
+band_samples_forward.enc
+band_samples_forward.enc.tmp
+# 日报自己的状态文件（今天跟昨天比的基准，纯中间产物）
+digest_state.json
+digest_state.json.tmp
 # 回填用的日线磁盘缓存（几千个小文件，纯中间产物）
 .sample_cache/
