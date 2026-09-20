@@ -2897,9 +2897,13 @@ def parse_band_samples_text(text, rows=None):
     return out
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_cloud_corpus(url=CORPUS_URL):
-    """拉云端语料快照 → (rows, err)。**永不抛异常**：失败返回 ([], 原因字符串)。"""
+    """拉云端语料快照 → (rows, err)。**永不抛异常**：失败返回 ([], 原因字符串)。
+
+    ★ ttl 取 1 小时：语料是**每天盘后更新一次**，没必要每次 rerun 都去下几 MB。
+      实测一次全市场前瞻 ≈ 3711 条（一只股票一条横截面），快照上限 6 万条约十几 MB 级。
+    """
     try:
         r = _http_session().get(url, timeout=CORPUS_FETCH_TIMEOUT,
                                 headers=_REQUEST_HEADERS, allow_redirects=True)
