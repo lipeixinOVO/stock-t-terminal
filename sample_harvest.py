@@ -97,6 +97,9 @@ NET_CONSTS = {"_REQUEST_HEADERS", "_EM_HOSTS", "_HTTP_HEADERS", "_QQ_APP_HOSTS",
               "_FEED_CODE_LEVEL",
               "_TLS_LOCAL"}
 METRIC_FUNCS = {"_calculate_band_metrics", "_band_score", "_band_status", "_band_evaluate"}
+# ★ 指标层自己的常量：`_calculate_band_metrics` 现在要用顶背离的 MACD 门槛。
+#   漏了 → NameError（这里没 try 兜底，会直接炸，属于"幸运的"失败方式）。
+METRIC_CONSTS = {"BAND_DIVERGENCE_MACD_MIN_PCT"}
 
 SAMPLE_FUNCS = {
     "_sample_key", "_sample_hash_hit", "_sample_tier", "_sample_prefilter", "_sample_tradable",
@@ -128,14 +131,14 @@ SAMPLE_CONSTS = {
 REVIEW_CONSTS = {
     "REVIEW_RULE_VERSION", "REVIEW_BENCH_SYMBOL", "REVIEW_TP_PCT", "REVIEW_MAX_HOLD_DAYS",
     "REVIEW_MFE_GOOD", "REVIEW_MIN_SAMPLE", "CLOSE_REASON_LABEL", "VERDICT_LABEL",
-    "BAND_STATUS_LEVEL", "_BENCH_CACHE", "EXCLUDE_PREFIXES",
+    "BAND_STATUS_LEVEL", "EXCLUDE_PREFIXES",
     # ★ daily_digest.py 的日报要用这两个集合来数「启动 / 结束预警」。
     #   必须从主应用抽，不能在日报脚本里另抄一份 —— 状态名一改就会静默数成 0。
     "BAND_ALERT_STATUSES", "BAND_ENTRY_STATUSES",
 }
 
 WANT_FUNCS = NET_FUNCS | METRIC_FUNCS | SAMPLE_FUNCS | OUTCOME_FUNCS | CRYPTO_FUNCS
-WANT_CONSTS = NET_CONSTS | SAMPLE_CONSTS | REVIEW_CONSTS
+WANT_CONSTS = NET_CONSTS | SAMPLE_CONSTS | REVIEW_CONSTS | METRIC_CONSTS
 
 
 # ============================ 一、把主应用当"库"来加载 ============================
