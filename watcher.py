@@ -45,9 +45,10 @@ WATCHLIST = [c.strip() for c in os.environ.get("WATCHLIST", "").replace("，", "
 # 额外的波段监控名单（可选）：不依赖网页端记忆文件，直接逗号分隔填代码。
 BAND_WATCHLIST = [c.strip() for c in os.environ.get("BAND_WATCHLIST", "").replace("，", ",").split(",") if c.strip()]
 LOG_FILE = os.environ.get("NOTIFY_LOG", "notify_log.json")
-# 波段摘要文件：由网页端同步到仓库，这里只读取并回写状态变化。
-# ⚠️ 读的是「脱敏摘要」band_watch.json（只有代码/名称/状态/轨迹），
-#    不是含备注与入选价的 band_memory.json —— 本仓库是 public，隐私字段不上传。
+# 波段记忆文件：由网页端同步到仓库，这里只读取并回写状态变化。
+# ★ 读写的 band_watch.json 是网页端本地记忆的**完整镜像**（2026-09-20 起不再裁剪字段），
+#   所以回写时也必须整节点写回 —— 否则会把网页端刚推上来的备注/入选价裁掉。
+#   本仓库是 public：要保密请配 BAND_KEY（提交的是密文），不要靠删字段。
 BAND_MEMORY_FILE = os.environ.get("BAND_MEMORY_FILE", "band_watch.json")
 WINDOW_MIN = int(os.environ.get("ALERT_WINDOW_MIN", "10"))
 FORCE_RUN = os.environ.get("FORCE_RUN", "0").strip() == "1"
@@ -429,9 +430,10 @@ def check_band_end(sym, log, today):
     return False
 
 
-# ============ 波段摘要加密（与 ai_stock_terminal.py 同一套规则）============
-# 本仓库是 public：脱敏摘要虽不含备注/入选价，但仍含股票代码清单。若在两端 Secrets
-# 配了同名的 BAND_KEY，摘要文件会整段加密后再提交，连代码清单也看不到。
+# ============ 波段记忆同步加密（与 ai_stock_terminal.py 同一套规则）============
+# 本仓库是 public：band_watch.json 现在是完整记忆（含备注/入选价、股票代码清单），
+# 加密是唯一的保密手段。若在两端 Secrets 配了同名的 BAND_KEY，该文件会整段加密后再提交，
+# 连代码清单也看不到。
 # 为什么不改 Private：public 仓库的 Actions 免费不限量，private 只有 2000 分钟/月，
 # 而本项目的巡检 + 保活约需 7800 分钟/月，额度烧穿后 GitHub 会静默停掉定时任务。
 # ⚠️ 下面 crypto 三个函数必须与 ai_stock_terminal.py 里的同名函数行为保持一致。
@@ -494,10 +496,10 @@ def band_decrypt_obj(data):
         return False, None, "解密后的内容不是 JSON 对象"
     return True, obj, ""
 
-# ============ 波段记忆（读网页端同步来的脱敏摘要 band_watch.json）============
+# ============ 波段记忆（读网页端同步来的完整镜像 band_watch.json）============
 
 def load_band_memory():
-    """读仓库里的波段摘要（由网页端同步过来）。缺失/损坏都退化为空摘要。
+    """读仓库里的波段记忆（由网页端同步过来）。缺失/损坏都退化为空记忆。
 
     若文件是密文而本端没有 BAND_KEY，会打印醒目横幅并返回空 —— 此时波段监控实际不可用，
     必须让它在 Actions 日志里一眼可见，而不是安静地什么都不推。"""
@@ -525,32 +527,34 @@ def load_band_memory():
 
 
 def save_band_memory(mem):
-    """把状态变化回写到摘要文件（workflow 会检测到 diff 后提交回仓库）。
+    """把状态变化回写到 band_watch.json（workflow 会检测到 diff 后提交回仓库）。
 
-    只写巡检需要的字段，绝不引入备注/入选价 —— 这个文件会进 public 仓库。
-    配置了 BAND_KEY 时会整段加密后再落盘。"""
+    ★ 2026-09-20 改，别再改回去：这里原来做「字段裁剪」—— 只写 code/name/status/
+      status_ts/last_check/closed/alerts/history 这 8 个白名单字段，理由是
+      「这个文件会进 public 仓库」。后果是**每天被巡检覆盖几十次**：网页端刚把带备注的
+      完整记忆推上去，这边下一次巡检（5 分钟一次）就把它裁掉，再提交回仓库
+      → 用户手写的备注/入选价在仓库里永远留不住，容器一重启就真丢了。
+
+      现在口径与网页端一致（见 app 的 _band_memory_digest）：
+      **仓库那份 = 完整记忆，两端结构完全一致**，整节点原样落盘。
+      要保密靠 BAND_KEY 加密，不靠删字段。
+
+    配置了 BAND_KEY 时会整段加密后再落盘；没配就是明文（与历史行为一致）。"""
     try:
         mem["updated_at"] = now_cn().strftime('%Y-%m-%d %H:%M:%S')
         clean = {"version": mem.get("version", 1), "updated_at": mem["updated_at"], "stocks": {}}
         for code, node in (mem.get("stocks") or {}).items():
             if not isinstance(node, dict):
                 continue
-            hist = []
-            for h in (node.get("history") or []):
-                if not isinstance(h, dict):
-                    continue
-                hist.append({k: h.get(k) for k in ("ts", "status", "price", "ma20", "event")
-                             if h.get(k) is not None})
-            clean["stocks"][code] = {
-                "code": node.get("code", code),
-                "name": node.get("name", ""),
-                "status": node.get("status", ""),
-                "status_ts": node.get("status_ts", ""),
-                "last_check": node.get("last_check", ""),
-                "closed": bool(node.get("closed")),
-                "alerts": dict(node.get("alerts") or {}),
-                "history": hist,
-            }
+            try:
+                # 节点来自 band_decrypt_obj(json.load) 或本进程构建，正常必为 JSON 安全；
+                # 这一探只为「万一有怪值」时留下可定位日志，而不是让整次回写莫名失败。
+                json.dumps(node, ensure_ascii=False)
+                clean["stocks"][code] = dict(node)
+            except Exception as e:
+                _log("save_band_memory:node", e)
+                clean["stocks"][code] = json.loads(
+                    json.dumps(node, ensure_ascii=False, default=str))
         out = band_encrypt_obj(clean)
         with open(BAND_MEMORY_FILE, 'w', encoding='utf-8') as f:
             json.dump(out, f, ensure_ascii=False, indent=2)
