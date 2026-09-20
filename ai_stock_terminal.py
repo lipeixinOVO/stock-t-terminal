@@ -1380,7 +1380,19 @@ def _calculate_band_metrics(df):
     }
 
 def _band_status(metrics):
-    """根据指标返回波段状态和对应颜色。"""
+    """根据指标返回波段状态和对应颜色。
+
+    ★ 这是**短路判断**，先命中先返回，即优先级：
+      顶背离预警 > 跌破支撑 > 波段启动确认（突破+放量）> 波段进行中 > 波段未形成。
+      所以标签是「**最该处理的那一条**」，不是「全部结论」：
+      一只票可以同时满足「突破+放量」与「顶背离」，标签只会显示顶背离。
+
+    ★ 而且别把「顶背离」理解成「它没在启动」：顶背离的定义本来就要求
+      **后一个高点比前一个更高**（价格创新高、MACD 反而更低），
+      跟「突破创新高」是同一个方向上的描述 —— 两者同时成立不矛盾，
+      那正是**动量衰竭型突破**的典型形态。看到它该做的是「别追高/准备止盈」，
+      而不是「它还没启动」。
+    """
     if metrics['top_divergence']:
         return '顶背离预警', '#ff4b4b'
     if metrics['below_support']:
@@ -1596,11 +1608,15 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None):
 BAND_MEMORY_VERSION = 1
 BAND_ALERT_STATUSES = ('顶背离预警', '跌破支撑')        # 波段结束预警：需要止盈/止损
 BAND_ENTRY_STATUSES = ('波段启动确认',)                 # 波段启动：值得关注/参与
-# ⚠️ 这个常量**只用于「更新已入册的条目」**；新建条目只认 BAND_ENTRY_STATUSES。
+# ⚠️ 名字里的 AUTO_MEMO 很容易读成「自动记入的条件」—— **它不是**。
+#    它的真实含义是「这些状态的变化值得更新已有条目 / 推送提醒」，而且**只对已入册的股票生效**；
+#    新建条目只认 BAND_ENTRY_STATUSES（波段启动确认）。
 #    2026-09-19 之前它被直接当成入册条件，于是全市场扫描时几百只「跌破支撑」
 #    被灌进记忆（实测 460 只/458 只是预警）。改回之前先读 band_memory_record 的说明。
 BAND_AUTO_MEMO_STATUSES = BAND_ENTRY_STATUSES + BAND_ALERT_STATUSES
-# 状态层级：用于判断是「变好」还是「恶化」，从而决定要不要打扰用户
+# 状态层级：**危险 / 恶化程度**，只用来判断「是变好了还是变差了、要不要打扰用户」。
+# ⚠️ 数值高 ≠ 信号好：顶背离预警=4 排最高，意思是「最该处理」，不是「最值得买」；
+#    启动确认=2 比它低，纯粹因为「启动」不是需要你立刻动手的事。
 BAND_STATUS_LEVEL = {'波段未形成': 0, '波段进行中': 1, '波段启动确认': 2,
                      '跌破支撑': 3, '顶背离预警': 4}
 BAND_MEMORY_HISTORY_MAX = 40    # 每只股票最多保留的轨迹条数，防止文件无限膨胀
@@ -1747,8 +1763,8 @@ def band_memory_record(mem, rows, source, batch_id=None, bench_above=None):
                 "note": "", "closed": False, "alerts": {},
                 # platform_high：动态目标价（每次刷新重算，这里先落一个入册时的值）
                 # alert_ack：「已看过该预警」的标记，值 = 当时的 status_ts。
-                #   只在本地，**不进云端摘要**（每端各自记），所以容器重启后会重置 →
-                #   预警票会再自动展开一次，这是有意的（宁可多提醒一次，也别漏掉）。
+                #   ★ 2026-09-20 起它会随**完整镜像**一起同步（以前做字段裁剪时才不同步），
+                #   所以容器重启后**不会**再把同一条预警重复展开。
                 "platform_high": float(r.get('PlatformHigh') or 0.0),
                 "alert_ack": "",
                 "history": [],
@@ -4135,8 +4151,14 @@ def band_memory_ui():
     # ---- 概览 ----
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("记住的股票", f"{stats['active']} 只", help="不含已标记结束的")
-    c2.metric("结束预警", f"{stats['alert']} 只", help="顶背离预警 / 跌破支撑，需要处理")
-    c3.metric("波段启动", f"{stats['entry']} 只")
+    c2.metric("结束预警", f"{stats['alert']} 只",
+              help="顶背离预警 / 跌破支撑 —— 这两个都是**结束**信号，需要处理。"
+                   "它们排在最前只因为「最该处理」，不是「更好」。")
+    c3.metric("波段启动", f"{stats['entry']} 只",
+              help="只统计当前状态正好是「波段启动确认」的票。"
+                   "★ 状态判定是短路判断（顶背离 > 跌破支撑 > 启动确认），只显示优先命中的那一条；"
+                   "而顶背离本身要求「价格创新高」，所以一只票可以同时满足启动条件与顶背离 —— "
+                   "标着「结束预警」的票不代表它没在启动。")
     c4.metric("累计记录", f"{stats['total']} 只", help="含已归档")
 
     # ---- 本次新增提示 ----
@@ -4399,8 +4421,9 @@ def band_memory_ui():
             if need_show:
                 if st.button("👁️ 我已看过这条预警（以后不再自动展开）",
                              key=f"bandmem_ack_{code}"):
-                    # 只记本地（alert_ack 不在云端摘要白名单里），故意不推送，
-                    # 免得把「我什么时候看过」这种本机行为也写到公开仓库的密文里。
+                    # ★ 2026-09-20 起 alert_ack 也随完整镜像同步，容器重启后不会再重复展开。
+                    #   这里仍然**不主动推送**：点「我已看过」不是状态变化，
+                    #   没必要为它单独提交一次。
                     node['alert_ack'] = str(node.get('status_ts') or '')
                     save_band_memory(mem)
                     st.session_state.band_memory_sync_msg = (
