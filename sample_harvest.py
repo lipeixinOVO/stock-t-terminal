@@ -104,12 +104,16 @@ SAMPLE_FUNCS = {
     "band_evaluate_asof", "band_sample_build", "_sample_fetch_kline", "band_samples_harvest",
     # 并发改造后，单只股票的处理拆到了这个函数里
     "_sample_harvest_one",
-    "band_samples_harvest_forward", "load_band_samples", "save_band_samples",
+    "band_samples_harvest_forward", "load_band_samples", "_load_band_samples_parsed",
+    "save_band_samples",
     "band_samples_merge", "band_samples_range", "band_sample_summary", "band_sample_lift",
     "_sample_usable", "band_samples_pending_keys", "band_samples_refresh_pending",
 }
 OUTCOME_FUNCS = {
-    "_bench_history", "_get_index_history", "_bench_above_ma20", "_band_entry_context",
+    # 2026-09-20：基准日线缓存搬进 st.cache_data，_bench_history 现在会调这两层。
+    # 不抽出来 → NameError 被吞 → 基准恒为 None → 超额收益全空（复盘静默废掉）。
+    "_bench_history", "_bench_history_fetch", "_clear_bench_cache",
+    "_get_index_history", "_bench_above_ma20", "_band_entry_context",
     "band_outcome_compute", "_bucket_defs",
 }
 CRYPTO_FUNCS = {"band_crypto_key", "band_crypto_enabled", "_fernet",
