@@ -57,6 +57,20 @@ FORCE_RUN = os.environ.get("FORCE_RUN", "0").strip() == "1"
 # ⚠️ 必须与 ai_stock_terminal.py 中的同名常量保持一致，否则网页与微信的结论会不一致。
 BAND_ALERT_STATUSES = ('顶背离预警', '跌破支撑')        # 波段结束预警
 BAND_ENTRY_STATUSES = ('波段启动确认',)                 # 波段启动
+# ★ 顶背离的「MACD 背离幅度」门槛（%）：第二个高点的 MACD 必须比第一个低这么多，才算真背离。
+#   0 = 只看方向（2026-09-20 之前的旧行为）；30 = 要求 MACD 真的掉三成。
+#
+#   依据 `_debug_probe/probe_divergence_backtest.py`（3398 只票 / 27,352 次「进入顶背离预警」
+#   事件 / 2023-11 起约 450 根日线 / 判据只用事件之后的走势）：在「之后 10 天内跌破 20 日线」
+#   这个判据上，四个候选收紧方向里**只有这个方向是单调有效的** ——
+#     门槛 0/5/10/15/20/25/30/40/50% → 保留组跌破率 68.3/69.1/70.0/70.7/71.2/72.1/72.9/74.3/75.3%
+#   而「新高须 ≥N%」方向**相反**（68.3%→64.4% 单调下降：擦边新高反而更准，
+#   照直觉收紧会先砍掉更准的那批）；「两高点间隔 ≥M 根」几乎无效
+#   （现状本身就保证 ≥2 根，再抬高只是减少样本）。
+#
+#   ⚠️ 必须与 ai_stock_terminal.py 中的同名常量保持一致；不一致就会出现
+#      「网页标了顶背离、微信不推」这种最难查的不对称。
+BAND_DIVERGENCE_MACD_MIN_PCT = 30.0
 BAND_STATUS_LEVEL = {'波段未形成': 0, '波段进行中': 1, '波段启动确认': 2,
                      '跌破支撑': 3, '顶背离预警': 4}
 BAND_MEMORY_HISTORY_MAX = 40
@@ -420,10 +434,16 @@ def _band_metrics(df):
     recent['local_high'] = (recent['High'] > recent['High'].shift(1)) & (recent['High'] > recent['High'].shift(-1))
     highs = recent[recent['local_high']].tail(5)
     top_divergence = False
+    top_divergence_gap_pct = 0.0
     if len(highs) >= 2:
         h1, h2 = highs.iloc[-2], highs.iloc[-1]
         if h2['High'] > h1['High'] and h2['macd'] < h1['macd']:
-            top_divergence = True
+            # 背离幅度：以第一个高点的 MACD 为分母。它小到约等于 0 时分比没有意义
+            # → 记 0（= 不给预警），避免出现「分母趋零 ⇒ 幅度无穷大」的假信号。
+            _m1 = float(h1['macd'])
+            top_divergence_gap_pct = (((_m1 - float(h2['macd'])) / abs(_m1) * 100.0)
+                                      if abs(_m1) > 1e-9 else 0.0)
+            top_divergence = top_divergence_gap_pct >= BAND_DIVERGENCE_MACD_MIN_PCT
 
     below_support = current < ma20
 
@@ -436,7 +456,8 @@ def _band_metrics(df):
         'breakout': breakout, 'vol_ratio': vol_ratio, 'volume_expansion': volume_expansion,
         'macd': float(macd.iloc[-1]),
         'macd_golden': bool(diff.iloc[-1] > dea.iloc[-1] and diff.iloc[-2] <= dea.iloc[-2]),
-        'top_divergence': top_divergence, 'below_support': below_support,
+        'top_divergence': top_divergence, 'top_divergence_gap_pct': top_divergence_gap_pct,
+        'below_support': below_support,
         'position_pct': position_pct, 'lookback': lookback,
     }
 
