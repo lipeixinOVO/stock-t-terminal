@@ -59,6 +59,14 @@ PLAIN_FILE = os.path.join(HERE, "band_samples.jsonl.gz")     # 本地明文（�
 ENC_FILE = os.path.join(HERE, "band_samples.enc")            # 加密语料（可进仓库/缓存）
 CACHE_DIR = os.environ.get("SAMPLE_CACHE_DIR") or os.path.join(HERE, ".sample_cache")
 PART_FMT = os.path.join(CACHE_DIR, "_part_{i}.jsonl.gz")
+FORWARD_FILE = os.path.join(HERE, "band_samples_forward.enc")  # 前瞻语料快照（发布给网页端读）
+
+# 前瞻语料快照的条数上限。★ 为什么只导出 forward、还要设上限：
+#   ① forward 才是「真实判断、能当成绩用」的那一类，backfill 自带前视/生存者偏差，
+#      只能提假设 —— 网页端统计前瞻那几栏只需要它；
+#   ② 快照每天都会被发布一次，条数越多传输越慢，而超过一定量之后统计口径不再变化
+#      （band_sample_lift 要的是分桶样本量，不是全部历史）。超限时保留**最新**的那批。
+FORWARD_EXPORT_MAX = 20000
 
 # ---------- 要从主应用里抽出来执行的符号（与 _debug_probe 的回归测试同一套集合）----------
 NET_FUNCS = {
@@ -104,6 +112,9 @@ REVIEW_CONSTS = {
     "REVIEW_RULE_VERSION", "REVIEW_BENCH_SYMBOL", "REVIEW_TP_PCT", "REVIEW_MAX_HOLD_DAYS",
     "REVIEW_MFE_GOOD", "REVIEW_MIN_SAMPLE", "CLOSE_REASON_LABEL", "VERDICT_LABEL",
     "BAND_STATUS_LEVEL", "_BENCH_CACHE", "EXCLUDE_PREFIXES",
+    # ★ daily_digest.py 的日报要用这两个集合来数「启动 / 结束预警」。
+    #   必须从主应用抽，不能在日报脚本里另抄一份 —— 状态名一改就会静默数成 0。
+    "BAND_ALERT_STATUSES", "BAND_ENTRY_STATUSES",
 }
 
 WANT_FUNCS = NET_FUNCS | METRIC_FUNCS | SAMPLE_FUNCS | OUTCOME_FUNCS | CRYPTO_FUNCS
@@ -485,6 +496,8 @@ def main():
     ap.add_argument("--unwrap", nargs=2, metavar=("SRC", "DST"), help="把加密语料解成明文")
     ap.add_argument("--pull", default="", metavar="SRC",
                     help="把云端加密语料解出来并并入本机明文语料库")
+    ap.add_argument("--export-forward", default="", metavar="OUT",
+                    help="只把库里的前瞻(forward)样本导出一份加密快照，供网页端读取")
     args = ap.parse_args()
 
     t_all = time.time()
@@ -512,6 +525,25 @@ def main():
             ns, rows_map, list(cloud.values()), PLAIN_FILE, enc=False)
         print(f"✅ 已并入云端语料：{len(cloud)} 条 → 新增 {added}，更新结案 {updated}，"
               f"裁剪 {trimmed}，本机现有 {n} 条")
+        return 0
+
+    # ---- 导出前瞻语料快照（发布给网页端读的那一份）----
+    if args.export_forward:
+        rows_map = load_store(ns, path, enc=enc)
+        fwd = [r for r in rows_map.values() if str(r.get("source") or "") == "forward"]
+        fwd.sort(key=lambda r: (str(r.get("date") or ""), str(r.get("code") or "")))
+        total_fwd = len(fwd)
+        if total_fwd > FORWARD_EXPORT_MAX:
+            fwd = fwd[-FORWARD_EXPORT_MAX:]
+            print(f"  前瞻样本 {total_fwd} 条，超过上限 {FORWARD_EXPORT_MAX}，"
+                  f"只保留最新的 {len(fwd)} 条")
+        if not fwd:
+            # ★ 首次运行/当天没采到都会走到这里，属正常状态，**不能报错退出**：
+            #   退出码非 0 会让 Actions 步骤变红，久了就没人信这个红灯。
+            print(f"语料库里还没有前瞻样本（现有 {len(rows_map)} 条，均为回填），跳过导出。")
+            return 0
+        n = save_store(ns, fwd, args.export_forward, enc=True)
+        print(f"✅ 已导出前瞻语料快照：{n} 条 → {args.export_forward}")
         return 0
 
     # ---- 报表 ----
