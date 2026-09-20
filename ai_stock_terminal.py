@@ -1391,6 +1391,10 @@ def _band_memory_apply(node, r, event):
     node['ma20'] = r.get('MA20', node.get('ma20', 0.0))
     node['reasons'] = r.get('Reasons', node.get('reasons', ''))
     node['last_check'] = now_cn_str()
+    # ★ 动态目标价的来源：**当前**平台高点（`_band_evaluate` 每天重算 ⇒ 平台抬高时目标自动上移）。
+    #   必须写在下面「状态没变就直接 return」的**之前** —— 否则状态长期不变的票，
+    #   目标价会永远停在入选那一天，"动态"就是句空话。踩过一次这种顺序坑（日报条数统计）。
+    node['platform_high'] = float(r.get('PlatformHigh') or node.get('platform_high') or 0.0)
     old_status = node.get('status')
     if new_status == old_status:
         return False
@@ -1455,7 +1459,14 @@ def band_memory_record(mem, rows, source, batch_id=None, bench_above=None):
                     "position250": r.get('Position250', 0.0),
                     "reasons": r.get('Reasons', ''),
                 },
-                "note": "", "closed": False, "alerts": {}, "history": [],
+                "note": "", "closed": False, "alerts": {},
+                # platform_high：动态目标价（每次刷新重算，这里先落一个入册时的值）
+                # alert_ack：「已看过该预警」的标记，值 = 当时的 status_ts。
+                #   只在本地，**不进云端摘要**（每端各自记），所以容器重启后会重置 →
+                #   预警票会再自动展开一次，这是有意的（宁可多提醒一次，也别漏掉）。
+                "platform_high": float(r.get('PlatformHigh') or 0.0),
+                "alert_ack": "",
+                "history": [],
             }
             mem['stocks'][code] = node
             added.append(code)
@@ -2329,6 +2340,208 @@ def _fmt_price(v, digits=2):
     except (TypeError, ValueError):
         return "—"
     return f"{f:.{digits}f}" if f > 0 else "—"
+
+
+# ============ 波段阶段进度（2026-09-20 新增，口径已与用户确认） ============
+# 进度 = (现价 − 启动价) ÷ (目标价 − 启动价)，其中目标价 = **当前平台高点**
+# （PlatformHigh，每次刷新重算 ⇒ 平台抬高时目标自动上移，这就是"动态"的来源）。
+#
+# ★★ 措辞红线：这是「按固定规则算出来的参考位」，**不是预测**。
+#    任何展示的地方都必须写清"参考位"，否则用户会拿它当目标价去挂单。
+#    见 _band_stage_text 与展开区的 caption。
+BAND_STAGE_STEPS = ((0.67, "🌾 启动末段"), (0.34, "🌿 启动中段"), (0.0, "🌱 启动初段"))
+
+
+def _band_num(v):
+    """把 None / '' / NaN 一律收敛成 0.0，省掉各处 try。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if f == f else 0.0        # NaN 不等于自身
+
+
+def band_start_price(node):
+    """取该股的启动价（= 入选价 added_price），取不到时用轨迹兜底。
+
+    ★ 为什么需要兜底（别删）：云端摘要 `band_watch.json` **不包含 added_price**
+      （隐私字段一律不上传），所以容器一旦重启、本地记忆丢失后从云端重建，
+      `added_price` 就是 None —— 阶段进度会永远显示不出来。
+      但 `history` 是**会同步**的、且每条都带 `price`，入册那一条的 price 即启动价。
+      所以「轨迹里最早一条的价格」是可靠的近似来源（轨迹上限 40 条，正常远够不到）。
+    """
+    p = _band_num(node.get("added_price"))
+    if p > 0:
+        return p
+    for h in (node.get("history") or []):
+        if isinstance(h, dict):
+            q = _band_num(h.get("price"))
+            if q > 0:
+                return q                # 轨迹按追加顺序，第一条即入册那次
+    return 0.0
+
+
+def band_stage_calc(start, cur, target):
+    """算波段阶段。数据不足返回 None（调用方负责显示成「—」而不是硬凑）。
+
+    返回 {"start","cur","target","progress","stage","gap_pct"}
+    其中 progress 允许 <0（跌破启动价）或 >1（已越过目标）；gap_pct = 距目标还有百分之几。
+    """
+    start, cur, target = _band_num(start), _band_num(cur), _band_num(target)
+    if start <= 0 or cur <= 0:
+        return None
+    if target <= start:
+        # 平台高点不高于启动价（还没有有效上行空间）→ 不给进度，
+        # 免得算出负数或除零的百分比，那种数字比不显示更糟。
+        return None
+    progress = (cur - start) / (target - start)
+    if cur < start:
+        stage = "⚠️ 已跌破启动价"
+    elif progress >= 1.0:
+        stage = "🚀 已越过目标" if progress >= 1.01 else "🎯 已达目标"
+    else:
+        # BAND_STAGE_STEPS 最后一档阈值是 0.0，progress ≥ 0 恒成立 ⇒ 必然命中，无需 else 兜底
+        stage = "🌱 启动初段"
+        for _th, _label in BAND_STAGE_STEPS:
+            if progress >= _th:
+                stage = _label
+                break
+    return {"start": start, "cur": cur, "target": target,
+            "progress": progress, "stage": stage,
+            "gap_pct": (target - cur) / cur * 100.0}
+
+
+def band_alert_need_expand(node):
+    """这一条预警要不要**自动展开**（「只展开新出现的预警」）。
+
+    规则：预警类 + 未归档 + 用户还没点过「我已看过」（alert_ack ≠ status_ts）。
+    用户点过之后 ack == status_ts ⇒ 折叠；日后状态再变 ⇒ status_ts 跟着变 ⇒ 又展开一次。
+    新预警本来就该被看到，这个"再展开"是刻意的，不是 bug。
+
+    ★ 为什么抽成独立函数（2026-09-20）：这条判定原来内联在渲染里，
+      而 **AppTest 的 expander 不暴露 `expanded` 状态、连折叠的内容也会进元素树**，
+      所以 UI 层根本断言不了"折叠没折叠"。抽出来后可以直接测，
+      UI 侧只留一条"渲染用的是这个函数"的接线守卫。
+    """
+    if not isinstance(node, dict):
+        return False
+    if (node.get('status') or '') not in BAND_ALERT_STATUSES:
+        return False
+    if node.get('closed'):
+        return False
+    return str(node.get('alert_ack') or '') != str(node.get('status_ts') or '')
+
+
+def _band_stage_text(node):
+    """清单标题行用的紧凑串（不展开也能看到启动价/目标价/阶段）。
+
+    缺数据时**不返回占位符**，而是返回空串 —— 标题行已经很长，
+    没数的票就别再塞「—」进去；缺什么在展开区里说明原因。
+    """
+    st_ = band_stage_calc(band_start_price(node), node.get("price"),
+                          node.get("platform_high"))
+    if st_ is None:
+        return ""
+    return (f"启动 {_fmt_price(st_['start'])} → 目标 {_fmt_price(st_['target'])}"
+            f"　{st_['stage']} {st_['progress'] * 100:.0f}%")
+
+
+def _band_bulk_manage_ui(mem, nodes):
+    """记忆清单的批量管理：多选 → 批量归档 / 批量删除。
+
+    ★ 为什么单独做这一块（2026-09-20 用户明确抱怨）：原来删除按钮藏在每一只的 expander
+      里面，删 10 只要「展开 10 次 + 点 10 次」= 20 次操作。现在勾一下就能批量处理。
+    ★ 删除不可撤销（本地记忆文件直接重写），所以**必须先勾确认框**才能点删除；
+      归档是可逆的，不设门槛。
+    ★ Streamlit 陷阱：**不能在同一个 run 里改已实例化 widget 的 session_state**
+      （会抛 StreamlitAPIException）。所以「快捷选择」和「批量动作」全部走 `on_click`
+      回调 —— 回调在下一次 run 开头执行，那时旧 widget 已经销毁，改 state 才是合法的。
+    """
+    nodes = [n for n in (nodes or []) if isinstance(n, dict)]
+    if not nodes:
+        return
+
+    meta = []
+    for n in nodes:
+        c = str(n.get('code') or '?')
+        _alert = (n.get('status') in BAND_ALERT_STATUSES) and not n.get('closed')
+        meta.append({
+            "code": c,
+            "alert": _alert,
+            "closed": bool(n.get('closed')),
+            "label": (("⚠️ " if _alert else "")
+                      + ("🗄️ " if n.get('closed') else "")
+                      + f"{n.get('name') or c}（{c}）　{n.get('status') or '未知'}"),
+        })
+    by_label = {m["label"]: m["code"] for m in meta}
+
+    def _set_pick(labels):
+        st.session_state.bandmem_bulk_pick = list(labels)
+
+    def _bulk_close(mem_obj, codes, value):
+        for c in codes:
+            n = mem_obj['stocks'].get(c)
+            if isinstance(n, dict):
+                n['closed'] = value
+        save_band_memory(mem_obj)
+        band_memory_push_github(mem_obj)
+        st.session_state.band_memory_sync_msg = (
+            f"已{'归档' if value else '取消归档'} {len(codes)} 只")
+        st.rerun()
+
+    def _bulk_delete(mem_obj, codes):
+        names = []
+        for c in codes:
+            n = mem_obj['stocks'].pop(c, None)
+            if isinstance(n, dict):
+                names.append(n.get('name') or c)
+        save_band_memory(mem_obj)
+        band_memory_push_github(mem_obj)
+        st.session_state.band_memory_sync_msg = (
+            f"已批量删除 {len(codes)} 只：{'、'.join(names[:5])}"
+            + ("…" if len(names) > 5 else ""))
+        st.session_state.bandmem_bulk_pick = []      # 回调里改 state 是安全的
+        st.rerun()
+
+    with st.expander(f"🧺 批量管理（{len(nodes)} 只）", expanded=False):
+        st.caption("勾选后一次性处理，不用再一只只展开去找删除按钮。"
+                   "删除**不可撤销**（本地记忆直接重写），所以要先勾下面的确认框；"
+                   "归档是可逆的，随时能取消。")
+        q1, q2, q3 = st.columns(3)
+        q1.button("⚠️ 只选预警的", use_container_width=True,
+                  key="bandmem_bulk_q_alert",
+                  on_click=_set_pick,
+                  args=([m["label"] for m in meta if m["alert"]],))
+        q2.button("🗄️ 只选已归档的", use_container_width=True,
+                  key="bandmem_bulk_q_closed",
+                  on_click=_set_pick,
+                  args=([m["label"] for m in meta if m["closed"]],))
+        q3.button("✖️ 清空选择", use_container_width=True,
+                  key="bandmem_bulk_q_clear", on_click=_set_pick, args=([],))
+
+        picked = st.multiselect("选中要处理的股票（可多选、可搜索）",
+                                options=list(by_label.keys()),
+                                key="bandmem_bulk_pick",
+                                placeholder="这里选，或先用上面的快捷按钮")
+        codes = [by_label[x] for x in picked if x in by_label]
+        if not codes:
+            st.caption("还没选中任何股票。")
+            return
+
+        confirm = st.checkbox(f"我确认要处理选中的 {len(codes)} 只（删除不可撤销）",
+                              key="bandmem_bulk_confirm")
+        d1, d2, d3 = st.columns(3)
+        d1.button(f"🗄️ 归档选中（{len(codes)}）", use_container_width=True,
+                  key="bandmem_bulk_close",
+                  on_click=_bulk_close, args=(mem, codes, True))
+        d2.button(f"♻️ 取消归档（{len(codes)}）", use_container_width=True,
+                  key="bandmem_bulk_unclose",
+                  on_click=_bulk_close, args=(mem, codes, False))
+        d3.button(f"🗑️ 删除选中（{len(codes)}）", use_container_width=True,
+                  key="bandmem_bulk_del", disabled=not confirm,
+                  on_click=_bulk_delete, args=(mem, codes))
+        if not confirm:
+            st.caption("⬆️ 删除按钮是灰的：先勾上面的确认框。")
 
 
 def _band_status_badge(status):
@@ -3801,25 +4014,78 @@ def band_memory_ui():
                    key=lambda n: (bool(n.get('closed')),
                                   -BAND_STATUS_LEVEL.get(n.get('status'), 0),
                                   str(n.get('added_at', ''))))
+    # 批量多选处理（归档 / 删除）—— 不用再一只只展开去找删除按钮
+    _band_bulk_manage_ui(mem, order)
+
     for node in order:
         code = node.get('code') or '?'
         cur = node.get('status') or '未知'
         col, icon = _band_status_badge(cur)
         add_col, add_icon = _band_status_badge(node.get('added_status'))
         changed = bool(node.get('added_status')) and node.get('added_status') != cur
+        stage_txt = _band_stage_text(node)
         title = (f"{icon} {node.get('name')}（{code}）　{cur}"
                  + ("　⚠️ 状态已变化" if changed else "")
-                 + ("　🗄️ 已归档" if node.get('closed') else ""))
-        with st.expander(title, expanded=(cur in BAND_ALERT_STATUSES and not node.get('closed'))):
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("当前状态", cur)
-            m2.metric("入选时", f"{add_icon} {node.get('added_status') or '—'}")
-            m3.metric("现价", _fmt_price(node.get('price')))
-            m4.metric("入选价", _fmt_price(node.get('added_price')))
+                 + ("　🗄️ 已归档" if node.get('closed') else "")
+                 + (f"　·　{stage_txt}" if stage_txt else ""))
+        # ★ 「只展开新出现的预警」—— 判定抽在 band_alert_need_expand 里（可单测），
+        #   这里只负责接线。别把条件再内联回来：AppTest 断言不了展开状态。
+        need_show = band_alert_need_expand(node)
+        with st.expander(title, expanded=need_show):
+            _s = band_stage_calc(band_start_price(node), node.get('price'),
+                                 node.get('platform_high'))
+            # 启动价是不是"推算"来的：容器重启后本地不存 added_price，只能从入册轨迹近似。
+            # ★ 只有**真的推出了值**才敢叫「推算」：added_price 和轨迹都没有时（例如复盘用的
+            #   历史样本、或数据被清过），启动价是 0、界面显示「—」，这时再标「推算」就是骗人。
+            _start_guess = (_band_num(node.get('added_price')) <= 0
+                            and band_start_price(node) > 0)
+            _start_help = ("容器重启后本地不保存入选价，这里用**入册那条轨迹的价格**近似；"
+                           "误差通常极小，但它不是原始记录。" if _start_guess else None)
+            if _s:
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("当前状态", cur)
+                m2.metric("现价", _fmt_price(_s['cur']))
+                m3.metric("启动价" + ("（推算）" if _start_guess else ""),
+                          _fmt_price(_s['start']), help=_start_help)
+                m4.metric("目标价（动态）", _fmt_price(_s['target']),
+                          help="取**当前平台高点**，每次刷新重算 —— 平台抬高它就自动上移。"
+                               "这是按固定规则算出来的参考位，不是预测。")
+                m5.metric("阶段进度", f"{_s['progress'] * 100:.0f}%",
+                          delta=f"距目标 {_s['gap_pct']:+.1f}%", delta_color="off")
+                st.caption(f"{_s['stage']}　·　目标价 = 当前平台高点（参考位，非预测）；"
+                           f"平台抬高时它会跟着上移。")
+            else:
+                m1, m2, m3 = st.columns(3)
+                m1.metric("当前状态", cur)
+                m2.metric("现价", _fmt_price(node.get('price')))
+                m3.metric("启动价" + ("（推算）" if _start_guess else ""),
+                          _fmt_price(band_start_price(node)), help=_start_help)
+                _miss = []
+                if band_start_price(node) <= 0:
+                    _miss.append("启动价没有记录（容器重启后本地信息会丢，"
+                                 "点上面的「🔄 刷新全部状态」会按轨迹补算）")
+                if _band_num(node.get('platform_high')) <= 0:
+                    _miss.append("还没刷新过，拿不到平台高点")
+                elif _band_num(node.get('platform_high')) <= band_start_price(node):
+                    _miss.append("平台高点不高于启动价，暂时没有有效上行空间")
+                st.caption(("阶段进度暂缺：" + "；".join(_miss) + "。") if _miss
+                           else "阶段进度暂缺。")
             st.caption(
-                f"入选时间：{node.get('added_at') or '—'}　|　来源：{node.get('added_source') or '—'}"
+                f"入选时间：{node.get('added_at') or '—'}"
+                f"　|　入选时：{add_icon} {node.get('added_status') or '—'}"
+                f"　|　来源：{node.get('added_source') or '—'}"
                 f"　|　最近检查：{node.get('last_check') or '未检查'}"
                 f"　|　20日线：{_fmt_price(node.get('ma20'))}")
+            if need_show:
+                if st.button("👁️ 我已看过这条预警（以后不再自动展开）",
+                             key=f"bandmem_ack_{code}"):
+                    # 只记本地（alert_ack 不在云端摘要白名单里），故意不推送，
+                    # 免得把「我什么时候看过」这种本机行为也写到公开仓库的密文里。
+                    node['alert_ack'] = str(node.get('status_ts') or '')
+                    save_band_memory(mem)
+                    st.session_state.band_memory_sync_msg = (
+                        f"{node.get('name')}：已标记看过，之后折叠；状态再变化会重新展开提醒")
+                    st.rerun()
             if node.get('reasons'):
                 st.caption(f"📋 最近依据：{node['reasons']}")
 
