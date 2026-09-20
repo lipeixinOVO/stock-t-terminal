@@ -5,11 +5,15 @@ name: 全市场样本自动采集（逻辑验证语料）
 # （都走 sample_harvest.py → AST 抽取 ai_stock_terminal.py 里的真实函数），
 # 所以云端采的样本和你本机采的样本逐字段同构。
 #
-# ★ 为什么不把语料提交回仓库（对比 notify.yml 回写 band_watch.json）：
-#   ① 体积：几十万行、数 MB，每天提交一次二进制会把仓库历史压垮；
-#   ② 隐私：本仓库是 public，语料 = 完整的「策略特征表 + 成绩单」，公开等于送人。
-#   所以这里走 actions/cache（跨运行保留、不进仓库树）+ 加密产物（BAND_KEY）。
-#   本机要拿云端采的样本：下载 Artifact 后
+# ★ 语料怎么回到网页（2026-09-19 改造）：
+#   原来采完只落在 actions/cache 和 Artifact 里 —— 网页端读的是本地文件，
+#   于是**云端页面上这个面板永远是空的**，只能靠你在本机手点，这就是「每天都要点一下」的根因。
+#   现在改成：采完 → 导出**只含前瞻(forward)样本**的加密快照 → 发布成一个滚动 release 资源
+#   （tag = data-latest），网页端每次打开页面自动拉这一份并解密。
+#   为什么走 release 而不是提交进仓库：语料是数 MB 的二进制，天天提交会把 git 历史撑爆
+#   （release 资源不进 git 历史）；为什么只导 forward：backfill 自带前视/生存者偏差、
+#   只能提假设，而 forward 才是能当成绩用的那一类，也是网页统计真正需要的。
+#   本机要拿云端采的全量语料（含 backfill）：下载 Artifact 后
 #     python sample_harvest.py --pull band_samples.enc
 
 on:
@@ -36,9 +40,11 @@ on:
     # 未配置 BAND_KEY 时这一步会自动跳过（不会报红），配好即自动开始积累。
     - cron: "40 7 * * 1-5"
 
-# ★ 只读权限：刻意不给 contents: write —— 从机制上保证语料不可能被提交进仓库
+# ★ contents: write 只为了发布 data-latest 这个 release 资源。
+#   语料本身全程是**加密**的（BAND_KEY，fail-closed：没密钥就拒绝落盘为明文），
+#   并且**不进 git 历史**，所以公开仓库里不会出现策略特征表的明文。
 permissions:
-  contents: read
+  contents: write
 
 # 串行化，避免两次运行同时写同一份缓存
 concurrency:
@@ -119,6 +125,39 @@ jobs:
         with:
           path: band_samples.enc
           key: band-samples-${{ steps.ckey.outputs.key }}-${{ github.run_id }}
+
+      - name: 导出前瞻语料快照（只含 forward，网页端读的就是它）
+        if: always()
+        env:
+          BAND_KEY: ${{ secrets.BAND_KEY }}
+        run: |
+          if [ -z "$BAND_KEY" ]; then
+            echo "::warning::未配 BAND_KEY，跳过导出。"
+            exit 0
+          fi
+          if [ ! -f band_samples.enc ]; then
+            echo "(缓存里没有语料，跳过导出)"
+            exit 0
+          fi
+          python sample_harvest.py --export-forward band_samples_forward.enc \
+            --store enc --file band_samples.enc
+
+      - name: 发布快照到 data-latest（网页端自动读取这一份）
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f band_samples_forward.enc ]; then
+            echo "(没有前瞻快照，跳过发布 —— 库里还没攒下前瞻样本时属正常)"
+            exit 0
+          fi
+          ls -la band_samples_forward.enc
+          gh release view data-latest >/dev/null 2>&1 || \
+            gh release create data-latest \
+              --title "样本语料（滚动更新）" \
+              --notes "由 sample-harvest 工作流每日自动发布。文件为 BAND_KEY 加密产物，非明文；网页端读取此文件以展示「逻辑有效性验证」。"
+          gh release upload data-latest band_samples_forward.enc --clobber
+          echo "✅ 已发布到 data-latest"
 
       - name: 上传加密语料（供本机 --pull 拉回）
         if: always()
