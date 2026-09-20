@@ -65,6 +65,12 @@ st.markdown("""
     .ai-advice-box { background-color: #2b2b3b; padding: 15px; border-left: 5px solid #ffaa00; border-radius: 8px; color: #f0f2f6; font-size: 16px; margin-bottom: 20px; }
     .guide-box { background-color: #1a2b1a; padding: 15px; border-left: 5px solid #00cc66; border-radius: 8px; color: #f0f2f6; font-size: 16px; margin-bottom: 20px; }
     .predict-box { background-color: #2b1a1a; padding: 15px; border-left: 5px solid #ff4b4b; border-radius: 8px; color: #f0f2f6; font-size: 16px; margin-bottom: 20px; }
+    /* 今日盘面动态分析（2026-09-20 新增）：蓝边，和绿边「做T指引」、红边「极值预测」区分开 */
+    .struct-box { background-color: #16212e; padding: 15px; border-left: 5px solid #4aa3ff; border-radius: 8px; color: #f0f2f6; font-size: 16px; margin-bottom: 20px; }
+    .struct-tag { display: inline-block; margin-left: 8px; padding: 1px 9px; border-radius: 10px; background-color: #24384f; color: #9fd0ff; font-size: 13px; }
+    .struct-line { margin-top: 9px; line-height: 1.75; }
+    .struct-scen { margin-top: 9px; line-height: 1.75; color: #dfe6ef; }
+    .struct-warn { margin-top: 9px; line-height: 1.75; color: #ffd166; }
     div.stButton > button[kind="primary"] { background-color: #1f6feb; color: white; border: none; font-weight: bold; }
     div.stButton > button[kind="secondary"] { background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
     @media (min-width: 992px) {
@@ -825,8 +831,238 @@ def _intraday_divergence(df_min):
         _log("_intraday_divergence", e)
     return info
 
+
+# ================= 7.5 今日盘面动态分析 =================
+# 为什么要单独算这个（2026-09-20）：原来的「日内极值预测」只给出「以现价为中心、±0.6×ATR」
+# 的对称区间，它回答不了盘中最要紧的那个问题 ——「今天到底在走什么走势、现在算高位还是低位」；
+# 上下快的时候更是越看越糊。这一层专门讲**结构**：
+#   形态（单边 / 冲高回落 / 探底回升 / 横盘…）· 现价在当日区间的百分位 ·
+#   波动速度（是不是刚刚在加速）· 三种情景 + 触发价 · 与做T指引是否打架。
+# ★ 纯函数：不碰网络、不碰 Streamlit；now_time 由调用方传入，便于做确定性测试。
+INTRADAY_STRUCT_MIN_BARS = 10      # 少于这么多根分钟线，结构判定没有意义
+INTRADAY_SPEED_WINDOW = 30         # 「最近 N 分钟」窗口：判断波动是不是骤然加速
+INTRADAY_SPEED_FAST = 2.5          # 近窗口每分钟振幅 ÷ 当日至今平均每分钟振幅 ≥ 此值 → 上下太快
+INTRADAY_SPEED_WARM = 1.6          # ≥ 此值 → 波动加快
+INTRADAY_SPEED_CALM = 0.6          # ≤ 此值 → 波动收敛
+INTRADAY_RANGE_ATR_BIG = 1.3       # 当日振幅 ÷ ATR14 ≥ 此值 → 全天大波动（相对该股常态）
+INTRADAY_RANGE_ATR_CALM = 0.8      # ≤ 此值 → 相对自身常态偏收敛
+INTRADAY_NARROW_PCT = 0.5          # 当日振幅（%）不足此值 → 窄幅盘整
+INTRADAY_FLAT_PCT = 0.15           # 现价与开盘相差（%）不足此值 → 视为「走平」
+INTRADAY_HIGH_POS = 0.75           # 现价在当日区间的位置 ≥ 此值 → 日内高位
+INTRADAY_LOW_POS = 0.25            # ≤ 此值 → 日内低位
+INTRADAY_STILL_RATIO = 0.40        # 近窗口振幅 ÷ 当日振幅 ≤ 此值 → 「最近没在动」（横盘类）
+INTRADAY_EDGE_RATIO = 0.40         # 极值出现在前 40% 时段 → 算「单边」而不是「反转」
+
+INTRADAY_SHAPE_READ = {
+    "单边上行": "开盘后逐波抬高、日内低点出现在前段 —— 典型**单边上行**，盘中的回落多是洗盘；不破均价线方向仍偏多。",
+    "震荡上行": "重心缓慢上移、幅度不大 —— **震荡上行**，偏多但不强，别在日内高位追。",
+    "探底回升": "盘中砸出低点后又拉回来 —— **探底回升（V 型）**，低位有承接；但要站稳均价线才算真确认。",
+    "冲高回落": "高点已经过去、现价从高点回落明显 —— **冲高回落（倒 V）**，上方抛压重，反抽到均价线附近容易再被打下来。",
+    "单边下行": "开盘后逐波走低、日内高点出现在前段 —— **单边下行**，反抽到均价线附近都是减仓机会，别急着抄底。",
+    "震荡下行": "重心缓慢下移 —— **震荡下行**，偏弱，反弹力度通常有限。",
+    "高位横盘": "价格贴在日内高位窄幅波动 —— **高位横盘**：能放量突破日内高点就是蓄势，突不上去要防冲高做头。",
+    "低位横盘": "价格贴在日内低位窄幅波动 —— **低位横盘**：缩量会磨人，再放量跌破日内低点要防加速下跌。",
+    "横盘整理": "最近一段时间价格在一个小区间里反复 —— **横盘整理**，方向未定，等它自己选方向。",
+    "窄幅盘整": "全天振幅极小 —— **极度缩量盘整**，做T空间几乎没有，硬做只会被手续费磨损。",
+}
+
+
+def _intraday_stage_text(now_time):
+    """把当前时刻映射成盘中阶段。"""
+    if now_time < time(9, 30): return "开盘前"
+    if now_time <= time(10, 0): return "开盘半小时"
+    if now_time <= time(11, 30): return "上午盘中"
+    if now_time < time(13, 0): return "午间休市"
+    if now_time <= time(14, 30): return "下午盘中"
+    if now_time <= time(15, 0): return "尾盘"
+    return "已收盘"
+
+
+def analyze_intraday_structure(df_minute, prev_close, atr, now_time=None, direction=None):
+    """今日盘面动态分析（纯函数）。
+
+    参数：
+        df_minute  : 分时数据（需含 Time / Price，AvgPrice 可选）
+        prev_close : 昨收价，作为涨跌幅基准（<=0 或 None 时退回用开盘价）
+        atr        : 日线 ATR14，用来衡量「这只票平时一天波动多大」
+        now_time   : datetime.time；不传则取当前北京时间
+        direction  : 做T指引方向（"正T"/"反T"/"不做"），用于判断「指引」与「盘中位置」是否打架
+
+    返回 dict。ok=False 表示数据不足 —— 调用方直接跳过渲染即可，本函数不会抛异常。
+    """
+    out = {"ok": False, "shape": "", "shape_read": "", "stage": "", "pos": 0.0, "pos_pct": 0.0,
+           "chg": 0.0, "avg_dev": 0.0, "speed": 0.0, "speed_label": "", "win": 0,
+           "range_atr": 0.0, "range_label": "", "range_pct": 0.0,
+           "read": "", "scenarios": "", "conflict": "",
+           "open_price": 0.0, "day_high": 0.0, "day_low": 0.0,
+           "avg_line": 0.0, "mid_line": 0.0, "up_trigger": 0.0, "down_trigger": 0.0}
+    try:
+        if df_minute is None or getattr(df_minute, "empty", True):
+            return out
+        dfm = df_minute[df_minute["Time"] <= "1500"]
+        if len(dfm) < INTRADAY_STRUCT_MIN_BARS:
+            return out
+        px = pd.to_numeric(dfm["Price"], errors="coerce").dropna().reset_index(drop=True)
+        if len(px) < INTRADAY_STRUCT_MIN_BARS:
+            return out
+        n = len(px); span = max(n - 1, 1)
+        open_price = float(px.iloc[0]); cur = float(px.iloc[-1])
+        day_high = float(px.max()); day_low = float(px.min())
+        rng = day_high - day_low
+        _pc = 0.0
+        try:
+            _pc = float(prev_close) if prev_close is not None else 0.0
+        except (TypeError, ValueError):
+            _pc = 0.0
+        base = _pc if _pc > 0 else open_price
+        if base <= 0:
+            return out
+        avg_line = 0.0
+        if "AvgPrice" in dfm.columns:
+            _av = pd.to_numeric(dfm["AvgPrice"], errors="coerce").dropna()
+            if len(_av): avg_line = float(_av.iloc[-1])
+        want_time = now_time if now_time is not None else now_cn().time()
+        stage = _intraday_stage_text(want_time)
+
+        pos = (cur - day_low) / rng if rng > 1e-9 else 0.5
+        chg = (cur - base) / base * 100
+        avg_dev = (cur - avg_line) / avg_line * 100 if avg_line > 0 else 0.0
+        range_pct = rng / base * 100
+        high_ratio = int(px.idxmax()) / span
+        low_ratio = int(px.idxmin()) / span
+
+        # 近窗口振幅：既用于「形态」（最近是横着还是动着），也用于「速度」的分子
+        win = min(INTRADAY_SPEED_WINDOW, max(span, 1))
+        _tail = px.tail(win + 1)
+        recent_rng = float(_tail.max()) - float(_tail.min())
+        recent_ratio = recent_rng / rng if rng > 1e-9 else 0.0
+
+        # ---- 形态：先看「最近是否还在动」，再按方向 + 极值出现的时间位置区分单边 / 反转 ----
+        if range_pct < INTRADAY_NARROW_PCT:
+            shape = "窄幅盘整"
+        elif recent_ratio <= INTRADAY_STILL_RATIO or abs(cur - open_price) / open_price * 100 <= INTRADAY_FLAT_PCT:
+            shape = ("高位横盘" if pos >= INTRADAY_HIGH_POS
+                     else "低位横盘" if pos <= INTRADAY_LOW_POS else "横盘整理")
+        elif cur > open_price:
+            if pos >= INTRADAY_HIGH_POS:
+                shape = "单边上行" if low_ratio <= INTRADAY_EDGE_RATIO else "探底回升"
+            elif pos >= 0.45:
+                shape = "震荡上行"
+            else:
+                shape = "冲高回落"
+        else:
+            if pos <= INTRADAY_LOW_POS:
+                shape = "单边下行" if high_ratio <= INTRADAY_EDGE_RATIO else "冲高回落"
+            elif pos <= 0.55:
+                shape = "震荡下行"
+            else:
+                shape = "探底回升"
+
+        # ---- 速度：近窗口每分钟振幅 ÷ 当日至今平均每分钟振幅。
+        #      自归一化（不用 ATR 当标尺）—— 早期用 ATR/240 当基准会把「开盘本来就活跃」
+        #      误判成「上下太快」，实测偏差过大，弃用。
+        per_min_all = rng / span
+        per_min_recent = recent_rng / win
+        if span < INTRADAY_SPEED_WINDOW:
+            speed = 0.0; speed_label = "样本不足"
+        elif per_min_all <= 1e-9:
+            speed = 0.0; speed_label = "几乎不动"
+        else:
+            speed = per_min_recent / per_min_all
+            if speed >= INTRADAY_SPEED_FAST: speed_label = "上下太快"
+            elif speed >= INTRADAY_SPEED_WARM: speed_label = "波动加快"
+            elif speed <= INTRADAY_SPEED_CALM: speed_label = "波动收敛"
+            else: speed_label = "波动平稳"
+
+        _atr = 0.0
+        try:
+            _atr = float(atr)
+        except (TypeError, ValueError):
+            _atr = 0.0
+        if pd.isna(_atr) or _atr <= 0: _atr = 0.0
+        range_atr = rng / _atr if _atr > 0 else 0.0
+        if range_atr == 0.0: range_label = "无参照"
+        elif range_atr >= INTRADAY_RANGE_ATR_BIG: range_label = "全天大波动"
+        elif range_atr <= INTRADAY_RANGE_ATR_CALM: range_label = "波动收敛"
+        else: range_label = "波动正常"
+
+        # ---- 一句话结论 ----
+        pos_label = "日内高位" if pos >= INTRADAY_HIGH_POS else ("日内低位" if pos <= INTRADAY_LOW_POS else "日内中位")
+        avg_label = "在均价线上方" if avg_dev > 0.05 else ("在均价线下方" if avg_dev < -0.05 else "贴着均价线")
+        shape_read = INTRADAY_SHAPE_READ.get(shape, "盘面结构不典型。")
+        read = f"[{stage}] 今日涨跌 {chg:+.2f}%。{shape_read}"
+        read += f" 现价 {cur:.3f} 处于{pos_label}（当日区间 {pos * 100:.0f}% 分位），{avg_label} {avg_dev:+.2f}%。"
+        read += f" 当日振幅 {range_pct:.2f}%（约为该股日均波动的 {range_atr:.2f} 倍）。"
+        if speed > 0:
+            read += f" 近 {win} 分钟波动是今日平均的 {speed:.2f} 倍（{speed_label}）。"
+        else:
+            read += f" 开盘不足 {INTRADAY_SPEED_WINDOW} 分钟，还测不出波动是否在加速。"
+        if speed_label == "上下太快":
+            read += (" —— 现在是**直上直下**的段落，看不懂方向很正常：别在这个节奏里追涨杀跌，"
+                     "等一根缩量、振幅收窄的小 K 线（波动收敛）再动手。")
+
+        # ---- 三种情景 + 触发价 ----
+        mid = avg_line if avg_line > 0 else (day_high + day_low) / 2
+        scenarios = (
+            f"**① 偏强 —— 看延续上行**：放量站上 **{day_high:.3f}**（今日高点）且不破，前高之上还有空间；"
+            f"回踩不破均价线 {mid:.3f} 可跟。\n"
+            f"**② 中性 —— 看区间反复**：在 **{day_low:.3f} ~ {day_high:.3f}** 之间围绕均价线 {mid:.3f} 来回震荡"
+            f" —— 那就只做两头（贴上下沿反向操作），不追中间。\n"
+            f"**③ 偏弱 —— 看继续下探**：跌破 **{day_low:.3f}**（今日低点）且反抽无力，"
+            f"下一档参考 **{day_low - rng * 0.5:.3f}**（今日低点再下移半个当日振幅）。"
+        )
+
+        # ---- 指引与盘中位置是否打架（最容易亏钱的地方，必须明说）----
+        conflict = ""
+        if direction == "正T" and pos >= INTRADAY_HIGH_POS:
+            conflict = (f"⚠️ **指引与盘中位置打架**：日线指引偏「正T（先买后卖）」，但现价已在日内区间 "
+                        f"**{pos * 100:.0f}%** 的高位、距今日高点只剩 {day_high - cur:.3f} —— "
+                        f"此刻低吸等于买在日内天花板下沿。建议等回踩均价线 **{mid:.3f}** 附近再看，别在这个位置追。")
+        elif direction == "反T" and pos <= INTRADAY_LOW_POS:
+            conflict = (f"⚠️ **指引与盘中位置打架**：日线指引偏「反T（先卖后买）」，但现价已在日内区间 "
+                        f"**{pos * 100:.0f}%** 的低位、距今日低点只剩 {cur - day_low:.3f} —— "
+                        f"此刻高抛等于砍在日内地板上。建议等反抽均价线 **{mid:.3f}** 附近再减。")
+        elif direction == "正T" and pos <= INTRADAY_LOW_POS and avg_dev < 0:
+            conflict = (f"✅ **指引与盘中位置一致**：偏「正T低吸」，而现价正好在日内低位（{pos * 100:.0f}%）"
+                        f"且位于均价线下方 —— 位置是对的，但仍要等**缩量止跌**（不再创新低）再出手。")
+        elif direction == "反T" and pos >= INTRADAY_HIGH_POS and avg_dev > 0:
+            conflict = (f"✅ **指引与盘中位置一致**：偏「反T高抛」，而现价正好在日内高位（{pos * 100:.0f}%）"
+                        f"且冲在均价线上方 —— 位置是对的，冲高滞涨（不再创新高）即可减仓。")
+
+        out.update({
+            "ok": True, "shape": shape, "shape_read": shape_read, "stage": stage,
+            "pos": round(pos, 4), "pos_pct": round(pos * 100, 1),
+            "chg": round(chg, 2), "avg_dev": round(avg_dev, 2),
+            "speed": round(speed, 2), "speed_label": speed_label, "win": win,
+            "range_atr": round(range_atr, 2), "range_label": range_label,
+            "range_pct": round(range_pct, 2),
+            "read": read, "scenarios": scenarios, "conflict": conflict,
+            "open_price": round(open_price, 3), "day_high": round(day_high, 3),
+            "day_low": round(day_low, 3), "avg_line": round(avg_line, 3),
+            "mid_line": round(mid, 3), "up_trigger": round(day_high, 3),
+            "down_trigger": round(day_low, 3),
+        })
+        return out
+    except Exception as e:
+        _log("analyze_intraday_structure", e)
+        return out
+
+
+def _intraday_rich_text(text):
+    """把「今日看盘」四个盒子里的文案渲染成 HTML：自己转义、自己换行。
+
+    用于 struct-box / ai-advice-box / guide-box / predict-box —— 它们的文案都是塞在
+    `<div ...>` 里的 raw HTML。Streamlit 前端走的是 `allowDangerousHtml` 直通 HTML，
+    **raw HTML 块内部的 markdown 不会被解析**（已在前端包 StreamlitMarkdown 里确认）：
+    原样传 `**今日不做T**` 会显示成星号，而不是加粗。所以这里自己转，不赌渲染器行为。
+    """
+    s = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+    return s.replace("\n", "<br>")
+
+
 # ================= 8. 核心策略判定 =================
-def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
+def generate_report_and_advice(df_daily, df_minute, deviation, market_change, prev_close=None):
     latest = df_daily.iloc[-1]; prev = df_daily.iloc[-2]
     trend = "震荡"
     if latest['MA20_UP'] and latest['Close'] > latest['MA20']: trend = "上升"
@@ -853,13 +1089,22 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     support = round(min(latest['MA20'], latest['BOLL_LOW']), 3); resistance = round(max(latest['Close'] * 1.02, latest['BOLL_UP']), 3)
     best_buy = "无有效点"; best_sell = "无有效点"; buy_points = pd.DataFrame(); sell_points = pd.DataFrame(); buy_warning = ""; divergence_info = ""
     best_buy_price = 0.0; best_sell_price = 0.0   # 同时保留数值，避免下游再去 split 自己拼的字符串
+    # ★ 2026-09-20 拆开两个量：区间上沿/下沿并不是「预测」—— 它是「已实现极值」与
+    #   「剩余时段外推」取并集，上午冲过一次高之后，上沿会长时间停在那根已发生的高点上。
+    #   所以额外把「剩余时段预估振幅」单独留出来（intraday_pred_offset），文案里如实写明。
     intraday_high_predict = 0; intraday_low_predict = 0
+    intraday_pred_offset = 0.0; intraday_pred_mode = ""
+    cur_price = 0.0; day_high = 0.0; day_low = 0.0
     if not df_minute.empty:
-        cur_price = df_minute['Price'].iloc[-1]; day_high = df_minute['Price'].max(); day_low = df_minute['Price'].min()
+        cur_price = float(df_minute['Price'].iloc[-1]); day_high = float(df_minute['Price'].max()); day_low = float(df_minute['Price'].min())
         atr = latest['ATR14'] if not pd.isna(latest['ATR14']) else cur_price * 0.02
         now_time = now_cn().time()
-        if now_time < time(9, 30): intraday_high_predict = round(latest['Close'] + atr * 0.5, 3); intraday_low_predict = round(latest['Close'] - atr * 0.5, 3)
-        elif now_time > time(15, 0): intraday_high_predict = day_high; intraday_low_predict = day_low
+        if now_time < time(9, 30):
+            intraday_high_predict = round(latest['Close'] + atr * 0.5, 3); intraday_low_predict = round(latest['Close'] - atr * 0.5, 3)
+            intraday_pred_offset = atr * 0.5; intraday_pred_mode = "盘前"
+        elif now_time > time(15, 0):
+            intraday_high_predict = day_high; intraday_low_predict = day_low
+            intraday_pred_offset = 0.0; intraday_pred_mode = "收盘结算"
         else:
             _today = now_cn().date()
             current_dt = datetime.combine(_today, now_time); start_am = datetime.combine(_today, time(9, 30)); end_am = datetime.combine(_today, time(11, 30)); start_pm = datetime.combine(_today, time(13, 0))
@@ -868,6 +1113,7 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
             if passed_minutes > 10: realized_volatility_per_min = (day_high - day_low) / passed_minutes; remaining_range = realized_volatility_per_min * remaining_minutes
             else: remaining_range = atr * 0.5
             dynamic_offset = min(remaining_range, atr) * 0.6
+            intraday_pred_offset = dynamic_offset; intraday_pred_mode = "盘中"
             intraday_high_predict = round(max(day_high, cur_price + dynamic_offset), 3); intraday_low_predict = round(min(day_low, cur_price - dynamic_offset), 3)
     sig = compute_intraday_signals(df_minute, deviation) if allow_t == "允许" else None
     if sig:
@@ -916,10 +1162,46 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change):
     if allow_t == "不允许": t_guide = f"**今日不做T** —— 日线处于下降趋势且未企稳，风险大于收益。\n\n操作建议：\n1. 空仓观望或仅持底仓不动。\n2. 若盘中有冲高至压力位 {resistance:.3f} 附近，可少量反T减仓。\n3. 等待日线企稳信号（缩量止跌+支撑不破）再考虑重新入场。"
     elif direction == "反T": t_guide = f"**今日优先做反T（先卖后买）** —— 日线下降趋稳或震荡区间上沿。\n\n操作步骤：\n1. **高抛**：当分时价格冲高至均价线以上 {deviation*100:.2f}% 且放量滞涨时，减仓 30%。\n2. **低吸回补**：待价格回落至日线支撑 {support:.3f} 附近缩量企稳时，用同等仓位买回。\n3. **止损**：若回补后跌破 {support:.3f}，立刻止损。\n4. **仓位**：单次不超过底仓 30%。"
     else: t_guide = f"**今日优先做正T（先买后卖）** —— 日线趋势向上且已企稳。\n\n操作步骤：\n1. **低吸**：当分时价格回踩均价线以下 {deviation*100:.2f}% 且缩量企稳时，买入 30% 仓位。\n2. **高抛**：待价格冲高至压力位 {resistance:.3f} 附近且放量滞涨时，卖出回补的仓位。\n3. **止损**：若买入后跌破买入价 0.5%，立刻止损。\n4. **仓位**：单次不超过底仓 30%，单日最多操作 2-3 次。"
-    if intraday_high_predict > 0: predict_text = f"**今日预估波动区间（动态调整）**：\n- 预估最高点：**{intraday_high_predict:.3f}**（基于实时波动率与剩余时间）\n- 预估最低点：**{intraday_low_predict:.3f}**（基于实时波动率与剩余时间）\n- 当前价格：**{df_minute['Price'].iloc[-1]:.3f}**\n\n⚠️ 该预测随盘中行情变化而动态更新，仅供参考，不构成操作依据。"
+    if intraday_high_predict > 0:
+        if intraday_pred_offset <= 0 and intraday_pred_mode == "收盘结算":
+            predict_text = (f"**今日波动区间（收盘结算）**：\n"
+                            f"- 今日最高：**{intraday_high_predict:.3f}**\n"
+                            f"- 今日最低：**{intraday_low_predict:.3f}**\n\n"
+                            f"⚠️ 已收盘 —— 这里显示的是今日**实际**极值，不是预测。")
+        elif intraday_pred_mode == "盘前":
+            predict_text = (f"**今日预估波动区间（盘前）**：\n"
+                            f"- 预估最高：**{intraday_high_predict:.3f}**\n"
+                            f"- 预估最低：**{intraday_low_predict:.3f}**\n"
+                            f"- 参考价（昨收）：**{latest['Close']:.3f}**\n\n"
+                            f"⚠️ 开盘前只能按昨收 ± 半个 ATR 估，开盘后会自动转成按实时波动率算。")
+        else:
+            predict_text = (f"**今日波动区间（盘中动态）**：\n"
+                            f"- 今日**已**出现：最高 **{day_high:.3f}** / 最低 **{day_low:.3f}**\n"
+                            f"- 剩余时段预估振幅：**±{intraday_pred_offset:.3f}**（现价 {cur_price:.3f}）\n"
+                            f"- 全天预估区间：**{intraday_low_predict:.3f} ~ {intraday_high_predict:.3f}**\n\n"
+                            f"⚠️ 全天区间 = 「今日已实现的极值」与「剩余时段按实时波动率外推」取并集。"
+                            f"所以只要上午冲过一次高，上沿就会长时间停在那个**已经发生过的**最高价上 —— "
+                            f"它回答的是「今天已经走过哪儿」，不是「接下来要去哪儿」。"
+                            f"要看接下来怎么走，读下方的「今日盘面动态分析」。")
     else: predict_text = "数据不足，无法预测日内极值。"
+    # ★ 盘面结构：与「极值预测」互补 —— 预测给区间，结构给「现在处在什么走势的哪一段」。
+    intraday_struct = analyze_intraday_structure(df_minute, prev_close, latest['ATR14'],
+                                                 now_cn().time(), direction)
     context = f"""【当前盘面实时数据】\n标的: {current_name} ({symbol})\n当前价格: {latest['Close']:.3f}\n日线趋势: {trend}\n是否企稳: {'是' if is_steady else '否'}\n做T方向: {direction}\n关键支撑: {support:.3f}\n关键压力: {resistance:.3f}\n大盘涨跌幅: {market_change:.2f}%\n当前最优买点: {best_buy}\n当前最优卖点: {best_sell}\n日内预估最高: {intraday_high_predict:.3f}\n日内预估最低: {intraday_low_predict:.3f}"""
-    return report, ai_advice, t_guide, predict_text, buy_points, sell_points, context, best_buy, best_sell, latest
+    if intraday_struct.get("ok"):
+        _spd = (f"{intraday_struct['speed']:.2f} 倍" if intraday_struct['speed'] > 0
+                else "开盘不足 30 分钟，测不出加速度")
+        context += (f"\n\n【今日盘面结构】\n"
+                    f"形态: {intraday_struct['shape']}（盘中阶段: {intraday_struct['stage']}）\n"
+                    f"日内位置: {intraday_struct['pos_pct']:.0f}%（0=今日最低，100=今日最高）\n"
+                    f"现价相对昨收: {intraday_struct['chg']:+.2f}%\n"
+                    f"相对均价线: {intraday_struct['avg_dev']:+.2f}%\n"
+                    f"当日振幅: {intraday_struct['range_pct']:.2f}%（约为该股日均波动的 {intraday_struct['range_atr']:.2f} 倍）\n"
+                    f"近30分钟波动速度: {intraday_struct['speed_label']}（{_spd}）\n"
+                    f"结构判读: {intraday_struct['read']}")
+        if intraday_struct.get("conflict"):
+            context += f"\n指引冲突提示: {intraday_struct['conflict']}"
+    return report, ai_advice, t_guide, predict_text, buy_points, sell_points, context, best_buy, best_sell, latest, intraday_struct
 
 # ================= 9. 全天候监控所有自选股 =================
 def monitor_all_watchlist(send_key, market_change):
@@ -4774,7 +5056,7 @@ try:
     if len(df_daily) >= 2 and last_k_norm == today_norm: prev_close = df_daily['Close'].iloc[-2]
     else: prev_close = df_daily['Close'].iloc[-1]
     actual_deviation = dynamic_deviation(df_minute) if auto_dev else manual_dev
-    report, ai_advice, t_guide, predict_text, buy_points, sell_points, context, best_buy, best_sell, latest = generate_report_and_advice(df_daily, df_minute, actual_deviation, market_change)
+    report, ai_advice, t_guide, predict_text, buy_points, sell_points, context, best_buy, best_sell, latest, intraday_struct = generate_report_and_advice(df_daily, df_minute, actual_deviation, market_change, prev_close)
     if is_trading_time() and st.session_state.get('send_key') and st.session_state.get('enable_page_monitor', False):
         fired = monitor_all_watchlist(st.session_state.send_key, market_change)
         st.session_state.last_monitor_time = now_cn_str('%H:%M:%S')
@@ -4797,10 +5079,40 @@ try:
 
     with _tab_today:
         st.markdown(f'<div class="report-box">{report}</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="ai-advice-box">🤖 <b>AI 实时建议</b><br>{ai_advice}</div>', unsafe_allow_html=True)
+        # ★ 三个盒子里的文案都过 _intraday_rich_text：它们是塞进 <div> 的 raw HTML，
+        #   Streamlit 前端用 allowDangerousHtml 直通 HTML，**块内的 markdown 不会被解析**，
+        #   `**加粗**` 会原样显示成星号（已在 StreamlitMarkdown 前端包里确认）。
+        #   所以自己把 ** 转 <b>、换行转 <br>，不依赖渲染器。
+        st.markdown(f'<div class="ai-advice-box">🤖 <b>AI 实时建议</b><br>{_intraday_rich_text(ai_advice)}</div>', unsafe_allow_html=True)
+        # ================= ★ 今日盘面动态分析（2026-09-20 新增）=================
+        # 起因：用户反馈「盘面上下太快的时候根本看不懂今天到底可能是什么走势」。
+        # 原来的两栏（做T指引 / 极值预测）各答一个侧面，谁也不回答「今天在走什么结构」；
+        # 而极值预测的上下沿会被**已实现**的极值钉住，越到下午越像在回显事实。
+        # 这一栏专门讲结构：形态 + 日内位置 + 波动速度 + 三种情景 + 触发价，
+        # 并且当「指引方向」与「盘中位置」互相打架时**明说出来**（那是最容易亏钱的位置）。
+        if intraday_struct.get("ok"):
+            _st_sub = _intraday_rich_text(intraday_struct["read"])
+            _st_scen = _intraday_rich_text(intraday_struct["scenarios"])
+            _st_conf = _intraday_rich_text(intraday_struct["conflict"]) if intraday_struct.get("conflict") else ""
+            _st_html = (
+                f'<div class="struct-box">🧭 <b>今日盘面动态分析</b>'
+                f'<span class="struct-tag">{intraday_struct["shape"]}</span>'
+                f'<span class="struct-tag">{intraday_struct["stage"]}</span>'
+                f'<span class="struct-tag">昨收以来 {intraday_struct["chg"]:+.2f}%</span>'
+                f'<span class="struct-tag">日内位置 {intraday_struct["pos_pct"]:.0f}%</span>'
+                f'<span class="struct-tag">振幅 {intraday_struct["range_pct"]:.2f}%（{intraday_struct["range_label"]}）</span>'
+                f'<span class="struct-tag">{intraday_struct["speed_label"]}</span>'
+                f'<div class="struct-line">{_st_sub}</div>'
+                f'<div class="struct-scen">{_st_scen}</div>'
+                + (f'<div class="struct-warn">{_st_conf}</div>' if _st_conf else "")
+                + '</div>'
+            )
+            st.markdown(_st_html, unsafe_allow_html=True)
+        else:
+            st.caption("🧭 今日盘面动态分析：分时数据不足（至少需要 10 根分钟线），暂不判定结构。")
         col_g, col_p = st.columns(2)
-        with col_g: st.markdown(f'<div class="guide-box">🎯 <b>今日做T指引</b><br>{t_guide}</div>', unsafe_allow_html=True)
-        with col_p: st.markdown(f'<div class="predict-box">📊 <b>日内极值预测</b><br>{predict_text}</div>', unsafe_allow_html=True)
+        with col_g: st.markdown(f'<div class="guide-box">🎯 <b>今日做T指引</b><br>{_intraday_rich_text(t_guide)}</div>', unsafe_allow_html=True)
+        with col_p: st.markdown(f'<div class="predict-box">📊 <b>日内波动区间</b><br>{_intraday_rich_text(predict_text)}</div>', unsafe_allow_html=True)
         # ★ 分时图放最前：盘中真正盯着看的是它；日线图 120 根是「确认大势」用的，
         #   收进展开项，少占一屏。
         col_title2, col_btn2 = st.columns([9, 1])
