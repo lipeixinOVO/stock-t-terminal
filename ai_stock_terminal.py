@@ -2017,14 +2017,37 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None, pri
                                        f"深度分析 {len(to_scan)} 只（失败 {no_data} 只）→ 无有效结果")
         return pd.DataFrame()
 
-    # 排序：结束预警优先（需要关注），然后按分数降序
+    # ★★ 2026-09-21 修 bug（用户反馈「我点了这个扫描波段启动股，但是没有选出来任何一个」）：
+    #   旧实现把所有结果按「结束预警优先」排序后，一句 `.head(max_results)` 截断 ——
+    #   全市场里「跌破支撑 / 顶背离」动辄几百只，20 个展示位会被结束信号**全部吃满**，
+    #   「波段启动确认」被排挤到 df 之外 → 主区永远是「刚启动（0 只）」。
+    #   可这一页存在的唯一意义就是回答「今天有哪些票刚启动」。
+    #   所以改成：**信号不设名额，噪音才设名额** ——
+    #     启动确认：全部保留（按分数降序），只给一个防极端行情的大上限；
+    #     其余状态：按「结束预警优先」排序后截断到 max_results。
+    # ★ 同时按用户 2026-09-21 的要求，**结束信号（顶背离 / 跌破支撑）不再出现在选股页**
+    #   （原话「把这些所谓的顶背离的都删了，我不在乎他们是不是顶背离，因为我都没有选过他们」）。
+    #   它只对「🧠 波段记忆」里在跟踪的票有意义 —— 那里有红框与微信推送。
+    # ★ 这里只是**不展示**，不是丢弃：`band_last_raw`（记忆层自动入册用）仍是全集，
+    #   scan_stats 与页面上都会写明「N 只结束信号已移出本页」，不做静默隐藏。
     status_order = {'顶背离预警': 0, '跌破支撑': 1, '波段启动确认': 2, '波段进行中': 3, '波段未形成': 4}
-    scored_sorted = sorted(scored, key=lambda x: (status_order.get(x['Status'], 5), -x['Score']))
+    entries = sorted([r for r in scored if r['Status'] in BAND_ENTRY_STATUSES],
+                     key=lambda x: -x['Score'])
+    others = sorted([r for r in scored if r['Status'] not in BAND_ENTRY_STATUSES],
+                    key=lambda x: (status_order.get(x['Status'], 5), -x['Score']))
+    alerts = [r for r in others if r['Status'] in BAND_ALERT_STATUSES]
+    rest = [r for r in others if r['Status'] not in BAND_ALERT_STATUSES]
+    _ENTRY_CAP = 100          # 启动确认不设「名额」，但极端行情下别渲染上千张卡片
+    _cap_note = f"，本页展示前 {_ENTRY_CAP}" if len(entries) > _ENTRY_CAP else ""
+    scored_sorted = entries + others          # 全集：记忆层自动入册用，不受展示截断影响
+    st.session_state.scan_alerts_hidden = len(alerts)     # 选股页据此写「已移出本页 N 只」
     st.session_state.scan_stats = (f"拉取 {len(all_stocks)} 只 → 初筛 {total_cand} 只{_cap_txt} → "
-                                   f"深度分析 {len(to_scan)} 只（K线失败 {no_data} 只）→ 有效 {len(scored)} 只")
-    df = pd.DataFrame(scored_sorted).head(max_results).reset_index(drop=True)
+                                   f"深度分析 {len(to_scan)} 只（K线失败 {no_data} 只）→ 有效 {len(scored)} 只"
+                                   f"（启动确认 {len(entries)} 只{_cap_note}；"
+                                   f"结束信号 {len(alerts)} 只已移出本页）")
+    df = pd.DataFrame(entries[:_ENTRY_CAP] + rest[:max_results]).reset_index(drop=True)
     df.index = df.index + 1
-    st.session_state.band_last_raw = scored_sorted   # 供记忆层自动入册（不受 max_results 截断影响）
+    st.session_state.band_last_raw = scored_sorted
     return df
 
 # ============ 波段记忆（Band Memory）============
@@ -2262,6 +2285,12 @@ def band_memory_purge(mem, mode="never_started"):
     mode="never_started"：只删「入选时不是波段启动确认」的条目 —— 也就是旧规则下
         由「跌破支撑 / 顶背离预警」误建的那些。**带备注的条目一律保留**，
         因为写了备注说明你是主动关注它的，不能当噪音清掉。
+    mode="alert"：只删「入选时就是结束预警（顶背离 / 跌破支撑）」的条目，
+        **连带备注一起删**。这是用户 2026-09-21 明确点名的口径 ——
+        原话「把这些所谓的顶背离的都删了，我不在乎他们是不是顶背离，因为我都没有选过他们」。
+        与 never_started 的差别：那些备注多半不是在说这只票（是旧规则灌进来时顺手带的），
+        所以这里不拿备注当免删金牌；但**启动确认入册的、以及手动记入的（added_status 为空）
+        一律不动**，避免误伤用户真正手动加进来的票。
     mode="all"：全清（调用方须自行做二次确认）。
     """
     stocks = mem.get('stocks')
@@ -2277,6 +2306,12 @@ def band_memory_purge(mem, mode="never_started"):
         if mode == "all":
             stocks.pop(code, None)
             removed += 1
+            continue
+        if mode == "alert":
+            # 只认「入选时就是预警状态」这一条 —— added_status 为空的（手动记入）不碰
+            if node.get('added_status') in BAND_ALERT_STATUSES:
+                stocks.pop(code, None)
+                removed += 1
             continue
         if node.get('added_status') in BAND_ENTRY_STATUSES:
             continue                       # 正常入册（启动确认）的保留
@@ -2300,6 +2335,18 @@ def band_memory_purge_stats(mem):
         else:
             junk += 1
     return junk, noted
+
+def band_memory_alert_stats(mem):
+    """统计「入选时就是结束预警（顶背离 / 跌破支撑）」的条目数。
+
+    单独一个函数而不是往 `band_memory_purge_stats` 里塞第三个返回值 ——
+    那个函数的 (junk, noted) 二元组已被多处解包，改签名会连带改一片调用点。
+    """
+    n = 0
+    for node in (mem.get('stocks') or {}).values():
+        if isinstance(node, dict) and node.get('added_status') in BAND_ALERT_STATUSES:
+            n += 1
+    return n
 
 # ============ 策略复盘：批次 / 结案 / 归因（P0，只统计不改参数）============
 # 读这一节之前先看上面 REVIEW_* 常量的三条原则。
@@ -4804,25 +4851,32 @@ def band_memory_ui():
     # 修复「全市场扫描把几百只预警灌进记忆」之后，必须给用户一个清掉存量的口子，
     # 否则 460 条只能一只一只点删除。
     _junk, _noted = band_memory_purge_stats(mem)
-    with st.expander(f"🧹 清理记忆（{_junk} 只可清理）", expanded=False):
+    _n_alert = band_memory_alert_stats(mem)
+    with st.expander(f"🧹 清理记忆（{_junk} 只噪声 / {_n_alert} 只结束信号）", expanded=False):
         st.markdown(f"""
         2026-09-19 之前的版本允许用「跌破支撑 / 顶背离预警」**新建**记忆条目，
         全市场扫描一次就会把几百只跌破 20 日线的股票灌进来。现在规则已改为
         **只有「波段启动确认」能入册**，这里用来清理已经堆下来的存量。
 
-        - 可清理：**{_junk}** 只（入选时不是「波段启动确认」，且你没写过备注）
+        - 噪声可清理：**{_junk}** 只（入选时不是「波段启动确认」，且你没写过备注）
         - 会保留：**{_noted}** 只（你写过备注，说明是主动关注的）
+        - **结束信号条目：{_n_alert}** 只（入选时就是顶背离 / 跌破支撑 —— 旧规则自动灌进来的，
+          你从没主动选过它们。这一档**连带备注一起删**。）
         - 正常入册的（启动确认）一律不动
         """)
         _pend = st.session_state.get('bandmem_purge_pending')
         if _pend == 'junk':
             st.warning(f"确认删除这 {_junk} 只？不可恢复，建议先点上方「📥 下载备份」留底。")
+        elif _pend == 'alert':
+            st.warning(f"确认删除这 **{_n_alert} 只结束信号条目**（顶背离 / 跌破支撑）？"
+                       "**带备注的也会一起删**，不可恢复 —— 建议先点上方「📥 下载备份」留底。")
         elif _pend == 'all':
             st.error("确认**清空全部记忆**？所有备注与轨迹都会一起删除，不可恢复。")
         if _pend:
             _k1, _k2 = st.columns(2)
             if _k1.button("✅ 确认", key="bandmem_purge_ok", use_container_width=True):
-                _mode = 'all' if _pend == 'all' else 'never_started'
+                _mode = ('all' if _pend == 'all' else
+                         'alert' if _pend == 'alert' else 'never_started')
                 _mem2, _n = band_memory_purge(mem, _mode)
                 save_band_memory(_mem2)
                 _pmsg = ""
@@ -4837,12 +4891,19 @@ def band_memory_ui():
                 st.session_state['bandmem_purge_pending'] = None
                 st.rerun()
         else:
-            _b1, _b2 = st.columns(2)
+            _b1, _b2, _b3 = st.columns(3)
             if _b1.button(f"🧹 清理这 {_junk} 只", key="bandmem_purge_junk",
-                          use_container_width=True, disabled=(_junk == 0)):
+                          use_container_width=True, disabled=(_junk == 0),
+                          help="删掉「入选时不是波段启动确认、且你没写过备注」的条目"):
                 st.session_state['bandmem_purge_pending'] = 'junk'
                 st.rerun()
-            if _b2.button("🗑️ 清空全部记忆", key="bandmem_purge_all", use_container_width=True):
+            if _b2.button(f"⚠️ 清结束信号（{_n_alert}）", key="bandmem_purge_alert",
+                          use_container_width=True, disabled=(_n_alert == 0),
+                          help="删掉全部「入选时就是顶背离 / 跌破支撑」的条目 —— 带备注的也会删。"
+                               "这些是旧规则自动灌进来的，你从没主动选过它们。"):
+                st.session_state['bandmem_purge_pending'] = 'alert'
+                st.rerun()
+            if _b3.button("🗑️ 清空全部记忆", key="bandmem_purge_all", use_container_width=True):
                 st.session_state['bandmem_purge_pending'] = 'all'
                 st.rerun()
 
@@ -5149,11 +5210,61 @@ def _add_band_to_memory(r, source="手动加入"):
         return f"❌ 加入记忆失败：{type(e).__name__}: {str(e)[:120]}"
 
 
+def _scan_drop_row(code):
+    """把一只票从**本次扫描结果**里去掉（只动 session_state，不碰记忆与文件）。
+
+    ★ 这是「加一个可以删除的功能」里**无副作用**的一半：重扫还会出现，
+      所以不需要二次确认。真正不可逆的是 `_scan_delete_from_memory`。
+    """
+    df = st.session_state.get('scan_results')
+    if df is None or getattr(df, 'empty', True):
+        return 0
+    keep = df[df['Code'].astype(str) != str(code)]
+    n = int(len(df) - len(keep))
+    if n:
+        keep = keep.reset_index(drop=True)
+        keep.index = keep.index + 1
+        st.session_state.scan_results = keep
+    return n
+
+
+def _scan_delete_from_memory(code):
+    """把一只票从「波段记忆」（本地文件 + 云端）里删掉，返回给用户看的提示语。
+
+    ★★ 推送必须带 merge_remote=False：默认 True 会先拉云端那份再合并，而合并对
+      「云端有、本地没有」是**整节点照抄** → 刚删掉的票立刻被复活、还顺手写回本地
+      → 用户看到的就是「点了删除没反应」（2026-09-20 实测）。同一条纪律在
+      「🧠 波段记忆」的单只删除与「🧹 清理记忆」里都已存在，这里不能漏。
+    """
+    code = str(code or '').strip()
+    if not code:
+        return "❌ 代码为空，未删除。"
+    try:
+        mem = load_band_memory()
+        node = (mem.get('stocks') or {}).pop(code, None)
+        if not isinstance(node, dict):
+            return f"⚠️ {code} 不在跟踪清单里（可能已被删除）。"
+        _name = node.get('name') or code
+        save_band_memory(mem)
+        _ok, _msg = band_memory_push_github(mem, merge_remote=False)
+        if _ok:
+            return f"🗑️ 已从记忆中删除 **{_name}（{code}）**，云端巡检不再盯它。"
+        # 同步失败就别报「已删除」：云端那份还在，下次合并会把它拉回来。
+        return (f"⚠️ 已在本地删除 {_name}（{code}），但云端同步失败（{_msg}）——"
+                "下次同步时它可能被云端那份合并回来，请检查 GITHUB_TOKEN。")
+    except Exception as e:
+        _log("_scan_delete_from_memory", e)
+        return f"❌ 删除失败：{type(e).__name__}: {str(e)[:120]}"
+
+
 def _render_band_card(r, tracked=None):
     """渲染一张波段选股结果卡片。
 
     ★ 已在「跟踪清单」（波段记忆）里的票只打标记，**不再重复当成一条新发现** ——
       原先扫描结果里出现一次、记忆清单里又出现一次，就是「两块内容看着重复」的来源。
+    ★ 2026-09-21 加删除入口（用户原话「加一个可以删除的功能，因为这些我都没办法自己删除」）：
+      - 已跟踪 → 「🗑️ 从记忆删除」：不可逆（本地 + 云端一起删），点击后**就地**出现一次确认；
+      - 未跟踪 → 「🗑️ 移除本行」：只从本次扫描结果里去掉，重扫会回来，故不设确认。
     """
     tracked = tracked or set()
     chg_color = "#ff4b4b" if r['ChangePct'] >= 0 else "#00cc66"
@@ -5173,11 +5284,11 @@ def _render_band_card(r, tracked=None):
                     <div style="margin-top:6px; color:#f9e2af; font-size:13px;">📋 {r['Reasons']}</div>
                 </div>
                 """, unsafe_allow_html=True)
-    # ---- 一键进「波段记忆」----
+    # ---- 操作行：一键进「波段记忆」 / 删除 ----
     # ★ 按钮只能放在卡片**下方**：Streamlit 的控件没法塞进上面那段 raw HTML 里。
     _code = str(r['Code'])
     _lot = float(r['Price'] or 0) * 100
-    _c_act, _c_hint = st.columns([1.15, 3.4])
+    _c_act, _c_del, _c_hint = st.columns([1.15, 1.15, 3.0])
     with _c_act:
         if _code in tracked:
             st.caption("✅ 已在跟踪清单")
@@ -5185,6 +5296,30 @@ def _render_band_card(r, tracked=None):
                        help="放进「🧠 波段记忆」全程监控：云端巡检每 5 分钟看一次，"
                             "出现顶背离 / 跌破支撑会推微信提醒。已买入的票点一下就行。"):
             st.session_state.band_memory_manual_msg = _add_band_to_memory(r)
+            st.rerun()
+    with _c_del:
+        # ★ 就地二次确认：`scan_del_pending` 是**非 widget** 的 state，
+        #   普通按钮里直接赋值合法（同「🧠 波段记忆」批量删除的写法）。
+        _del_pend = st.session_state.get('scan_del_pending')
+        if _code in tracked:
+            if _del_pend == _code:
+                _d1, _d2 = st.columns(2)
+                if _d1.button("✅ 确认", key=f"scan_delok_{_code}", use_container_width=True,
+                              help="确认从本地与云端清单一起移除，不可撤销"):
+                    st.session_state['scan_del_pending'] = None
+                    st.session_state.band_memory_manual_msg = _scan_delete_from_memory(_code)
+                    st.rerun()
+                if _d2.button("✖️ 取消", key=f"scan_delno_{_code}", use_container_width=True):
+                    st.session_state['scan_del_pending'] = None
+                    st.rerun()
+            elif st.button("🗑️ 从记忆删除", key=f"scan_memdel_{_code}", use_container_width=True,
+                           help="从「🧠 波段记忆」的本地清单与云端一起移除，之后不再监控这只票。"
+                                "不可撤销，点一下后会再确认一次。"):
+                st.session_state['scan_del_pending'] = _code
+                st.rerun()
+        elif st.button("🗑️ 移除本行", key=f"scan_drop_{_code}", use_container_width=True,
+                       help="只把这一行从**本次扫描结果**里去掉；下次重新扫描它还会出现。"):
+            _scan_drop_row(_code)
             st.rerun()
     with _c_hint:
         if _code in tracked:
@@ -5200,7 +5335,8 @@ def ai_band_picker_ui():
     st.caption("**只挑「刚启动」的票**：突破 60 日整理平台 + 放量站上 20 日线"
                "（排除科创/创业板/北交所/ST）。看中了就点卡片下方的「➕ 加入记忆」，"
                "之后由「🧠 波段记忆」全程盯着，出现顶背离 / 跌破支撑会推你微信。"
-               "其余状态（波段进行中 / 结束信号 / 未形成）收在最下方的折叠区里，不在这里凑热闹。")
+               "**结束信号（顶背离 / 跌破支撑）不会列在这一页** —— 它只对跟踪清单里的票有意义；"
+               "不想看的票可以直接点卡片下方「🗑️ 移除本行」删掉。")
 
     with st.expander("📖 选股逻辑说明", expanded=False):
         st.markdown("""
@@ -5210,7 +5346,7 @@ def ai_band_picker_ui():
         3. 站上 20 日线，20 日线在 60 日线上方更佳。
         4. MACD 金叉或红柱，资金流入加分。
 
-        **波段结束提醒**：
+        **波段结束提醒**（只在「🧠 波段记忆」里生效 —— 选股页不再列这类票）：
         - 顶背离：股价创新高，但 MACD 未创新高（且背离幅度 ≥30%，见下）。
         - 跌破支撑：收盘价跌破 20 日线。
 
@@ -5372,17 +5508,22 @@ def ai_band_picker_ui():
                 for _, r in _primary.iterrows():
                     _render_band_card(r, _tracked)
 
-            # ---- 其余状态：默认折叠，不占版面（保留全部结果，避免静默丢弃）----
+            # ★ 2026-09-21 按用户要求：**结束信号（顶背离 / 跌破支撑）不再出现在选股页**。
+            #   原话「把这些所谓的顶背离的都删了，我不在乎他们是不是顶背离，因为我都没有选过他们」。
+            #   它们只对「🧠 波段记忆」里在跟踪的票有意义 —— 那里的红框与微信推送会负责提醒。
+            #   ★ 但绝不静默：这里明写「已移出本页 N 只」，数字来自 screen_band_stocks 写的
+            #     `scan_alerts_hidden`（df 里已经没有它们了，只能从那里取）。
+            _n_hidden = int(st.session_state.get('scan_alerts_hidden') or 0)
+            if _n_hidden:
+                st.caption(f"⚠️ 已按你的要求把 **{_n_hidden} 只结束信号**（顶背离 / 跌破支撑）"
+                           "移出本页 —— 它们只对「🧠 波段记忆」里在跟踪的票有意义，"
+                           "那里的红框和微信推送会负责提醒。")
+            # ---- 其余状态：默认折叠，不占版面 ----
             _others = df_r[~df_r['Code'].astype(str).isin(_seen)]
             if not _others.empty:
-                with st.expander(f"📂 其他状态（{len(_others)} 只：进行中 / 结束信号 / 未形成）"
+                with st.expander(f"📂 其他状态（{len(_others)} 只：进行中 / 未形成）"
                                  "—— 默认折叠，不影响选股", expanded=False):
-                    st.caption("**「结束信号」只对「🧠 波段记忆」里在跟踪的票有意义** ——"
-                               "不持有的票，它结束不结束与你无关；而你持有的票，"
-                               "结束提醒由记忆清单的红框和微信推送负责。"
-                               "这里保留全部结果，只是为了不静默丢掉任何一行。")
                     for _gtitle, _gsts in (
-                            ("⚠️ 结束信号（顶背离 / 跌破支撑）", ('顶背离预警', '跌破支撑')),
                             ("🔄 波段进行中", ('波段进行中',)),
                             ("… 波段未形成", ('波段未形成',)),
                     ):
