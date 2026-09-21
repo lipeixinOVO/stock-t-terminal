@@ -416,6 +416,11 @@ def _band_metrics(df):
     lookback = 60
     platform_high = float(high.tail(lookback).max())
     platform_low = float(low.tail(lookback).min())
+    # 突破位 = **突破前**的平台上沿（不含当天）。与 ai_stock_terminal.py 的
+    # `_calculate_band_metrics` **同口径**（两边的 docstring 都承诺"等价"，不能漂移）：
+    # 含当天的 platform_high 在"今天创新高"时等于现价，做不了突破位。
+    breakout_pivot = (float(high.tail(lookback + 1).iloc[:-1].max())
+                      if len(df) > lookback else 0.0)
     breakout = current >= platform_high * 0.995 and current >= float(close.tail(lookback).max()) * 0.999
 
     vol_5 = float(vol.tail(5).mean())
@@ -453,6 +458,7 @@ def _band_metrics(df):
     return {
         'current': current, 'ma20': ma20, 'ma60': ma60,
         'platform_high': platform_high, 'platform_low': platform_low,
+        'breakout_pivot': breakout_pivot,
         'breakout': breakout, 'vol_ratio': vol_ratio, 'volume_expansion': volume_expansion,
         'macd': float(macd.iloc[-1]),
         'macd_golden': bool(diff.iloc[-1] > dea.iloc[-1] and diff.iloc[-2] <= dea.iloc[-2]),
