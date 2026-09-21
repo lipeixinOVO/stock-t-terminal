@@ -4999,9 +4999,10 @@ def _render_band_card(r, tracked=None):
 def ai_band_picker_ui():
     st.markdown("---")
     st.header("🌊 波段做T选股")
-    st.caption("筛选突破整理平台+放量的波段启动股，并预警顶背离/跌破支撑等波段结束信号"
-               "（排除科创/创业板/北交所/ST）。扫描结果按**波段状态分组**，"
-               "下面是唯一的「跟踪清单」——同一只票全页只出现一次。")
+    st.caption("**只挑「刚启动」的票**：突破 60 日整理平台 + 放量站上 20 日线"
+               "（排除科创/创业板/北交所/ST）。看中了就点卡片下方的「➕ 加入记忆」，"
+               "之后由「🧠 波段记忆」全程盯着，出现顶背离 / 跌破支撑会推你微信。"
+               "其余状态（波段进行中 / 结束信号 / 未形成）收在最下方的折叠区里，不在这里凑热闹。")
 
     with st.expander("📖 选股逻辑说明", expanded=False):
         st.markdown("""
@@ -5144,39 +5145,62 @@ def ai_band_picker_ui():
                 st.caption(f"上次扫描时间: {st.session_state.scan_time}")
             if 'scan_stats' in st.session_state:
                 st.caption(f"📊 扫描漏斗: {st.session_state.scan_stats}")
-            # ★ 按波段状态分组，而不是一长串平铺 —— 原来启动/预警/进行中混在一起，
-            #   一眼看不出「今天该先看哪几只」。分组顺序＝处理优先级。
+            # ★ 2026-09-21 按用户要求重排：**选股页只回答「今天有哪些票刚启动」**。
+            #   用户原话：「我只要刚启动的，然后如果我选中的话就加入记忆清单，
+            #   然后在记忆清单里全程监视，及时提醒我结束。」
+            #   所以其余状态全部收进折叠区，理由：
+            #   - 「结束信号」只对**已在跟踪清单里的票**有意义 —— 你不持有的票，
+            #     它结束不结束跟你无关；而你持有的票，结束提醒由「🧠 波段记忆」的红框
+            #     和微信推送负责，不需要在选股页再看一遍。
+            #   - **折叠而不是删除**：任何一行都不静默丢弃（万一是自己持有的票，仍点得开）。
+            #   ★ 主区状态直接用 `BAND_ENTRY_STATUSES`，不另立一个常量 ——
+            #     「刚启动」和「能自动入册」本来就是同一件事，两处各写一份就会漂移。
             try:
                 _tracked = set((load_band_memory().get('stocks') or {}).keys())
             except Exception as e:
                 _log("ai_band_picker_ui/tracked", e)
                 _tracked = set()
-            _groups = [
-                ("🚀 波段启动确认", ('波段启动确认',)),
-                ("⚠️ 结束信号（顶背离 / 跌破支撑）", ('顶背离预警', '跌破支撑')),
-                ("🔄 波段进行中", ('波段进行中',)),
-                ("… 波段未形成", ('波段未形成',)),
-            ]
             _seen = set()
-            for _gtitle, _gsts in _groups:
-                _sub = df_r[df_r['Status'].isin(_gsts)]
-                if _sub.empty:
-                    continue
-                _seen.update(_sub['Code'].astype(str).tolist())
-                st.markdown(f"#### {_gtitle}（{len(_sub)} 只）")
-                if _gsts == ('波段启动确认',):
-                    st.caption("**这一组才是买入信号**（突破 60 日平台 + 放量）。"
-                               "它们已自动进入「🧠 波段记忆」；若你已买入某只，"
-                               "点它下方的「➕ 加入记忆」即可开始全程监控"
-                               "（会立刻同步到云端，出现顶背离 / 跌破支撑推微信）。")
-                for _, r in _sub.iterrows():
+            _primary = df_r[df_r['Status'].isin(BAND_ENTRY_STATUSES)]
+            st.markdown(f"#### 🚀 刚启动（波段启动确认）（{len(_primary)} 只）")
+            if _primary.empty:
+                st.caption("本次没有刚启动的票。折叠区里可能还有正在走的波段。")
+            else:
+                st.caption("**这一组才是买入信号**（突破 60 日平台 + 放量）。"
+                           "它们已自动进入「🧠 波段记忆」；若你已买入某只，"
+                           "点它下方的「➕ 加入记忆」即可开始全程监控"
+                           "（会立刻同步到云端，出现顶背离 / 跌破支撑推微信）。")
+                _seen.update(_primary['Code'].astype(str).tolist())
+                for _, r in _primary.iterrows():
                     _render_band_card(r, _tracked)
-            # 兜底：万一以后加了新状态、或状态文案改了，剩下的一律照常显示，绝不静默丢弃
-            _rest = df_r[~df_r['Code'].astype(str).isin(_seen)]
-            if not _rest.empty:
-                st.markdown(f"#### 其他状态（{len(_rest)} 只）")
-                for _, r in _rest.iterrows():
-                    _render_band_card(r, _tracked)
+
+            # ---- 其余状态：默认折叠，不占版面（保留全部结果，避免静默丢弃）----
+            _others = df_r[~df_r['Code'].astype(str).isin(_seen)]
+            if not _others.empty:
+                with st.expander(f"📂 其他状态（{len(_others)} 只：进行中 / 结束信号 / 未形成）"
+                                 "—— 默认折叠，不影响选股", expanded=False):
+                    st.caption("**「结束信号」只对「🧠 波段记忆」里在跟踪的票有意义** ——"
+                               "不持有的票，它结束不结束与你无关；而你持有的票，"
+                               "结束提醒由记忆清单的红框和微信推送负责。"
+                               "这里保留全部结果，只是为了不静默丢掉任何一行。")
+                    for _gtitle, _gsts in (
+                            ("⚠️ 结束信号（顶背离 / 跌破支撑）", ('顶背离预警', '跌破支撑')),
+                            ("🔄 波段进行中", ('波段进行中',)),
+                            ("… 波段未形成", ('波段未形成',)),
+                    ):
+                        _sub = _others[_others['Status'].isin(_gsts)]
+                        if _sub.empty:
+                            continue
+                        _seen.update(_sub['Code'].astype(str).tolist())
+                        st.markdown(f"**{_gtitle}（{len(_sub)} 只）**")
+                        for _, r in _sub.iterrows():
+                            _render_band_card(r, _tracked)
+                    # 兜底：万一以后加了新状态、或状态文案改了，剩下的一律照常显示，绝不静默丢弃
+                    _rest = _others[~_others['Code'].astype(str).isin(_seen)]
+                    if not _rest.empty:
+                        st.markdown(f"**其他状态（{len(_rest)} 只）**")
+                        for _, r in _rest.iterrows():
+                            _render_band_card(r, _tracked)
 
     # ★ 2026-09-19 重排：这里原先紧接着渲染「波段记忆 / 策略复盘 / 逻辑有效性验证」
     #   三个面板，导致选股页越拖越长；而记忆清单又会把刚扫出来的启动股再列一遍，
