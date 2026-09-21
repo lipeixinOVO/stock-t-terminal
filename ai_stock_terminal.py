@@ -5304,6 +5304,11 @@ def _render_band_card(r, tracked=None):
     ★ 2026-09-21 加删除入口（用户原话「加一个可以删除的功能，因为这些我都没办法自己删除」）：
       - 已跟踪 → 「🗑️ 从记忆删除」：不可逆（本地 + 云端一起删），点击后**就地**出现一次确认；
       - 未跟踪 → 「🗑️ 移除本行」：只从本次扫描结果里去掉，重扫会回来，故不设确认。
+    ★ 2026-09-21（晚）按用户要求与「🧠 波段记忆」**同口径**：价格行改成
+      现价（= 加入记忆后的入选价）/ 突破位 / 防守位（20 日线）三段，
+      并**去掉「平台上沿」** —— 它（含当天）与突破位（不含当天）几乎同值，
+      两个几乎一样的数字并排，正是用户反馈「目标价贴着启动价」的误导来源。
+      数据没丢：记忆节点里仍有 `platform_high`，这里只是不再展示它。
     """
     tracked = tracked or set()
     chg_color = "#ff4b4b" if r['ChangePct'] >= 0 else "#00cc66"
@@ -5316,6 +5321,9 @@ def _render_band_card(r, tracked=None):
     #   ⚠️ 上面这句注释刻意不写出那个下标写法，否则它自己就会让源码守卫变红
     #      （"被守的字符串同时出现在注释里"是这套测试明确的坑，见 test_picker_ui A6c）。
     _pivot_txt = _fmt_price(_band_num(r.get('BreakoutPivot')))
+    # ★ 防守位与「🧠 波段记忆」同口径：就是 20 日线（同一列 MA20），缺值降级成「—」。
+    #   和突破位一样，**绝不在展示串里直接下标取字段** —— 缺字段的调用路径不能打崩整页。
+    _def_txt = _fmt_price(_band_num(r.get('MA20')))
     st.markdown(f"""
                 <div style="background:#1e1e2e; border-radius:10px; padding:14px 18px; margin-bottom:10px; border-left:4px solid {r['StatusColor']};">
                     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
@@ -5325,7 +5333,7 @@ def _render_band_card(r, tracked=None):
                         <div style="text-align:right;"><span style="color:{r['StatusColor']}; font-size:16px; font-weight:bold;">{r['Status']}</span></div>
                     </div>
                     <div style="margin-top:8px; color:#c9d1d9; font-size:13px; line-height:1.8;">
-                        <span style="color:#89b4fa;">价格:</span> {r['Price']:.2f} | <span style="color:#89b4fa;">20日线:</span> {r['MA20']:.2f} | <span style="color:#89b4fa;">平台上沿:</span> {r['PlatformHigh']:.2f} | <span style="color:#89b4fa;">突破位:</span> {_pivot_txt} | <span style="color:#89b4fa;">量比:</span> {r['VolRatio']:.1f} | <span style="color:#89b4fa;">250日分位:</span> {r['Position250']:.0f}%
+                        <span style="color:#89b4fa;">现价:</span> {r['Price']:.2f}（加入记忆后即「入选价」） | <span style="color:#89b4fa;">突破位:</span> {_pivot_txt} | <span style="color:#89b4fa;">防守位:</span> {_def_txt}（20 日线） | <span style="color:#89b4fa;">量比:</span> {r['VolRatio']:.1f} | <span style="color:#89b4fa;">250日分位:</span> {r['Position250']:.0f}%
                     </div>
                     <div style="margin-top:6px; color:#f9e2af; font-size:13px;">📋 {r['Reasons']}</div>
                 </div>
@@ -5550,6 +5558,13 @@ def ai_band_picker_ui():
                            "它们已自动进入「🧠 波段记忆」；若你已买入某只，"
                            "点它下方的「➕ 加入记忆」即可开始全程监控"
                            "（会立刻同步到云端，出现顶背离 / 跌破支撑推微信）。")
+                # ★ 2026-09-21（晚）三个位的读法：和「🧠 波段记忆」同一套措辞，
+                #   尤其**不许出现「目标价」**（创新高的票上方没有历史阻力）。
+                st.caption("价格行读法：**现价**（加入记忆时它就记作「入选价」）· "
+                           "**突破位**（突破前的 60 日平台上沿、**不含当天** —— "
+                           "这条才是要站上去的线）· "
+                           "**防守位**（20 日线，收盘跌破即波段结束）。"
+                           "三个位都是按固定规则算出来的参考位，不是预测。")
                 _seen.update(_primary['Code'].astype(str).tolist())
                 for _, r in _primary.iterrows():
                     _render_band_card(r, _tracked)
