@@ -375,7 +375,13 @@ def _quote_prefix(symbol):
     return "sz"
 
 # 腾讯日线/分时多域名容错
-_QQ_APP_HOSTS = ["https://web.ifzq.gtimg.cn", "https://ifzq.gtimg.cn"]
+# ★ 2026-09-21：末尾补上腾讯 K 线的**镜像域**。为什么需要它 ——
+#   本机（以及部分受代理影响的网络）`web.ifzq.gtimg.cn` / `ifzq.gtimg.cn` 会返 501，
+#   一失败整条链就退到**新浪不复权**源；除权日会读出假的「跌破 20 日线」。
+#   镜像域 `proxy.finance.qq.com/ifzqgtimg` 是同一套 API、同样前复权，只是换个 host，
+#   作为**第三顺位兜底**：主域正常时永远不会被用到，线上行为不变。
+_QQ_APP_HOSTS = ["https://web.ifzq.gtimg.cn", "https://ifzq.gtimg.cn",
+                 "https://proxy.finance.qq.com/ifzqgtimg"]
 
 # 东方财富日K的多域名池 —— **备用日线源**。
 # ★ 为什么选它当第二源：它同样提供**前复权**日线（fqt=1），与腾讯同口径、可直接互换；
@@ -1738,6 +1744,14 @@ def _calculate_band_metrics(df):
     platform_low = float(low.tail(lookback).min())
     platform_range_pct = (platform_high - platform_low) / platform_low * 100 if platform_low > 0 else 100
 
+    # ★ 突破位 = **突破前**的平台上沿（不含当天）。为什么必须把当天排除掉：
+    #   `platform_high` 是**含当天**的 60 日最高价 ⇒ 任何「今天创新高」的票它都等于现价，
+    #   拿它当「突破位」或「目标」必然贴脸 —— 这正是 2026-09-21 用户反馈
+    #   「这个目标为什么这么接近启动价格…是不是有点开玩笑了」的根因。
+    #   窗口不足一个完整周期时记 0，由展示层显示「—」，绝不瞎凑一个数。
+    breakout_pivot = (float(high.tail(lookback + 1).iloc[:-1].max())
+                      if len(df) > lookback else 0.0)
+
     # 突破：收盘价接近或创 60 日新高
     breakout = current >= platform_high * 0.995 and current >= float(close.tail(lookback).max()) * 0.999
 
@@ -1778,6 +1792,7 @@ def _calculate_band_metrics(df):
     return {
         'current': current, 'ma20': ma20, 'ma60': ma60,
         'platform_high': platform_high, 'platform_low': platform_low,
+        'breakout_pivot': breakout_pivot,
         'platform_range_pct': platform_range_pct, 'breakout': breakout,
         'vol_ratio': vol_ratio, 'volume_expansion': volume_expansion,
         'macd': float(macd.iloc[-1]), 'macd_golden': bool(diff.iloc[-1] > dea.iloc[-1] and diff.iloc[-2] <= dea.iloc[-2]),
@@ -1866,6 +1881,7 @@ def _band_evaluate(code, name='', price=0.0, change_pct=0.0):
         'Score': max(0, score), 'Status': status, 'StatusColor': color,
         'MA20': m['ma20'], 'MA60': m['ma60'],
         'PlatformHigh': m['platform_high'], 'PlatformLow': m['platform_low'],
+        'BreakoutPivot': m['breakout_pivot'],
         'VolRatio': m['vol_ratio'], 'Position250': round(m['position_pct'], 1),
         'Reasons': ' | '.join(reasons), 'LastClose': m['current'],
         'Breakout': bool(m['breakout']), 'VolumeExpansion': bool(m['volume_expansion']),
@@ -2162,6 +2178,10 @@ def _band_memory_apply(node, r, event):
     #   必须写在下面「状态没变就直接 return」的**之前** —— 否则状态长期不变的票，
     #   目标价会永远停在入选那一天，"动态"就是句空话。踩过一次这种顺序坑（日报条数统计）。
     node['platform_high'] = float(r.get('PlatformHigh') or node.get('platform_high') or 0.0)
+    # ★ 突破位同理（也必须写在"状态没变就直接 return"之前）：它是**滚动窗口**算出来的，
+    #   窗口前移它就会变；停在上一次刷新的值会让"回踩位"越来越失真。
+    node['breakout_pivot'] = float(r.get('BreakoutPivot')
+                                   or node.get('breakout_pivot') or 0.0)
     old_status = node.get('status')
     if new_status == old_status:
         return False
@@ -2206,16 +2226,21 @@ def _band_memory_new_node(r, source, batch_id=None, bench_above=None):
             "score": r.get('Score', 0), "ma20": r.get('MA20', 0.0),
             "ma60": r.get('MA60', 0.0),
             "platform_high": r.get('PlatformHigh', 0.0),
+            "breakout_pivot": r.get('BreakoutPivot', 0.0),
             "vol_ratio": r.get('VolRatio', 0.0),
             "position250": r.get('Position250', 0.0),
             "reasons": r.get('Reasons', ''),
         },
         "note": "", "closed": False, "alerts": {},
-        # platform_high：动态目标价（每次刷新重算，这里先落一个入册时的值）
+        # platform_high：**含当天的 60 日最高价**（每次刷新重算，这里先落一个入册时的值）。
+        #   ⚠️ 别再把它叫「目标价」：创新高的票它必然≈现价，当不了目标（见上面对话框的说明）。
         # alert_ack：「已看过该预警」的标记，值 = 当时的 status_ts。
         #   ★ 2026-09-20 起它会随**完整镜像**一起同步（以前做字段裁剪时才不同步），
         #   所以容器重启后**不会**再把同一条预警重复展开。
         "platform_high": float(r.get('PlatformHigh') or 0.0),
+        # breakout_pivot：突破位（突破前的 60 日平台上沿，不含当天）。
+        #   取不到就是 0 → 展示层显示「—」；旧节点没有这个字段，刷新一次会补上。
+        "breakout_pivot": float(r.get('BreakoutPivot') or 0.0),
         "alert_ack": "",
         "history": [],
     }
@@ -3233,14 +3258,21 @@ def _fmt_price(v, digits=2):
     return f"{f:.{digits}f}" if f > 0 else "—"
 
 
-# ============ 波段阶段进度（2026-09-20 新增，口径已与用户确认） ============
-# 进度 = (现价 − 启动价) ÷ (目标价 − 启动价)，其中目标价 = **当前平台高点**
-# （PlatformHigh，每次刷新重算 ⇒ 平台抬高时目标自动上移，这就是"动态"的来源）。
+# ============ 波段参考位（2026-09-21 重写；旧口径见 git 历史） ============
+# 旧版是「启动价 → 目标价 + 阶段进度」，进度 = (现价−启动价)÷(目标价−启动价)。
+# 为什么整块废掉：那个"目标价"取的是 **含当天的** 60 日最高价 ⇒ 任何"今天创新高"的票
+# 它都≈现价（突破判定还允许比 60 日高点低 0.5% 也算突破），于是清单上全是
+# 「启动 9.94 → 目标 9.98」这种贴脸的伪进度。用户 2026-09-21 反馈
+# 「这个目标为什么这么接近启动价格…是不是有点开玩笑了」。
 #
-# ★★ 措辞红线：这是「按固定规则算出来的参考位」，**不是预测**。
-#    任何展示的地方都必须写清"参考位"，否则用户会拿它当目标价去挂单。
-#    见 _band_stage_text 与展开区的 caption。
-BAND_STAGE_STEPS = ((0.67, "🌾 启动末段"), (0.34, "🌿 启动中段"), (0.0, "🌱 启动初段"))
+# 现在改成三个**各自说清是什么**的位（见下面三个取值函数）：
+#   · 入选价  = 入册那天的现价（自动入册的票必然≈现价，这是事实，不藏）
+#   · 突破位  = **突破前**的 60 日平台上沿（不含当天）= 回踩到这儿才算不破位
+#   · 防守位  = 20 日线（与「跌破支撑」判定用的是同一个数）
+#
+# ★★ 措辞红线（别删）：展示的全是「按固定规则算出来的参考位」，**不是预测**。
+#    尤其**不许再出现「目标价」这个词** —— 创新高的票上方没有历史阻力，
+#    编一个"目标"出来就是骗用户去挂单。
 
 
 def _band_num(v):
@@ -3273,34 +3305,23 @@ def band_start_price(node):
     return 0.0
 
 
-def band_stage_calc(start, cur, target):
-    """算波段阶段。数据不足返回 None（调用方负责显示成「—」而不是硬凑）。
+def band_breakout_pivot(node):
+    """突破位：**突破前**的平台上沿（入册/刷新时由 `_calculate_band_metrics` 落盘）。
 
-    返回 {"start","cur","target","progress","stage","gap_pct"}
-    其中 progress 允许 <0（跌破启动价）或 >1（已越过目标）；gap_pct = 距目标还有百分之几。
+    ★ 取不到就返回 0（展示层显示「—」），**绝不许拿 platform_high 兜底** ——
+      那正是这次要修的病：含当天的 60 日高点在"今天创新高"时完全等于现价，
+      拿它当突破位/目标必然是「启动 9.94 → 目标 9.98」这种贴脸数字。
     """
-    start, cur, target = _band_num(start), _band_num(cur), _band_num(target)
-    if start <= 0 or cur <= 0:
-        return None
-    if target <= start:
-        # 平台高点不高于启动价（还没有有效上行空间）→ 不给进度，
-        # 免得算出负数或除零的百分比，那种数字比不显示更糟。
-        return None
-    progress = (cur - start) / (target - start)
-    if cur < start:
-        stage = "⚠️ 已跌破启动价"
-    elif progress >= 1.0:
-        stage = "🚀 已越过目标" if progress >= 1.01 else "🎯 已达目标"
-    else:
-        # BAND_STAGE_STEPS 最后一档阈值是 0.0，progress ≥ 0 恒成立 ⇒ 必然命中，无需 else 兜底
-        stage = "🌱 启动初段"
-        for _th, _label in BAND_STAGE_STEPS:
-            if progress >= _th:
-                stage = _label
-                break
-    return {"start": start, "cur": cur, "target": target,
-            "progress": progress, "stage": stage,
-            "gap_pct": (target - cur) / cur * 100.0}
+    return _band_num(node.get("breakout_pivot"))
+
+
+def band_defense_price(node):
+    """防守位：20 日线。与 `_band_status` 的「跌破支撑 = 现价 < MA20」是同一把尺。
+
+    ★ 为什么复用节点里的 `ma20` 而不是现算一遍：状态判定用的 MA20 和卡片上显示的 MA20
+      必须是同一个数，否则会出现「状态说没跌破、卡片说已经到防守位」的自相矛盾。
+    """
+    return _band_num(node.get("ma20"))
 
 
 def band_alert_need_expand(node):
@@ -3324,18 +3345,23 @@ def band_alert_need_expand(node):
     return str(node.get('alert_ack') or '') != str(node.get('status_ts') or '')
 
 
-def _band_stage_text(node):
-    """清单标题行用的紧凑串（不展开也能看到启动价/目标价/阶段）。
+def band_levels_text(node):
+    """清单标题行用的紧凑串：「入选价 · 突破位 · 防守位」（不展开也能看到）。
 
-    缺数据时**不返回占位符**，而是返回空串 —— 标题行已经很长，
-    没数的票就别再塞「—」进去；缺什么在展开区里说明原因。
+    缺哪一段就**不拼那一段**（不塞「—」占位）—— 标题行已经很长，
+    缺什么在展开区里说明原因。三个都没数时返回空串。
     """
-    st_ = band_stage_calc(band_start_price(node), node.get("price"),
-                          node.get("platform_high"))
-    if st_ is None:
-        return ""
-    return (f"启动 {_fmt_price(st_['start'])} → 目标 {_fmt_price(st_['target'])}"
-            f"　{st_['stage']} {st_['progress'] * 100:.0f}%")
+    parts = []
+    start = band_start_price(node)
+    if start > 0:
+        parts.append(f"入选 {_fmt_price(start)}")
+    pivot = band_breakout_pivot(node)
+    if pivot > 0:
+        parts.append(f"突破位 {_fmt_price(pivot)}")
+    defense = band_defense_price(node)
+    if defense > 0:
+        parts.append(f"防守 {_fmt_price(defense)}")
+    return " · ".join(parts)
 
 
 def _band_bulk_manage_ui(mem, nodes):
@@ -3673,6 +3699,7 @@ def band_evaluate_asof(code, name, df, i, bench_df=None):
             'Score': max(0, score), 'Status': status, 'StatusColor': color,
             'MA20': m['ma20'], 'MA60': m['ma60'],
             'PlatformHigh': m['platform_high'], 'PlatformLow': m['platform_low'],
+            'BreakoutPivot': m['breakout_pivot'],
             'VolRatio': m['vol_ratio'], 'Position250': round(m['position_pct'], 1),
             'Reasons': ' | '.join(reasons), 'LastClose': m['current'],
             'Breakout': bool(m['breakout']), 'VolumeExpansion': bool(m['volume_expansion']),
@@ -4996,7 +5023,7 @@ def band_memory_ui():
         col, icon = _band_status_badge(cur)
         add_col, add_icon = _band_status_badge(node.get('added_status'))
         changed = bool(node.get('added_status')) and node.get('added_status') != cur
-        stage_txt = _band_stage_text(node)
+        stage_txt = band_levels_text(node)
         title = (f"{icon} {node.get('name')}（{code}）　{cur}"
                  + ("　⚠️ 状态已变化" if changed else "")
                  + ("　🗄️ 已归档" if node.get('closed') else "")
@@ -5005,44 +5032,56 @@ def band_memory_ui():
         #   这里只负责接线。别把条件再内联回来：AppTest 断言不了展开状态。
         need_show = band_alert_need_expand(node)
         with st.expander(title, expanded=need_show):
-            _s = band_stage_calc(band_start_price(node), node.get('price'),
-                                 node.get('platform_high'))
-            # 启动价是不是"推算"来的：容器重启后本地不存 added_price，只能从入册轨迹近似。
+            # ★ 2026-09-21 重写：旧版是「启动价 → 目标价 + 阶段进度」。用户反馈
+            #   「目标为什么这么接近启动价格…启动价格都是现价」，根因见 band_breakout_pivot。
+            #   现在三个位各自说清是什么，而且**不再出现「目标价」**——
+            #   创新高的票上方没有历史阻力，编一个目标出来就是让人去挂单。
+            _start = band_start_price(node)
+            _pivot = band_breakout_pivot(node)
+            _defense = band_defense_price(node)
+            _cur = _band_num(node.get('price'))
+            # 入选价是不是"推算"来的：容器重启后本地不存 added_price，只能从入册轨迹近似。
             # ★ 只有**真的推出了值**才敢叫「推算」：added_price 和轨迹都没有时（例如复盘用的
-            #   历史样本、或数据被清过），启动价是 0、界面显示「—」，这时再标「推算」就是骗人。
-            _start_guess = (_band_num(node.get('added_price')) <= 0
-                            and band_start_price(node) > 0)
+            #   历史样本、或数据被清过），入选价是 0、界面显示「—」，这时再标「推算」就是骗人。
+            _start_guess = (_band_num(node.get('added_price')) <= 0 and _start > 0)
             _start_help = ("容器重启后本地不保存入选价，这里用**入册那条轨迹的价格**近似；"
-                           "误差通常极小，但它不是原始记录。" if _start_guess else None)
-            if _s:
-                m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("当前状态", cur)
-                m2.metric("现价", _fmt_price(_s['cur']))
-                m3.metric("启动价" + ("（推算）" if _start_guess else ""),
-                          _fmt_price(_s['start']), help=_start_help)
-                m4.metric("目标价（动态）", _fmt_price(_s['target']),
-                          help="取**当前平台高点**，每次刷新重算 —— 平台抬高它就自动上移。"
-                               "这是按固定规则算出来的参考位，不是预测。")
-                m5.metric("阶段进度", f"{_s['progress'] * 100:.0f}%",
-                          delta=f"距目标 {_s['gap_pct']:+.1f}%", delta_color="off")
-                st.caption(f"{_s['stage']}　·　目标价 = 当前平台高点（参考位，非预测）；"
-                           f"平台抬高时它会跟着上移。")
-            else:
-                m1, m2, m3 = st.columns(3)
-                m1.metric("当前状态", cur)
-                m2.metric("现价", _fmt_price(node.get('price')))
-                m3.metric("启动价" + ("（推算）" if _start_guess else ""),
-                          _fmt_price(band_start_price(node)), help=_start_help)
-                _miss = []
-                if band_start_price(node) <= 0:
-                    _miss.append("启动价没有记录（容器重启后本地信息会丢，"
-                                 "点上面的「🔄 刷新全部状态」会按轨迹补算）")
-                if _band_num(node.get('platform_high')) <= 0:
-                    _miss.append("还没刷新过，拿不到平台高点")
-                elif _band_num(node.get('platform_high')) <= band_start_price(node):
-                    _miss.append("平台高点不高于启动价，暂时没有有效上行空间")
-                st.caption(("阶段进度暂缺：" + "；".join(_miss) + "。") if _miss
-                           else "阶段进度暂缺。")
+                           "误差通常极小，但它不是原始记录。" if _start_guess else
+                           "入册那天的现价。**自动入册的票它必然≈现价** —— 因为「波段启动确认」"
+                           "就是在当天创新高时命中的，这不是记录错误，是入选机制决定的。")
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("当前状态", cur)
+            m2.metric("现价", _fmt_price(_cur))
+            m3.metric("入选价" + ("（推算）" if _start_guess else ""),
+                      _fmt_price(_start), help=_start_help,
+                      delta=(f"{(_cur / _start - 1) * 100:+.1f}% 自入选"
+                             if (_start > 0 and _cur > 0) else None),
+                      delta_color="inverse")
+            m4.metric("突破位", _fmt_price(_pivot),
+                      delta=(f"现价 {(_cur / _pivot - 1) * 100:+.1f}%"
+                             if (_pivot > 0 and _cur > 0) else None),
+                      delta_color="off",
+                      help="**突破前**的 60 日平台上沿（**不含当天**）。现价在它上方是正常突破；"
+                           "回踩到它附近且不破，才算这次突破有效。")
+            m5.metric("防守位（20 日线）", _fmt_price(_defense),
+                      delta=(f"现价 {(_cur / _defense - 1) * 100:+.1f}%"
+                             if (_defense > 0 and _cur > 0) else None),
+                      delta_color="off",
+                      help="与状态判定的「跌破支撑」用的是同一个数：现价跌到它下方就转「跌破支撑」。")
+            _miss = []
+            if _start <= 0:
+                _miss.append("入选价没有记录（容器重启后本地信息会丢，"
+                             "点上面的「🔄 刷新全部状态」会按轨迹补算）")
+            if _pivot <= 0:
+                _miss.append("突破位还没算过（点「🔄 刷新全部状态」会补上）")
+            if _defense <= 0:
+                _miss.append("防守位暂缺（还没刷新过，拿不到 20 日线）")
+            if _miss:
+                st.caption("暂缺：" + "；".join(_miss) + "。")
+            _ph = _band_num(node.get('platform_high'))
+            if _ph > 0:
+                st.caption(f"当前平台高点（近 60 日最高价，**含当天**）{_fmt_price(_ph)}"
+                           "　—— 创新高的票它会≈现价，这是入选机制决定的，不是数据错了。")
+            st.caption("三个位都是按固定规则算出来的**参考位，不是预测**。")
             st.caption(
                 f"入选时间：{node.get('added_at') or '—'}"
                 f"　|　入选时：{add_icon} {node.get('added_status') or '—'}"
@@ -5270,6 +5309,13 @@ def _render_band_card(r, tracked=None):
     chg_color = "#ff4b4b" if r['ChangePct'] >= 0 else "#00cc66"
     _tag = ("　<span style='color:#89b4fa;font-size:12px;'>✅ 已在跟踪清单</span>"
             if str(r['Code']) in tracked else "")
+    # ★ 突破位可能缺失或为 0（旧扫描结果 / 手写夹具）→ 一律降级成「—」。
+    #   **绝不让展示串 KeyError 把整页打崩** —— 2026-09-21 实测：卡片里直接下标取这个字段，
+    #   缺它的调用路径（选股页 UI 用例）整页白屏报错（A2「没有 st.error」当场变红）。
+    #   展示层对缺字段的正确姿态是"少显示一段"，不是"炸掉"。
+    #   ⚠️ 上面这句注释刻意不写出那个下标写法，否则它自己就会让源码守卫变红
+    #      （"被守的字符串同时出现在注释里"是这套测试明确的坑，见 test_picker_ui A6c）。
+    _pivot_txt = _fmt_price(_band_num(r.get('BreakoutPivot')))
     st.markdown(f"""
                 <div style="background:#1e1e2e; border-radius:10px; padding:14px 18px; margin-bottom:10px; border-left:4px solid {r['StatusColor']};">
                     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
@@ -5279,7 +5325,7 @@ def _render_band_card(r, tracked=None):
                         <div style="text-align:right;"><span style="color:{r['StatusColor']}; font-size:16px; font-weight:bold;">{r['Status']}</span></div>
                     </div>
                     <div style="margin-top:8px; color:#c9d1d9; font-size:13px; line-height:1.8;">
-                        <span style="color:#89b4fa;">价格:</span> {r['Price']:.2f} | <span style="color:#89b4fa;">20日线:</span> {r['MA20']:.2f} | <span style="color:#89b4fa;">平台上沿:</span> {r['PlatformHigh']:.2f} | <span style="color:#89b4fa;">量比:</span> {r['VolRatio']:.1f} | <span style="color:#89b4fa;">250日分位:</span> {r['Position250']:.0f}%
+                        <span style="color:#89b4fa;">价格:</span> {r['Price']:.2f} | <span style="color:#89b4fa;">20日线:</span> {r['MA20']:.2f} | <span style="color:#89b4fa;">平台上沿:</span> {r['PlatformHigh']:.2f} | <span style="color:#89b4fa;">突破位:</span> {_pivot_txt} | <span style="color:#89b4fa;">量比:</span> {r['VolRatio']:.1f} | <span style="color:#89b4fa;">250日分位:</span> {r['Position250']:.0f}%
                     </div>
                     <div style="margin-top:6px; color:#f9e2af; font-size:13px;">📋 {r['Reasons']}</div>
                 </div>
