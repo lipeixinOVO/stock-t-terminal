@@ -3126,15 +3126,23 @@ def _band_stage_text(node):
 
 
 def _band_bulk_manage_ui(mem, nodes):
-    """记忆清单的批量管理：多选 → 批量归档 / 批量删除。
+    """记忆清单的批量管理：勾选 → 归档 / 删除（一行常驻，不再折叠）。
 
-    ★ 为什么单独做这一块（2026-09-20 用户明确抱怨）：原来删除按钮藏在每一只的 expander
-      里面，删 10 只要「展开 10 次 + 点 10 次」= 20 次操作。现在勾一下就能批量处理。
-    ★ 删除不可撤销（本地记忆文件直接重写），所以**必须先勾确认框**才能点删除；
-      归档是可逆的，不设门槛。
+    ★ 为什么改成现在这个形状（2026-09-21，用户第二轮抱怨「这个页面我想删除怎么这么难」）：
+      上一版把「多选 + 确认框 + 删除」整块塞进一个**默认折叠**的 expander，用户得走
+      「先展开 → 在下拉里找票 → 滚下去勾一个确认框 → 再回来点删除」四步，而且确认框
+      和删除按钮都在折叠体内、中间还隔着别的控件 —— 这就是「难」的来源。
+      现在：**整块常驻显示、不再折叠**；删除只多一步**紧挨着**的确认
+      （点「🗑️ 删除选中」→ 同一位置立刻出现「✅ 确认删除」），不再要求先去勾一个复选框。
+      同时卡片里的「🗑️ 从记忆中删除」已上提到卡片顶部（见下方 band_memory_ui），
+      单只删除 = 展开卡片 + 点一下，不用再往下滚。
+    ★ 一次确认是**安全下限**，不是仪式：删除不可撤销（本地记忆文件直接重写，并覆盖云端那份）。
+      归档是可逆的，直接执行、不设门槛。
     ★ Streamlit 陷阱：**不能在同一个 run 里改已实例化 widget 的 session_state**
-      （会抛 StreamlitAPIException）。所以「快捷选择」和「批量动作」全部走 `on_click`
-      回调 —— 回调在下一次 run 开头执行，那时旧 widget 已经销毁，改 state 才是合法的。
+      （会抛 StreamlitAPIException）。所以凡是「要改 bandmem_bulk_pick」的动作一律走
+      `on_click` 回调 —— 回调在下一次 run 开头执行，那时旧 widget 已经销毁，改 state 才合法。
+      反过来，「删除待确认」只用 bandmem_bulk_del_pending 这个**非 widget** 的 state，
+      普通按钮里直接赋值就是安全的（别把它改成 checkbox）。
     """
     nodes = [n for n in (nodes or []) if isinstance(n, dict)]
     if not nodes:
@@ -3182,45 +3190,59 @@ def _band_bulk_manage_ui(mem, nodes):
         st.session_state.bandmem_bulk_pick = []      # 回调里改 state 是安全的
         st.rerun()
 
-    with st.expander(f"🧺 批量管理（{len(nodes)} 只）", expanded=False):
-        st.caption("勾选后一次性处理，不用再一只只展开去找删除按钮。"
-                   "删除**不可撤销**（本地记忆直接重写），所以要先勾下面的确认框；"
-                   "归档是可逆的，随时能取消。")
-        q1, q2, q3 = st.columns(3)
-        q1.button("⚠️ 只选预警的", use_container_width=True,
-                  key="bandmem_bulk_q_alert",
-                  on_click=_set_pick,
-                  args=([m["label"] for m in meta if m["alert"]],))
-        q2.button("🗄️ 只选已归档的", use_container_width=True,
-                  key="bandmem_bulk_q_closed",
-                  on_click=_set_pick,
-                  args=([m["label"] for m in meta if m["closed"]],))
-        q3.button("✖️ 清空选择", use_container_width=True,
-                  key="bandmem_bulk_q_clear", on_click=_set_pick, args=([],))
+    def _confirm_bulk_delete(mem_obj, codes):
+        # 回调跑在新一次 run 的**开头**：那时 bandmem_bulk_pick 尚未实例化，清空才合法。
+        st.session_state['bandmem_bulk_del_pending'] = None
+        _bulk_delete(mem_obj, codes)
 
-        picked = st.multiselect("选中要处理的股票（可多选、可搜索）",
-                                options=list(by_label.keys()),
-                                key="bandmem_bulk_pick",
-                                placeholder="这里选，或先用上面的快捷按钮")
-        codes = [by_label[x] for x in picked if x in by_label]
-        if not codes:
-            st.caption("还没选中任何股票。")
-            return
+    st.caption(f"🧺 批量处理（共 {len(nodes)} 只）：在下面挑票 → 点「归档」或「删除」。"
+               "单只也可以展开卡片，直接在卡片**顶部**点「🗑️ 从记忆中删除」。")
+    picked = st.multiselect("选中要处理的股票（可多选、可搜索）",
+                            options=list(by_label.keys()),
+                            key="bandmem_bulk_pick",
+                            placeholder="这里选，或点下面「⚠️ 只选预警的」")
+    codes = [by_label[x] for x in picked if x in by_label]
 
-        confirm = st.checkbox(f"我确认要处理选中的 {len(codes)} 只（删除不可撤销）",
-                              key="bandmem_bulk_confirm")
-        d1, d2, d3 = st.columns(3)
-        d1.button(f"🗄️ 归档选中（{len(codes)}）", use_container_width=True,
-                  key="bandmem_bulk_close",
-                  on_click=_bulk_close, args=(mem, codes, True))
-        d2.button(f"♻️ 取消归档（{len(codes)}）", use_container_width=True,
-                  key="bandmem_bulk_unclose",
-                  on_click=_bulk_close, args=(mem, codes, False))
-        d3.button(f"🗑️ 删除选中（{len(codes)}）", use_container_width=True,
-                  key="bandmem_bulk_del", disabled=not confirm,
-                  on_click=_bulk_delete, args=(mem, codes))
-        if not confirm:
-            st.caption("⬆️ 删除按钮是灰的：先勾上面的确认框。")
+    _pend = st.session_state.get('bandmem_bulk_del_pending') or []
+    if _pend:
+        # ★ 就地确认：块紧贴在多选框下面，确认 / 取消就在原地出现，不用去别处找复选框。
+        _pend_names = []
+        for _c in _pend:
+            _n = mem['stocks'].get(_c) if isinstance(mem, dict) else None
+            _pend_names.append((_n or {}).get('name') or _c)
+        st.warning(f"确认删除这 {len(_pend)} 只？**不可撤销**"
+                   f"（{'、'.join(_pend_names[:6])}"
+                   + ("…" if len(_pend_names) > 6 else "") + "）。"
+                   "建议先点上方「📥 下载备份」留底。")
+        _k1, _k2 = st.columns(2)
+        _k1.button(f"✅ 确认删除（{len(_pend)}）", use_container_width=True,
+                   key="bandmem_bulk_del_ok",
+                   on_click=_confirm_bulk_delete, args=(mem, list(_pend)))
+        if _k2.button("✖️ 取消", use_container_width=True,
+                      key="bandmem_bulk_del_cancel"):
+            st.session_state['bandmem_bulk_del_pending'] = None
+            st.rerun()
+        return
+
+    _has_pick = bool(codes)
+    _a1, _a2, _a3, _a4 = st.columns(4)
+    _a1.button("⚠️ 只选预警的", use_container_width=True, key="bandmem_bulk_q_alert",
+               on_click=_set_pick,
+               args=([m["label"] for m in meta if m["alert"]],))
+    _a2.button(f"🗄️ 归档选中（{len(codes)}）", use_container_width=True,
+               key="bandmem_bulk_close", disabled=not _has_pick,
+               on_click=_bulk_close, args=(mem, codes, True))
+    _a3.button(f"♻️ 取消归档（{len(codes)}）", use_container_width=True,
+               key="bandmem_bulk_unclose", disabled=not _has_pick,
+               on_click=_bulk_close, args=(mem, codes, False))
+    # ⚠️ 这里刻意用**普通按钮**而不是 on_click：bandmem_bulk_del_pending 不是 widget 的
+    #    key，同一 run 里直接赋值合法，也就省掉一次多余的 rerun 回调。
+    if _a4.button(f"🗑️ 删除选中（{len(codes)}）", use_container_width=True,
+                  key="bandmem_bulk_del", disabled=not _has_pick):
+        st.session_state['bandmem_bulk_del_pending'] = list(codes)
+        st.rerun()
+    if not _has_pick:
+        st.caption("⬆️ 先在框里选票（或点「⚠️ 只选预警的」），归档 / 删除按钮才会亮。")
 
 
 def _band_status_badge(status):
@@ -4040,9 +4062,9 @@ def band_sample_ui():
                 "0. **盘后自动采集已上线** —— 周一至周五 15:40（北京时间）由 GitHub Actions "
                 "自动扫全市场，采到的前瞻样本每天发布一次，本页打开时会自动拉取，"
                 "**正常情况你什么都不用点**；\n"
-                "1. **点下面的「采集今日全市场样本」** —— 立刻按今天的真实判断收一批"
-                "（这是唯一能当成绩用的那类）；全市场约 5～15 分钟，只想先试流程"
-                "就把「试跑：只采前 N 只」填 50；\n"
+                "1. **展开下面的「🔧 手动采集」**，点「采集今日全市场样本」—— "
+                "立刻按今天的真实判断收一批（这是唯一能当成绩用的那类）；"
+                "全市场约 5～15 分钟，只想先试流程就把「试跑：只采前 N 只」填 50；\n"
                 "2. **在本机跑一次历史回填** —— 立刻拿到数千条重放样本"
                 "（自带前视偏差，只能提假设），脚本见 `_debug_probe/backfill_samples.py`。")
         _sample_forward_action({})
@@ -4133,33 +4155,39 @@ def band_sample_ui():
 
 
 def _sample_forward_action(rows_map):
-    """「采集今日全市场样本」这一个动作的 UI + 落盘。空库与非空库共用，避免两处逻辑漂移。"""
-    _c1, _c2, _c3 = st.columns([1, 0.9, 1.8])
-    with _c1:
-        _do = long_button("📥 采集今日全市场样本", key="sample_forward_btn",
-                          use_container_width=True)
-    with _c2:
-        _limit_in = st.number_input("试跑：只采前 N 只", min_value=0, max_value=6000,
-                                    value=0, step=100, key="sample_forward_limit",
-                                    help="0 = 全市场（默认）。想先确认流程通不通，填 50。")
-    with _c3:
-        # ★ 这里原来写的是「约 1～3 分钟」，**是错的**：全市场 3750 只 × 每只一次 HTTP
-        #   往返（云端在美国、接口在国内），改造前实测跑了 100 分钟以上，比「让路」窗口还长，
-        #   必被自动刷新掐断。现已改成「线程本地连接复用 + 8 线程并发」（实测约 47×；
-        #   其中连接复用 16.2×、并发 2.9×），耗时降到十几分钟以内。
-        #   故意给一个**区间**而不给单点：云端耗时随网络波动很大，本机测不出云端绝对值，
-        #   所以在文案里引导用户用「试跑」自己量，而不是给一个看起来很准的假数字。
-        # ★★ 这段文案原来写的是「样本只存在本地容器，不会上传仓库」——**已经过时**，
-        #   而且和现状直接矛盾：盘后自动采集 + release 发布 + 页面自动拉取早已上线，
-        #   正常情况根本不需要点这个按钮。旧文案会让人以为"只能手点、点了还在容器里"，
-        #   正是用户抱怨「每天都要点一下」的来源。别再改回去。
-        st.caption("★ **正常情况下你不需要点这个按钮**：周一至周五 15:40（北京时间）GitHub Actions "
-                   "会自动扫全市场，采到的前瞻样本每天发布一次，本页打开时自动拉取"
+    """「采集今日全市场样本」这一个动作的 UI + 落盘。空库与非空库共用，避免两处逻辑漂移。
+
+    ★ 2026-09-21（用户原话：「你都是全自动了，为什么还有这个按钮？」）：
+      盘后 Actions 自动采集 + 本页打开自动拉取早已上线，手动采集只是**兜底 / 调试**的口子，
+      但它原来是个正面朝用户的大按钮、右边还挂着一整块「正常情况下你不需要点这个按钮」的说明
+      —— 看起来就像「每天都要点一下」的常规步骤，这正是被质疑的原因。
+      现在整块收进**默认折叠**的 expander，标签上直接写「平时不用点」，要兜底时才展开。
+      功能一字未删；按钮 key（sample_forward_btn / sample_forward_limit）保持不变，
+      回归脚本仍按老 key 定位。
+    """
+    with st.expander("🔧 手动采集（兜底 / 调试用，平时不用点）", expanded=False):
+        st.caption("正常情况**不用点**：周一至周五 15:40（北京时间）GitHub Actions 自动扫全市场，"
+                   "采到的前瞻样本每天发布一次，本页打开时自动拉取"
                    "（看上面「语料来源」那行就知道有没有拉到）。"
-                   "手动采集只在两种情况下有意义：① 想立刻用**今天**的判断收一批；② 本地调试流程。"
+                   "手动采集只在两种情况下有意义：① 想立刻用**今天**的判断收一批；"
+                   "② 本地调试流程。"
                    "⚠️ 部署在 Streamlit Cloud 上时，手动采到的样本只存在容器里，"
-                   "**容器一重启就没了、也不会传到云端**，所以别把它当常规手段。"
-                   "扫描范围为全市场（含创业板/科创板/北交所），只记信号与对照，"
+                   "**容器一重启就没了、也不会传到云端**，所以别把它当常规手段。")
+        _c1, _c2 = st.columns([1, 1.1])
+        with _c1:
+            _do = long_button("📥 采集今日全市场样本", key="sample_forward_btn",
+                              use_container_width=True)
+        with _c2:
+            # ★ 这里原来写的是「约 1～3 分钟」，**是错的**：全市场 3750 只 × 每只一次 HTTP
+            #   往返（云端在美国、接口在国内），改造前实测跑了 100 分钟以上，比「让路」窗口还长，
+            #   必被自动刷新掐断。现已改成「线程本地连接复用 + 8 线程并发」（实测约 47×；
+            #   其中连接复用 16.2×、并发 2.9×），耗时降到十几分钟以内。
+            #   故意给一个**区间**而不给单点：云端耗时随网络波动很大，本机测不出云端绝对值，
+            #   所以在文案里引导用户用「试跑」自己量，而不是给一个看起来很准的假数字。
+            _limit_in = st.number_input("试跑：只采前 N 只", min_value=0, max_value=6000,
+                                        value=0, step=100, key="sample_forward_limit",
+                                        help="0 = 全市场（默认）。想先确认流程通不通，填 50。")
+        st.caption("扫描范围为全市场（含创业板/科创板/北交所），只记信号与对照，"
                    "不发推送、不写进记忆名单；全市场约 5～15 分钟（视网络而定，想先量准就填「试跑」），"
                    "期间请保持本页打开（自动刷新已让路）。")
     if not _do:
@@ -4794,32 +4822,10 @@ def band_memory_ui():
                 f"　|　来源：{node.get('added_source') or '—'}"
                 f"　|　最近检查：{node.get('last_check') or '未检查'}"
                 f"　|　20日线：{_fmt_price(node.get('ma20'))}")
-            if need_show:
-                if st.button("👁️ 我已看过这条预警（以后不再自动展开）",
-                             key=f"bandmem_ack_{code}"):
-                    # ★ 2026-09-20 起 alert_ack 也随完整镜像同步，容器重启后不会再重复展开。
-                    #   这里仍然**不主动推送**：点「我已看过」不是状态变化，
-                    #   没必要为它单独提交一次。
-                    node['alert_ack'] = str(node.get('status_ts') or '')
-                    save_band_memory(mem)
-                    st.session_state.band_memory_sync_msg = (
-                        f"{node.get('name')}：已标记看过，之后折叠；状态再变化会重新展开提醒")
-                    st.rerun()
-            if node.get('reasons'):
-                st.caption(f"📋 最近依据：{node['reasons']}")
 
-            # 轨迹：一眼看清「什么时候变成什么的」
-            hist = node.get('history') or []
-            if hist:
-                st.markdown("**状态轨迹**（新→旧）")
-                for h in reversed(hist[-10:]):
-                    _hc, _hi = _band_status_badge(h.get('status'))
-                    st.markdown(
-                        f"- `{h.get('ts', '')}`　{_hi} **{h.get('status')}**"
-                        f"　价格 {_fmt_price(h.get('price'))}"
-                        f"　<span style='color:{_hc};font-size:12px;'>{h.get('event', '')}</span>",
-                        unsafe_allow_html=True)
-
+            # ★ 2026-09-21：操作行（备注 / 归档 / 删除）**上提到卡片顶部**。
+            #   原来它在卡片最底部，上面还压着最多 10 行「状态轨迹」—— 想删一只票要先展开、
+            #   再往下滚一屏才找得到删除按钮，用户反馈「这个页面我想删除怎么这么难」即源于此。
             note_key = f"bandmem_note_{code}"
             note = st.text_input("备注（买入价 / 仓位 / 想法，本地与云端都会保存）",
                                  value=node.get('note') or '', key=note_key)
@@ -4855,6 +4861,32 @@ def band_memory_ui():
                         f"⚠️ 已在本地删除 {_del_name}（{code}），但云端同步失败（{_del_msg}）——"
                         "下次同步时它可能被云端那份合并回来，请检查 GITHUB_TOKEN")
                 st.rerun()
+
+            if need_show:
+                if st.button("👁️ 我已看过这条预警（以后不再自动展开）",
+                             key=f"bandmem_ack_{code}"):
+                    # ★ 2026-09-20 起 alert_ack 也随完整镜像同步，容器重启后不会再重复展开。
+                    #   这里仍然**不主动推送**：点「我已看过」不是状态变化，
+                    #   没必要为它单独提交一次。
+                    node['alert_ack'] = str(node.get('status_ts') or '')
+                    save_band_memory(mem)
+                    st.session_state.band_memory_sync_msg = (
+                        f"{node.get('name')}：已标记看过，之后折叠；状态再变化会重新展开提醒")
+                    st.rerun()
+            if node.get('reasons'):
+                st.caption(f"📋 最近依据：{node['reasons']}")
+
+            # 轨迹：一眼看清「什么时候变成什么的」
+            hist = node.get('history') or []
+            if hist:
+                st.markdown("**状态轨迹**（新→旧）")
+                for h in reversed(hist[-10:]):
+                    _hc, _hi = _band_status_badge(h.get('status'))
+                    st.markdown(
+                        f"- `{h.get('ts', '')}`　{_hi} **{h.get('status')}**"
+                        f"　价格 {_fmt_price(h.get('price'))}"
+                        f"　<span style='color:{_hc};font-size:12px;'>{h.get('event', '')}</span>",
+                        unsafe_allow_html=True)
 
     with st.expander("☁️ 云端推送（微信）怎么配", expanded=False):
         st.markdown("""
