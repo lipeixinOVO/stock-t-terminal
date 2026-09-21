@@ -71,6 +71,13 @@ st.markdown("""
     .struct-line { margin-top: 9px; line-height: 1.75; }
     .struct-scen { margin-top: 9px; line-height: 1.75; color: #dfe6ef; }
     .struct-warn { margin-top: 9px; line-height: 1.75; color: #ffd166; }
+    /* ★ 2026-09-21：「当前正在走哪一条情景」的标注（用户要求「动态标注是哪种状态」）。
+       颜色沿用全站的 A 股口径：涨=红、跌=绿（见 .color-red / .color-green 与 K 线 increasing/decreasing）。*/
+    .struct-now { margin-top: 9px; line-height: 1.75; background-color: #1d3145; border-left: 3px solid #4aa3ff; border-radius: 5px; padding: 6px 10px; color: #dcebff; }
+    .struct-tag-now-up { background-color: #4a1d1d !important; color: #ffb3b3 !important; font-weight: bold; }
+    .struct-tag-now-flat { background-color: #4a3f1d !important; color: #ffd166 !important; font-weight: bold; }
+    .struct-tag-now-down { background-color: #1f4d33 !important; color: #8ff0b5 !important; font-weight: bold; }
+    .scen-now { background-color: #2f4a66; color: #ffffff; padding: 0 7px; border-radius: 9px; font-weight: bold; }
     div.stButton > button[kind="primary"] { background-color: #1f6feb; color: white; border: none; font-weight: bold; }
     div.stButton > button[kind="secondary"] { background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
     @media (min-width: 992px) {
@@ -1076,6 +1083,19 @@ INTRADAY_HIGH_POS = 0.75           # 现价在当日区间的位置 ≥ 此值 �
 INTRADAY_LOW_POS = 0.25            # ≤ 此值 → 日内低位
 INTRADAY_STILL_RATIO = 0.40        # 近窗口振幅 ÷ 当日振幅 ≤ 此值 → 「最近没在动」（横盘类）
 INTRADAY_EDGE_RATIO = 0.40         # 极值出现在前 40% 时段 → 算「单边」而不是「反转」
+# ---- 「当前在走哪一条情景」的判定阈值（2026-09-21 新增，见 _intraday_pick_scenario）----
+INTRADAY_AVG_NEUTRAL = 0.05        # 现价与均价线的偏离（%）不足此值 → 视为「贴着均价线」
+INTRADAY_STRONG_POS = 0.66         # 站上均价线 + 日内位置 ≥ 此值 → 判为「① 偏强」
+INTRADAY_WEAK_POS = 0.34           # 跌破均价线 + 日内位置 ≤ 此值 → 判为「③ 偏弱」
+INTRADAY_NEAR_EDGE = 0.08          # 距日内高点/低点 ≤ 当日振幅的此比例 → 视为「正贴着临界价」
+INTRADAY_EDGE_RECENT = 0.75        # 极值出现在时间轴后 25% 内 → 视为「刚刚才创新高/新低」
+INTRADAY_SCEN_LABEL = {1: "① 偏强", 2: "② 中性", 3: "③ 偏弱"}
+INTRADAY_SCEN_KIND = {1: "up", 2: "flat", 3: "down"}
+# ★ 横盘类形态：价格在一个箱体里来回，**位置本身不构成方向选择** ——
+#   摆到中上位不等于「偏强」，要真贴上/突破上沿才算。见 _intraday_pick_scenario 的 boxed 参数。
+#   为什么必须这么分（2026-09-21 实测）：不区分时会出现「形态=横盘整理 / 当前=① 偏强」
+#   同框自相矛盾 —— 用户一眼就会截图来问。
+INTRADAY_BOXED_SHAPES = ("横盘整理", "窄幅盘整", "高位横盘", "低位横盘")
 
 INTRADAY_SHAPE_READ = {
     "单边上行": "开盘后逐波抬高、日内低点出现在前段 —— 典型**单边上行**，盘中的回落多是洗盘；不破均价线方向仍偏多。",
@@ -1102,6 +1122,112 @@ def _intraday_stage_text(now_time):
     return "已收盘"
 
 
+def _intraday_pick_scenario(pos, avg_dev, cur, avg_line, day_high, day_low, rng,
+                            hi_touch, lo_touch, boxed=False):
+    """判断**此刻真正在走**哪一条情景（纯函数）。
+
+    hi_touch / lo_touch：**最后一次**触及今日高/低点的时间位置（0=开盘、1=最后一根分钟线），
+      由调用方算好传进来（本函数没有分时序列）。必须用「最后一次」而不是「极值第一次出现在哪」——
+      高位横盘会**反复**碰到同一个高点，`idxmax()` 给的是第一次出现的位置，会把「一直贴着上沿」
+      误判成「极值早就过去了」（实测：现价距日高只有 0.02，却提示「要等涨到日高才算偏强」）。
+
+    改这个函数之前先读完（2026-09-21 用户要求：「这三种状态能不能每天动态得标注一下是哪种状态」）：
+    原来那三条情景是**静态预案**，每次看都要自己拿现价去对，页面从不告诉你现在算哪一条。
+    这里把它定下来，判定顺序是 **先看是不是刚贴上临界价，再看位置 + 均价线**：
+
+    ① 贴着今日高点、且高点就出在最近的分钟里、且站在均价线上方 → 「① 偏强」（情景刚开始）
+    ② 贴着今日低点、且低点就出在最近的分钟里、且跌破均价线     → 「③ 偏弱」
+    ③ 否则：站上均价线 + 位置 ≥ 0.66 → 偏强；跌破均价线 + 位置 ≤ 0.34 → 偏弱；
+       两头都不满足 → 中性。
+
+    ★ 两条刻意的设计（别"顺手优化"掉）：
+      1. **突破/破位也要求偏离均价线 ≥ INTRADAY_AVG_NEUTRAL**。否则一个极窄的横盘日
+         （振幅 0.3%、现价恰好就是当日最高）会被标成「刚突破」—— 位置是 100%，
+         但那是噪音，不是突破。窄幅日就该老实显示「中性」。
+      2. **位置偏上但已跌破均价线 → 中性（不是偏强）**，反过来同理，并在 reason 里说明
+         「有冲高回落/探底回升迹象」。位置和均价线打架时按中性处理最诚实 ——
+         说成偏强会让用户在冲高回落的下跌段去追多。
+      3. **中性分支里「贴着均价线」的判定要排在「位置偏上/偏下」之前**，且措辞必须自洽：
+         偏离 +0.02% 却写"已跌破均价线"会立刻毁掉用户对整栏的信任（这个错犯过一次）。
+
+    ★ boxed=True 表示形态是**横盘类**（横盘整理 / 窄幅盘整 / 高位横盘 / 低位横盘）：
+      箱体里位置会自己来回摆，所以**「位置中上」不单独算偏强**（反之亦然），只有真贴上
+      上/下沿（break）才算方向开始选；否则一律中性，并在 reason 里说清「要等贴到哪条线」。
+      不这么分就会出现「形态=横盘整理 / 当前=① 偏强」同框自相矛盾。
+
+    返回 {"no": 1|2|3, "label": "① 偏强"/…, "kind": "up"/"flat"/"down",
+          "mode": "break"|"pos", "reason": "一句话依据"}。
+    mode="break" 表示正贴着边界、情景刚开始（最该盯）；"pos" 表示按位置判定。
+    """
+    _has_avg = avg_line > 0
+    _ma = f"均价线 {avg_line:.3f}"
+
+    def _mk(no, mode, reason):
+        return {"no": no, "label": INTRADAY_SCEN_LABEL[no], "kind": INTRADAY_SCEN_KIND[no],
+                "mode": mode, "reason": reason}
+
+    if not _has_avg:
+        # 数据源没给均价线 → 只能按位置判，且**明说**这是降级口径（不许假装和完整口径一样）
+        _tail = "；本次取不到均价线，只按位置判"
+        if pos >= INTRADAY_STRONG_POS:
+            return _mk(1, "pos", f"现价处于日内 {pos * 100:.0f}% 分位（中上位）" + _tail)
+        if pos <= INTRADAY_WEAK_POS:
+            return _mk(3, "pos", f"现价处于日内 {pos * 100:.0f}% 分位（中下位）" + _tail)
+        return _mk(2, "pos", f"现价处于日内 {pos * 100:.0f}% 分位（中部）" + _tail)
+
+    _near = rng * INTRADAY_NEAR_EDGE
+    if (avg_dev >= INTRADAY_AVG_NEUTRAL and (day_high - cur) <= _near
+            and hi_touch >= INTRADAY_EDGE_RECENT):
+        return _mk(1, "break",
+                   f"现价 {cur:.3f} 正贴着今日高点 {day_high:.3f}（高点就出在最近几分钟），"
+                   f"且站上{_ma}（{avg_dev:+.2f}%）")
+    if (avg_dev <= -INTRADAY_AVG_NEUTRAL and (cur - day_low) <= _near
+            and lo_touch >= INTRADAY_EDGE_RECENT):
+        return _mk(3, "break",
+                   f"现价 {cur:.3f} 正贴着今日低点 {day_low:.3f}（低点就出在最近几分钟），"
+                   f"且跌破{_ma}（{avg_dev:+.2f}%）")
+    # ★ boxed（横盘类）：位置摆动不算方向 → 先跳过两条「按位置」的判定，落到中性分支去。
+    if (not boxed) and avg_dev > INTRADAY_AVG_NEUTRAL and pos >= INTRADAY_STRONG_POS:
+        return _mk(1, "pos",
+                   f"站上{_ma}（{avg_dev:+.2f}%），且处于日内 {pos * 100:.0f}% 分位（中上位）")
+    if (not boxed) and avg_dev < -INTRADAY_AVG_NEUTRAL and pos <= INTRADAY_WEAK_POS:
+        return _mk(3, "pos",
+                   f"跌破{_ma}（{avg_dev:+.2f}%），且处于日内 {pos * 100:.0f}% 分位（中下位）")
+    # ---- ② 中性：位置或均价线至少有一头不支持单边 ----
+    # ⚠️ 分支顺序有讲究（2026-09-21 实测踩过）：**「贴着均价线」必须放在最前面**。
+    #    先按 pos 判会让「位置 100% 分位、但偏离均价线只有 +0.02%」落进"位置偏上"那条，
+    #    于是输出「位置偏上但**已跌破**均价线（+0.02%）」—— 正数却写"跌破"，自相矛盾。
+    #    贴线时 pos 再极端也**没有拉开差距**，所以走贴线分支、并在括号里点明"不算突破/破位"。
+    if boxed and abs(avg_dev) > INTRADAY_AVG_NEUTRAL and (
+            pos >= INTRADAY_STRONG_POS or pos <= INTRADAY_WEAK_POS):
+        # 箱体里位置摆到中上/中下位 —— 这**不是**方向选择，说清要等哪条线被贴到。
+        if pos >= INTRADAY_STRONG_POS:
+            return _mk(2, "pos",
+                       f"形态仍是横盘箱体，位置摆到日内 {pos * 100:.0f}% 分位不构成方向选择"
+                       f" —— 要等真贴上/站上今日高点 **{day_high:.3f}** 才算偏强")
+        return _mk(2, "pos",
+                   f"形态仍是横盘箱体，位置摆到日内 {pos * 100:.0f}% 分位不构成方向选择"
+                   f" —— 要等真跌到/跌破今日低点 **{day_low:.3f}** 才算偏弱")
+    if abs(avg_dev) <= INTRADAY_AVG_NEUTRAL:
+        _gap = ""
+        if pos >= INTRADAY_STRONG_POS:
+            _gap = f"（位置虽在 {pos * 100:.0f}% 分位，但没拉开差距，不算突破）"
+        elif pos <= INTRADAY_WEAK_POS:
+            _gap = f"（位置虽在 {pos * 100:.0f}% 分位，但没拉开差距，不算破位）"
+        _why = f"贴着{_ma}（{avg_dev:+.2f}%），方向未定" + _gap
+    elif pos >= INTRADAY_STRONG_POS:
+        # 走到这里 avg_dev 必然 < -NEUTRAL（位置偏上却已跌破均价线）→ 冲高回落
+        _why = (f"位置偏上（{pos * 100:.0f}%）但已跌破{_ma}（{avg_dev:+.2f}%）"
+                " —— 有冲高回落的迹象，先按中性看")
+    elif pos <= INTRADAY_WEAK_POS:
+        # 同理，走到这里 avg_dev 必然 > +NEUTRAL（位置偏下却已站上均价线）→ 探底回升
+        _why = (f"位置偏下（{pos * 100:.0f}%）但已站上{_ma}（{avg_dev:+.2f}%）"
+                " —— 有探底回升的迹象，先按中性看")
+    else:
+        _why = f"处于日内 {pos * 100:.0f}% 分位（中部），偏离{_ma} 只有 {avg_dev:+.2f}%"
+    return _mk(2, "pos", _why)
+
+
 def analyze_intraday_structure(df_minute, prev_close, atr, now_time=None, direction=None):
     """今日盘面动态分析（纯函数）。
 
@@ -1118,6 +1244,8 @@ def analyze_intraday_structure(df_minute, prev_close, atr, now_time=None, direct
            "chg": 0.0, "avg_dev": 0.0, "speed": 0.0, "speed_label": "", "win": 0,
            "range_atr": 0.0, "range_label": "", "range_pct": 0.0,
            "read": "", "scenarios": "", "conflict": "",
+           "active_no": 0, "active_label": "", "active_kind": "flat", "active_mode": "",
+           "active_line": "",
            "open_price": 0.0, "day_high": 0.0, "day_low": 0.0,
            "avg_line": 0.0, "mid_line": 0.0, "up_trigger": 0.0, "down_trigger": 0.0}
     try:
@@ -1154,6 +1282,15 @@ def analyze_intraday_structure(df_minute, prev_close, atr, now_time=None, direct
         range_pct = rng / base * 100
         high_ratio = int(px.idxmax()) / span
         low_ratio = int(px.idxmin()) / span
+        # ★ 2026-09-21：再算一份「**最后一次**触及极值」的位置，专供情景判定用。
+        #   上面两个 high_ratio / low_ratio 是**形态**用的（问的是「极值出现在前段还是后段」），
+        #   语义不能混用：高位横盘会反复碰到同一个高点，拿「第一次出现的位置」会得出
+        #   「一直贴着上沿」=「极值早过去了」这种自相矛盾的结论。
+        _tol = max(rng * 1e-3, 1e-9)
+        _hi_hits = px.index[px >= day_high - _tol].tolist()
+        _lo_hits = px.index[px <= day_low + _tol].tolist()
+        hi_touch = (max(_hi_hits) if _hi_hits else int(px.idxmax())) / span
+        lo_touch = (max(_lo_hits) if _lo_hits else int(px.idxmin())) / span
 
         # 近窗口振幅：既用于「形态」（最近是横着还是动着），也用于「速度」的分子
         win = min(INTRADAY_SPEED_WINDOW, max(span, 1))
@@ -1225,16 +1362,36 @@ def analyze_intraday_structure(df_minute, prev_close, atr, now_time=None, direct
             read += (" —— 现在是**直上直下**的段落，看不懂方向很正常：别在这个节奏里追涨杀跌，"
                      "等一根缩量、振幅收窄的小 K 线（波动收敛）再动手。")
 
-        # ---- 三种情景 + 触发价 ----
+        # ---- 三种情景 + 触发价 + ★「当前正在走哪一条」（2026-09-21 新增）----
+        # 起因：用户看着这三条问「能不能每天动态地标注一下是哪种状态」——
+        # 静态预案每次都要自己拿现价去对。现在按「位置 + 均价线 + 极值是不是刚创出来」
+        # 定出此刻那一条，并在**标签行**与**情景行**上同时标出来。
         mid = avg_line if avg_line > 0 else (day_high + day_low) / 2
-        scenarios = (
-            f"**① 偏强 —— 看延续上行**：放量站上 **{day_high:.3f}**（今日高点）且不破，前高之上还有空间；"
-            f"回踩不破均价线 {mid:.3f} 可跟。\n"
-            f"**② 中性 —— 看区间反复**：在 **{day_low:.3f} ~ {day_high:.3f}** 之间围绕均价线 {mid:.3f} 来回震荡"
-            f" —— 那就只做两头（贴上下沿反向操作），不追中间。\n"
-            f"**③ 偏弱 —— 看继续下探**：跌破 **{day_low:.3f}**（今日低点）且反抽无力，"
-            f"下一档参考 **{day_low - rng * 0.5:.3f}**（今日低点再下移半个当日振幅）。"
-        )
+        _pick = _intraday_pick_scenario(pos, avg_dev, cur, avg_line, day_high, day_low,
+                                        rng, hi_touch, lo_touch,
+                                        boxed=shape in INTRADAY_BOXED_SHAPES)
+        _active_no = _pick["no"]
+        # 数据截止到哪一根分钟线 —— 让「动态」可核对（不然无法判断看到的是不是最新读数）
+        _last_t = str(dfm["Time"].iloc[-1]).strip().zfill(4)
+        _cut = (f"{_last_t[:2]}:{_last_t[2:4]}" if _last_t.isdigit()
+                else want_time.strftime("%H:%M"))
+        _scen_lines = {
+            1: (f"**① 偏强 —— 看延续上行**：放量站上 **{day_high:.3f}**（今日高点）且不破，"
+                f"前高之上还有空间；回踩不破均价线 {mid:.3f} 可跟。"),
+            2: (f"**② 中性 —— 看区间反复**：在 **{day_low:.3f} ~ {day_high:.3f}** 之间围绕均价线 "
+                f"{mid:.3f} 来回震荡 —— 那就只做两头（贴上下沿反向操作），不追中间。"),
+            3: (f"**③ 偏弱 —— 看继续下探**：跌破 **{day_low:.3f}**（今日低点）且反抽无力，"
+                f"下一档参考 **{day_low - rng * 0.5:.3f}**（今日低点再下移半个当日振幅）。"),
+        }
+        # ⚠️ [[...]] 只由带 scen_mark 开关的那次调用转换；普通文本一律不传该开关。
+        scenarios = "\n".join(
+            (f"[[▶ 当前]] {_scen_lines[k]}" if k == _active_no else _scen_lines[k])
+            for k in (1, 2, 3))
+        active_line = (
+            f"▶ **此刻走 {_pick['label']}**（截至 {_cut} 的分时）—— {_pick['reason']}。"
+            + ("这是刚贴上临界价、情景**刚开始**的时刻，最该盯的就是它。"
+               if _pick["mode"] == "break"
+               else "位置没变就按这一条执行；破了边界会自动切到另一条。"))
 
         # ---- 指引与盘中位置是否打架（最容易亏钱的地方，必须明说）----
         conflict = ""
@@ -1261,6 +1418,9 @@ def analyze_intraday_structure(df_minute, prev_close, atr, now_time=None, direct
             "range_atr": round(range_atr, 2), "range_label": range_label,
             "range_pct": round(range_pct, 2),
             "read": read, "scenarios": scenarios, "conflict": conflict,
+            "active_no": _active_no, "active_label": _pick["label"],
+            "active_kind": _pick["kind"], "active_mode": _pick["mode"],
+            "active_line": active_line,
             "open_price": round(open_price, 3), "day_high": round(day_high, 3),
             "day_low": round(day_low, 3), "avg_line": round(avg_line, 3),
             "mid_line": round(mid, 3), "up_trigger": round(day_high, 3),
@@ -1272,16 +1432,22 @@ def analyze_intraday_structure(df_minute, prev_close, atr, now_time=None, direct
         return out
 
 
-def _intraday_rich_text(text):
+def _intraday_rich_text(text, scen_mark=False):
     """把「今日看盘」四个盒子里的文案渲染成 HTML：自己转义、自己换行。
 
     用于 struct-box / ai-advice-box / guide-box / predict-box —— 它们的文案都是塞在
     `<div ...>` 里的 raw HTML。Streamlit 前端走的是 `allowDangerousHtml` 直通 HTML，
     **raw HTML 块内部的 markdown 不会被解析**（已在前端包 StreamlitMarkdown 里确认）：
     原样传 `**今日不做T**` 会显示成星号，而不是加粗。所以这里自己转，不赌渲染器行为。
+
+    ★ scen_mark=True（2026-09-21 新增）：额外把 `[[x]]` 转成「当前情景」标注 chip。
+      只有「三种情景」那一栏传这个开关 —— 别的盒子（尤其 AI 输出）一律不传，
+      免得文本里恰好出现 `[[...]]` 被误当成标注。
     """
     s = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+    if scen_mark:
+        s = re.sub(r"\[\[(.+?)\]\]", r'<span class="scen-now">\1</span>', s)
     return s.replace("\n", "<br>")
 
 
@@ -5698,10 +5864,15 @@ try:
         # 并且当「指引方向」与「盘中位置」互相打架时**明说出来**（那是最容易亏钱的位置）。
         if intraday_struct.get("ok"):
             _st_sub = _intraday_rich_text(intraday_struct["read"])
-            _st_scen = _intraday_rich_text(intraday_struct["scenarios"])
+            # ★ scen_mark=True：只有「三种情景」这一栏把 [[...]] 转成「当前」标注 chip，
+            #   别的盒子（含 AI 输出）不传这个开关，免得文本里恰好出现 [[...]] 被误转。
+            _st_scen = _intraday_rich_text(intraday_struct["scenarios"], scen_mark=True)
+            _st_now = _intraday_rich_text(intraday_struct.get("active_line") or "")
+            _now_kind = intraday_struct.get("active_kind") or "flat"
             _st_conf = _intraday_rich_text(intraday_struct["conflict"]) if intraday_struct.get("conflict") else ""
             _st_html = (
                 f'<div class="struct-box">🧭 <b>今日盘面动态分析</b>'
+                f'<span class="struct-tag struct-tag-now-{_now_kind}">当前 {intraday_struct.get("active_label") or "—"}</span>'
                 f'<span class="struct-tag">{intraday_struct["shape"]}</span>'
                 f'<span class="struct-tag">{intraday_struct["stage"]}</span>'
                 f'<span class="struct-tag">昨收以来 {intraday_struct["chg"]:+.2f}%</span>'
@@ -5709,7 +5880,8 @@ try:
                 f'<span class="struct-tag">振幅 {intraday_struct["range_pct"]:.2f}%（{intraday_struct["range_label"]}）</span>'
                 f'<span class="struct-tag">{intraday_struct["speed_label"]}</span>'
                 f'<div class="struct-line">{_st_sub}</div>'
-                f'<div class="struct-scen">{_st_scen}</div>'
+                + (f'<div class="struct-now">{_st_now}</div>' if _st_now else "")
+                + f'<div class="struct-scen">{_st_scen}</div>'
                 + (f'<div class="struct-warn">{_st_conf}</div>' if _st_conf else "")
                 + '</div>'
             )
