@@ -40,6 +40,11 @@ LOG_PATH = os.environ.get("NOTIFY_LOG", os.path.join(HERE, "notify_log.json"))
 # ★ 手动推送账本（2026-09-22 新增）。自动推送已关闭，今天推了几条
 #   只能从这份账本看 —— 巡检的 notify_log 现在恒为空。
 BUDGET_PATH = os.environ.get("NOTIFY_BUDGET", os.path.join(HERE, "notify_budget.json"))
+# ★ 自动推送白名单（2026-09-22 新增）：只有名单里的票出现信号才自动发微信
+#   （日内买卖点 + 该票的波段启动/结束点）。日报要把名单只数写出来 ——
+#   否则「今天为什么一条都没自动发」在日报里根本无从判断。
+WHITELIST_PATH = os.environ.get("NOTIFY_WHITELIST",
+                                os.path.join(HERE, "notify_whitelist.json"))
 STATE_PATH = os.environ.get("DIGEST_STATE", os.path.join(HERE, "digest_state.json"))
 # ★ 日报正文的落盘位置（2026-09-22 新增）。为什么要落盘：
 #   用户原话「万一说没有微信通知的机会了的话，怎么办？最好在网页中有地方可以呈现，
@@ -170,6 +175,29 @@ def load_notify_budget(ns):
     except Exception as e:
         _log("load_notify_budget", e)
         return None, f"推送账本读取失败：{e}"
+
+
+def load_notify_whitelist(ns):
+    """读自动推送白名单（可能是密文）→ (whitelist 或 None, err)。
+
+    不存在**不算错**（名单为空＝谁都不自动发，这是默认状态，与上一版行为一致）；
+    但"文件在却解不开"必须报出来 —— 那会让云端**静默地一条都不自动发**，
+    表现成「我明明勾了却不生效」，比直接报错难查得多。
+    """
+    if not os.path.exists(WHITELIST_PATH):
+        return None, ""
+    try:
+        with open(WHITELIST_PATH, encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return None, "自动推送白名单不是 JSON 对象"
+        ok, wl, err = ns["band_decrypt_obj"](payload)
+        if not ok:
+            return None, f"自动推送白名单解不开：{err}"
+        return wl, ""
+    except Exception as e:
+        _log("load_notify_whitelist", e)
+        return None, f"自动推送白名单读取失败：{e}"
 
 
 def today_budget(budget):
@@ -334,28 +362,40 @@ def sec_memory(ns, watch, state):
     return lines
 
 
-def sec_notify(keys, err, budget=None, budget_err=""):
+def sec_notify(keys, err, budget=None, budget_err="", whitelist=None, wl_err=""):
     """四、今日推送统计。
 
-    ★ 2026-09-22 起以**账本**为主口径：自动推送已关闭，巡检的
-      notify_log 恒为空，再按它统计只会天天写「0 次」。
+    ★ 2026-09-22 起以**账本**为主口径：自动推送只在**白名单**命中时才发生
+      （日内买卖点 + 该票的波段启动/结束点），其余全靠手动点 ——
+      所以账本是唯一能反映"今天究竟发了几条"的地方（巡检的 notify_log 恒为空）。
+    ★ 白名单只数必须写出来：不然「今天为什么一条都没自动发」无从判断。
     """
     lines = ["## 四、今日盘中推送", ""]
     if budget_err:
         lines.append(f"- ⚠️ {budget_err}")
+    if wl_err:
+        lines.append(f"- ⚠️ {wl_err}")
+    _wl_items = [it for it in ((whitelist or {}).get("items") or []) if isinstance(it, dict)]
+    lines.append(
+        f"- 自动推送白名单：**{len(_wl_items)} 只**"
+        + (f"（{'、'.join(str(it.get('code')) for it in _wl_items[:12])}）"
+           if _wl_items else "（空 —— 谁都不自动发）"))
     tb = today_budget(budget)
     if tb is None:
-        lines.append("- 手动推送：今天还没有账本记录（没推过，或账本日期还是旧的）")
+        lines.append("- 今日推送：还没有账本记录（没推过，或账本日期还是旧的）")
     else:
         sent = tb.get("sent") or []
-        lines.append(f"- 手动推送 **{len(sent)} / {tb.get('limit')}** 条"
-                     f"（其中 {tb.get('reserved')} 条预留本日报）")
+        lines.append(f"- 今日推送 **{len(sent)} / {tb.get('limit')}** 条"
+                     f"（其中 {tb.get('reserved')} 条预留本日报；"
+                     f"白名单自动 + 手动共用）")
         for it in sent[:10]:
-            lines.append(f"  - {it.get('ts', '')}　{it.get('title', '')}")
+            _src = str(it.get("src") or "")
+            _tag = "（自动）" if _src == "auto" else ("（手动）" if _src == "manual" else "")
+            lines.append(f"  - {it.get('ts', '')}　{it.get('title', '')}{_tag}")
         if not sent:
-            lines.append("  - （今天没有手动推送）")
-    lines.append("- 自动推送已关闭：巡检只登记候选，"
-                 "推送由网页端「📤 今日推送」手动点")
+            lines.append("  - （今天没有推送）")
+    lines.append("- 推送方式：白名单里的票出现信号会**自动发**；"
+                 "其余只登记候选，由网页端「📤 今日推送」手动点")
     if err:
         lines.append(f"- {err}")
     elif keys:
@@ -384,7 +424,7 @@ def sec_health(ns, notes, t_start, bench_ok, bench_cost):
 
 
 def build_digest(ns, rows, watch, keys, log_err, budget, budget_err,
-                 notes, state, bench_ok, bench_cost, t_start):
+                 notes, state, bench_ok, bench_cost, t_start, wl=None, wl_err=""):
     """把五节拼成一份日报正文并返回。
 
     ★ 抽出来的唯一理由（2026-09-22）：**正文只允许在这一处生成**。
@@ -400,7 +440,7 @@ def build_digest(ns, rows, watch, keys, log_err, budget, budget_err,
     body.append("")
     body += sec_memory(ns, watch, state)
     body.append("")
-    body += sec_notify(keys, log_err, budget, budget_err)
+    body += sec_notify(keys, log_err, budget, budget_err, wl, wl_err)
     body.append("")
     body += sec_health(ns, notes, t_start, bench_ok, bench_cost)
     return "\n".join(body)
@@ -464,6 +504,9 @@ def main():
     budget, budget_err = load_notify_budget(ns)
     if budget_err:
         notes.append(f"推送账本不可用：{budget_err}")
+    whitelist, wl_err = load_notify_whitelist(ns)
+    if wl_err:
+        notes.append(f"自动推送白名单不可用：{wl_err}")
 
     # 数据源健康：真的去取一次基准，取不到就说取不到（样本的超额收益依赖它）
     bench_ok, bench_cost = False, 0.0
@@ -480,7 +523,7 @@ def main():
 
     state = load_state()
     text = build_digest(ns, rows, watch, keys, log_err, budget, budget_err,
-                        notes, state, bench_ok, bench_cost, t_start)
+                        notes, state, bench_ok, bench_cost, t_start, whitelist, wl_err)
 
     print("=" * 72)
     print(text)
