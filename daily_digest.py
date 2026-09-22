@@ -37,6 +37,9 @@ BAND_KEY = os.environ.get("BAND_KEY", "").strip()
 ENC_PATH = os.environ.get("BAND_SAMPLES_ENC", os.path.join(HERE, "band_samples.enc"))
 WATCH_PATH = os.environ.get("BAND_WATCH", os.path.join(HERE, "band_watch.json"))
 LOG_PATH = os.environ.get("NOTIFY_LOG", os.path.join(HERE, "notify_log.json"))
+# ★ 手动推送账本（2026-09-22 新增）。自动推送已关闭，今天推了几条
+#   只能从这份账本看 —— 巡检的 notify_log 现在恒为空。
+BUDGET_PATH = os.environ.get("NOTIFY_BUDGET", os.path.join(HERE, "notify_budget.json"))
 STATE_PATH = os.environ.get("DIGEST_STATE", os.path.join(HERE, "digest_state.json"))
 DRY = os.environ.get("DIGEST_DRY", "").strip() == "1"
 
@@ -135,6 +138,39 @@ def load_notify_log():
     except Exception as e:
         _log("load_notify_log", e)
         return [], f"推送日志读取失败：{e}"
+
+
+def load_notify_budget(ns):
+    """读推送账本（可能是密文）→ (budget 或 None, err)。
+
+    账本不存在不算错：今天还没手动推过就没有这个文件，
+    审计口径在 sec_notify 里如实写出来就行，不要把它当异常告警。
+    ★ 但“文件在却解不开”必须报错 —— 那意味着账本可能正在丢失，
+      而不是“今天没推”。
+    """
+    if not os.path.exists(BUDGET_PATH):
+        return None, ""
+    try:
+        with open(BUDGET_PATH, encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return None, "推送账本不是 JSON 对象"
+        ok, budget, err = ns["band_decrypt_obj"](payload)
+        if not ok:
+            return None, f"推送账本解不开：{err}"
+        return budget, ""
+    except Exception as e:
+        _log("load_notify_budget", e)
+        return None, f"推送账本读取失败：{e}"
+
+
+def today_budget(budget):
+    """只看**今天**那份账：跨天的 sent 不算今天的推送。"""
+    if not isinstance(budget, dict):
+        return None
+    if str(budget.get("date") or "") != _cn_now().strftime("%Y-%m-%d"):
+        return None
+    return budget
 
 
 def code_of_notify_key(key):
@@ -290,19 +326,32 @@ def sec_memory(ns, watch, state):
     return lines
 
 
-def sec_notify(keys, err):
-    """四、今日推送统计"""
+def sec_notify(keys, err, budget=None, budget_err=""):
+    """四、今日推送统计。
+
+    ★ 2026-09-22 起以**账本**为主口径：自动推送已关闭，巡检的
+      notify_log 恒为空，再按它统计只会天天写「0 次」。
+    """
     lines = ["## 四、今日盘中推送", ""]
+    if budget_err:
+        lines.append(f"- ⚠️ {budget_err}")
+    tb = today_budget(budget)
+    if tb is None:
+        lines.append("- 手动推送：今天还没有账本记录（没推过，或账本日期还是旧的）")
+    else:
+        sent = tb.get("sent") or []
+        lines.append(f"- 手动推送 **{len(sent)} / {tb.get('limit')}** 条"
+                     f"（其中 {tb.get('reserved')} 条预留本日报）")
+        for it in sent[:10]:
+            lines.append(f"  - {it.get('ts', '')}　{it.get('title', '')}")
+        if not sent:
+            lines.append("  - （今天没有手动推送）")
+    lines.append("- 自动推送已关闭：巡检只登记候选，"
+                 "推送由网页端「📤 今日推送」手动点")
     if err:
         lines.append(f"- {err}")
-        return lines
-    codes = []
-    for k in keys:
-        c = code_of_notify_key(k)
-        if c and c not in codes:
-            codes.append(c)
-    lines.append(f"- 触发推送 **{len(keys)} 次**，涉及 {len(codes)} 只："
-                 f"{'、'.join(codes[:15]) if codes else '（今天没有推送）'}")
+    elif keys:
+        lines.append(f"- 巡检去重记录里有 {len(keys)} 条（历史遗留，不代表今天发过）")
     return lines
 
 
@@ -345,6 +394,9 @@ def main():
     keys, log_err = load_notify_log()
     if log_err:
         notes.append(f"推送日志不可用：{log_err}")
+    budget, budget_err = load_notify_budget(ns)
+    if budget_err:
+        notes.append(f"推送账本不可用：{budget_err}")
 
     # 数据源健康：真的去取一次基准，取不到就说取不到（样本的超额收益依赖它）
     bench_ok, bench_cost = False, 0.0
@@ -368,7 +420,7 @@ def main():
     body.append("")
     body += sec_memory(ns, watch, state)
     body.append("")
-    body += sec_notify(keys, log_err)
+    body += sec_notify(keys, log_err, budget, budget_err)
     body.append("")
     body += sec_health(ns, notes, t_start, bench_ok, bench_cost)
     text = "\n".join(body)
