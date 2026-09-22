@@ -283,12 +283,13 @@ def mark_notified(symbol, signal_type, price):
     if key not in log[today]: log[today].append(key)
     _save_notify_log(log)
 
-# ================= 3.1 ★ 微信推送「每日限额」（2026-09-22 新增）=================
-# 用户原话：「因为我每天微信通知只有五条的限制，留下一条给六点的通知，
-#   剩下的全部交给我来手动选择」。
-# 所以：**所有自动推送一律关掉** —— 网页端 monitor_all_watchlist 不再发，
-# 云端巡检 watcher 也不再发（见 watcher.send_wechat），只留 18:00 日报那一条。
-# 剩 4 条由用户在「📤 今日推送」面板里点哪条发哪条。
+# ================= 3.1 ★ 微信推送「每日限额」与「自动发送白名单」（2026-09-22）=====
+# 用户口径（两次澄清后的最终版）：
+#   「因为我每天微信通知只有五条的限制，留下一条给六点的通知」
+#   「剩下四条正常推送，不过是要我选定的股票才能自动推送，
+#    所以你需要给我一个可以自主选择哪只股票可以自动推送的板块」
+# ⇒ 1 条留给 18:00 日报；剩 4 条由**白名单自动推送**与**手动点**共用，用完都停。
+# ⇒ 白名单**只决定"能不能自动发"**，与监控范围无关（详见 3.2 的说明）。
 #
 # 账本 `notify_budget.json` 提交进仓库（2026-09-22 用户同意）：网页端容器一重启本地
 # 文件就没了，计数归零会让用户点到第 6 条被 Server酱 直接拒。
@@ -304,7 +305,11 @@ NOTIFY_CAND_STATUSES = ('跌破支撑', '顶背离预警', '波段启动确认')
 
 
 def _clamp_int(v, lo, hi, default):
-    """收敛进 [lo, hi]。坏值落到 default（**不是** lo）。"""
+    """收敛进 [lo, hi]。坏值落到 default（**不是** lo）。
+
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**
+      （测试会比对两边 ast.unparse 后的整个函数）—— 它决定额度算不算得对。
+    """
     try:
         n = int(float(v))
     except (TypeError, ValueError):
@@ -322,8 +327,9 @@ def notify_budget_normalize(b):
     """收敛成干净账本，**跨天自动清空 sent**。
 
     ★ 跨天必须清空：留着昨天的 sent，今天一开页面就是「额度已用完」。
-    ★ reserved 必须 ≤ limit：否则手动额度算成负数，界面会出现"还能推 -1 条"。
+    ★ reserved 必须 ≤ limit：否则额度算成负数，界面会出现"还能推 -1 条"。
     ★ sent 只保留结构正确的条目：坏条目会让计数与实际推送数不符（额度算错）。
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
     """
     d = notify_budget_empty()
     if not isinstance(b, dict):
@@ -343,19 +349,28 @@ def notify_budget_used(b):
     return len(notify_budget_normalize(b)["sent"])
 
 
-def notify_budget_manual_left(b):
-    """手动还能推几条 = 上限 − 预留（日报）− 已用。"""
+def notify_budget_left(b):
+    """今日还能推几条 = 上限 − 预留（日报）− 已用。
+
+    ★ 2026-09-22 起从 `notify_budget_manual_left` 改名：**自动推送（白名单）与手动点
+      共用这一份额度**，叫「manual_left」已经名不副实。
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
     nb = notify_budget_normalize(b)
     return max(0, nb["limit"] - nb["reserved"] - len(nb["sent"]))
 
 
 def notify_budget_line(b):
-    """界面用的一行话。数字只从账本算一次，不在别处另算。"""
+    """界面 / 日志用的一行话。数字只从账本算一次，不在别处另算。
+
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
     nb = notify_budget_normalize(b)
-    left = notify_budget_manual_left(nb)
+    left = notify_budget_left(nb)
     txt = (f"今日已用 **{len(nb['sent'])} / {nb['limit']}** 条"
-           f"（{nb['reserved']} 条预留 18:00 日报）→ 手动还能推 **{left}** 条")
-    return txt + ("　⚠️ 手动额度已用完，今天不再推送" if left == 0 else "")
+           f"（{nb['reserved']} 条预留 18:00 日报）→ 还能推 **{left}** 条"
+           f"（自动白名单 + 手动共用）")
+    return txt + ("　⚠️ 今日额度已用完：自动和手动都停了" if left == 0 else "")
 
 
 def notify_budget_load_local():
@@ -457,6 +472,272 @@ def notify_budget_push(budget):
     return False, "同步失败（已重试）"
 
 
+
+# ================= 3.2 ★ 自动推送白名单（2026-09-22 用户澄清后新增）=================
+# 用户原话：「剩下四条正常推送，不过是要我选定的股票才能自动推送，
+#   所以你需要给我一个可以自主选择哪只股票可以自动推送的板块」。
+#
+# ★★ 语义边界（写错就是隐蔽坑）：白名单**只决定"能不能自动发微信"**，
+#   **不是**监控范围。用户原话：「云端巡检如果是监控启动终止点以及日内买卖点的话，
+#   这些要正常进行，需要约束的只是微信通知权限」——该盯的照旧盯，不因名单变窄变宽。
+#   · 名单里的票出现信号（波段启动/结束预警 + 日内买卖点）→ 自动发，不用点；
+#   · 不在名单里的 → 只登记成候选，等你在「📤 今日推送」里点；
+#   · **名单为空 = 谁都不自动发**（默认状态，安全方向）。
+#   · 额度与手动推送共用同一份账本（4 条，1 条预留 18:00 日报），先到先用，用完都停。
+#
+# 文件 `notify_whitelist.json` 提交进仓库（云端巡检要读它才知道哪些能自动发）；
+# 与 band_watch.json 同一套保密规则：配了 BAND_KEY 就整段加密 ——
+# 否则「我允许哪几只票自动推」会以明文出现在 public 仓库里。
+NOTIFY_WHITELIST_FILE = os.path.join(BASE_DIR, "notify_whitelist.json")
+GITHUB_WHITELIST_PATH = "notify_whitelist.json"
+NOTIFY_WHITELIST_MAX = 20       # 上限：白名单不扩监控范围，没必要太长
+
+
+def notify_whitelist_empty():
+    """空名单。**这就是"谁都不自动发"** —— 默认状态，也是读不出来时的兜底。"""
+    return {"updated_at": "", "items": []}
+
+
+def notify_whitelist_normalize(w):
+    """收敛成干净名单：只留 6 位数字代码、去重、按代码升序。
+
+    ★ 超上限时**截断**而不是整份丢掉：整份丢掉会让用户以为"我明明勾了却保存不上"。
+    ★ `name` 只用于界面显示，丢了不影响判定（判定只认 code，见 notify_whitelist_has）。
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
+    out = notify_whitelist_empty()
+    if not isinstance(w, dict):
+        return out
+    out["updated_at"] = str(w.get("updated_at") or "")
+    seen, items = set(), []
+    for it in (w.get("items") or []):
+        if not isinstance(it, dict):
+            continue
+        code = str(it.get("code") or "").strip()
+        if not (len(code) == 6 and code.isdigit()) or code in seen:
+            continue
+        seen.add(code)
+        items.append({"code": code, "name": str(it.get("name") or "").strip(),
+                      "added_at": str(it.get("added_at") or "")})
+    items.sort(key=lambda x: x["code"])
+    out["items"] = items[:NOTIFY_WHITELIST_MAX]
+    return out
+
+
+def notify_whitelist_codes(w):
+    """名单里的代码集合（判定只认它）。"""
+    return {it["code"] for it in notify_whitelist_normalize(w)["items"]}
+
+
+def notify_whitelist_has(w, code):
+    """`code` 是否在白名单里 —— **自动推送的唯一判据**。
+
+    ★ 空名单恒为 False：这是刻意的默认安全（谁都不自动发）。
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
+    c = str(code or "").strip()
+    return bool(c) and c in notify_whitelist_codes(w)
+
+
+def notify_whitelist_load_local():
+    return notify_whitelist_normalize(_load_json(NOTIFY_WHITELIST_FILE, {}))
+
+
+def notify_whitelist_save_local(w):
+    _save_json(NOTIFY_WHITELIST_FILE, w)
+
+
+def notify_whitelist_set(w):
+    """更新会话缓存 + 本地文件（不提交远端，提交由调用方决定）。"""
+    nw = notify_whitelist_normalize(w)
+    st.session_state['notify_whitelist'] = nw
+    notify_whitelist_save_local(nw)
+    return nw
+
+
+def notify_whitelist_get():
+    """取当前名单。默认不打网络（理由同 notify_budget_get）。"""
+    cached = st.session_state.get('notify_whitelist')
+    if isinstance(cached, dict):
+        return cached
+    nw = notify_whitelist_load_local()
+    st.session_state['notify_whitelist'] = nw
+    return nw
+
+
+def notify_whitelist_pull():
+    """从仓库读白名单 → (ok, msg, whitelist 或 None)。
+
+    ★ 远端解不开时返回 ok=False、None，**绝不当成空名单**：空名单＝谁都不自动发，
+      看着"安全"，实际表现是"我明明勾了却不生效"，比直接报错难查得多。
+    """
+    if not _github_token():
+        return False, "未配置 GitHub Token", None
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_WHITELIST_PATH}"
+    try:
+        r = requests.get(url, headers=_github_headers(_github_token()),
+                         params={"ref": "main"}, timeout=(5, 15))
+    except Exception as e:
+        _log("notify_whitelist_pull", e)
+        return False, f"拉取异常：{type(e).__name__}: {str(e)[:100]}", None
+    if r.status_code == 404:
+        return True, "仓库里还没有白名单（在「📤 今日推送」里保存一次就会创建）", None
+    if r.status_code != 200:
+        return False, f"拉取失败 HTTP {r.status_code}", None
+    try:
+        raw = base64.b64decode((r.json() or {}).get("content") or "").decode("utf-8")
+        data = json.loads(raw)
+    except Exception as e:
+        _log("notify_whitelist_pull:decode", e)
+        return False, f"白名单解码失败：{str(e)[:100]}", None
+    ok, obj, err = band_decrypt_obj(data)
+    if not ok or obj is None:
+        return False, f"白名单读取失败：{err}", None
+    return True, "", notify_whitelist_normalize(obj)
+
+
+def notify_whitelist_push(whitelist):
+    """把白名单提交到仓库，返回 (ok, msg)。加密与冲突重试规则同 band_watch.json。"""
+    token = _github_token()
+    if not token:
+        return False, "未配置 GitHub Token（白名单无法同步 → 云端巡检读不到 → 不会自动发）"
+    try:
+        payload_obj = band_encrypt_obj(notify_whitelist_normalize(whitelist))
+    except Exception as e:
+        _log("notify_whitelist_push:encrypt", e)
+        return False, f"加密失败，已中止同步（不会以明文提交）：{str(e)[:120]}"
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_WHITELIST_PATH}"
+    content = base64.b64encode(json.dumps(payload_obj, ensure_ascii=False,
+                                         indent=2).encode("utf-8")).decode("ascii")
+    n = len(notify_whitelist_normalize(whitelist)["items"])
+    for attempt in (1, 2):
+        try:
+            sha = None
+            r = requests.get(url, headers=_github_headers(token),
+                             params={"ref": "main"}, timeout=(5, 15))
+            if r.status_code == 200:
+                sha = (r.json() or {}).get("sha")
+            body = {"message": f"更新自动推送白名单（{n} 只）",
+                    "content": content, "branch": "main"}
+            if sha:
+                body["sha"] = sha
+            r = requests.put(url, headers=_github_headers(token), json=body, timeout=(5, 25))
+            if r.status_code in (200, 201):
+                return True, "已同步"
+            if r.status_code in (409, 422) and attempt == 1:
+                continue        # sha 过期（别处刚提交过），重取后再试一次
+            return False, f"同步失败 HTTP {r.status_code}: {r.text[:150]}"
+        except Exception as e:
+            _log("notify_whitelist_push", e)
+            if attempt == 2:
+                return False, f"同步异常：{type(e).__name__}: {str(e)[:100]}"
+    return False, "同步失败（已重试）"
+
+
+def notify_watch_pool(mem):
+    """白名单可勾选的票 = 巡检**真的会盯**的票（波段记忆优先，其次本页自选）。
+
+    ★ 为什么只给这些：写了白名单却永远收不到信号，是最难查的一类坑 ——
+      云端巡检的监控范围是「Actions 里的 WATCHLIST + 波段记忆」，白名单**不加范围**。
+      所以这里不提供"随便填一只票就能自动收提醒"的假选项。
+    ★ 按 code 去重（同一只票既在记忆又在自选里）：否则界面上出现两行同一个代码，
+      取消其中一行**删不掉**它（另一行照样命中）。
+    """
+    out, seen = [], set()
+    _stocks = mem.get('stocks') if isinstance(mem, dict) else None
+    if isinstance(_stocks, dict):
+        for code, node in _stocks.items():
+            if not isinstance(node, dict) or node.get('closed'):
+                continue
+            c = str(code).strip()
+            if c in seen:
+                continue
+            seen.add(c)
+            out.append({"code": c, "name": str(node.get('name') or c),
+                        "status": str(node.get('status') or '（无状态）'), "src": "波段记忆"})
+    for sym in (st.session_state.get('stock_list') or []):
+        # ★ 用代码原样，**不能**过 `_get_code()` —— 那个是"补行情前缀"的
+        #   （`_get_code('600176') == 'sh600176'`），拿它当代码会得到假代码，
+        #   于是自选里的票永远进不了白名单判定（2026-09-22 实测踩到）。
+        c = str(sym or '').strip()
+        if not (len(c) == 6 and c.isdigit()) or c in seen:
+            continue
+        seen.add(c)
+        try:
+            _nm = get_stock_name(sym)
+        except Exception as e:
+            _log("notify_watch_pool/get_stock_name", e)
+            _nm = c
+        out.append({"code": c, "name": _nm, "status": "自选", "src": "自选清单"})
+    out.sort(key=lambda x: (x["src"], x["code"]))
+    return out
+
+
+def notify_whitelist_ui(mem):
+    """🎯 自动推送白名单 —— 用户自己勾「哪些票可以自动发微信」（2026-09-22 用户要求）。
+
+    ★ 只列「巡检真的会盯的票」（波段记忆 + 本页自选清单，见 notify_watch_pool）；
+      已在名单里、但已不在清单中的票**照旧显示**（否则保存一次就被静默丢掉）。
+    """
+    st.markdown("#### 🎯 自动推送白名单")
+    st.caption("勾中的票出现信号（波段启动/结束预警、日内买卖点）时**自动发微信**，不用你点；"
+               "没勾的仍然只列在下面等你点。**名单为空＝谁都不自动发**。"
+               "本题只管「能不能自动发」，**不影响巡检监控什么** —— 该盯的照旧盯。")
+    nw = notify_whitelist_get()
+    codes = notify_whitelist_codes(nw)
+    st.caption("当前名单 **%d** 只：%s"
+               % (len(codes), "、".join(sorted(codes)) if codes else "（空 —— 谁都不自动发）"))
+    _pool = notify_watch_pool(mem)
+    _labels = {f"{p['code']} {p['name']}（{p['src']}·{p['status']}）": p['code'] for p in _pool}
+    _pool_codes = {p['code'] for p in _pool}
+    for _c in sorted(codes - _pool_codes):
+        _labels[f"{_c}（已不在巡检清单里 ⚠️ 巡检不会盯它）"] = _c
+    _def = [k for k, v in _labels.items() if v in codes]
+    with st.form("notify_wl_form"):
+        _sel = st.multiselect("这些票出现信号时自动发微信（不勾的仍列在下面等你点）",
+                              list(_labels), default=_def, key="notify_wl_sel")
+        _extra = st.text_input(
+            "补充代码（逗号分隔）——注意：不在波段记忆/自选里的票，巡检本来就不会盯它，"
+            "自动推送无从触发；想盯它请先加进「🧠 波段记忆」",
+            value="", key="notify_wl_extra")
+        _sub = st.form_submit_button("💾 保存白名单并同步云端")
+    if not _sub:
+        return
+    _now = now_cn_str('%Y-%m-%d %H:%M:%S')
+    _by_code = {_labels[k]: {"code": _labels[k], "name": "", "added_at": _now} for k in _sel}
+    for p in _pool:
+        if p["code"] in _by_code:
+            _by_code[p["code"]]["name"] = p["name"]
+    _bad = []
+    _raw = (str(_extra).replace('，', ',').replace('；', ',')
+            .replace(';', ',').replace(' ', ',').replace('\n', ','))
+    for _piece in _raw.split(','):
+        _c = _piece.strip()
+        if not _c:
+            continue
+        if not (len(_c) == 6 and _c.isdigit()):
+            _bad.append(_c)
+            continue
+        if _c in _by_code:
+            continue
+        try:
+            _nm = get_stock_name(_c)
+        except Exception as e:
+            _log("notify_whitelist_ui/get_stock_name", e)
+            _nm = _c
+        _by_code[_c] = {"code": _c, "name": _nm, "added_at": _now}
+    _new = notify_whitelist_set({"updated_at": _now, "items": list(_by_code.values())})
+    _ok, _m = notify_whitelist_push(_new)
+    if _bad:
+        st.warning("这些不是 6 位代码，已忽略：" + "、".join(_bad))
+    if _ok:
+        st.success(f"✅ 白名单已保存并同步云端（{len(notify_whitelist_codes(_new))} 只）")
+    else:
+        st.warning(f"⚠️ 本地已保存，但**同步云端失败**：{_m} —— "
+                   "云端巡检读的是仓库里那份，不同步就等于云端不会自动发。")
+    st.rerun()
+
+
 def notify_send_key():
     """当前可用的 Server酱 SendKey：Secrets 优先，其次侧边栏/本地配置。"""
     try:
@@ -472,19 +753,22 @@ def notify_send_key():
         return ""
 
 
-def notify_send_guarded(title, content, kind, code="", name=""):
+def notify_send_guarded(title, content, kind, code="", name="", src="manual"):
     """★ 微信推送的**唯一出口**：先校验额度 → 再发送 → 成功才记账。
 
     顺序是刻意的，别改成"先发后记"：
       · 先发后记 → 发送失败也扣了额度，用户白白少一条；
       · 只校验不记账 → 连点两下就超发（每次点击都只是一次 rerun）。
     寄文失败不回滚计数：消息已经发出去了，这时把账本改回去才是真的对不上。
+
+    `src` 只用于记账时标记来源（`auto`＝白名单自动发 / `manual`＝你点的），
+    **不参与额度判定** —— 两者共用同一份账本（见 notify_budget_left）。
     返回 (ok, msg)，ok=False 时 msg 是给用户看的原因。
     """
     b = notify_budget_get()
-    if notify_budget_manual_left(b) <= 0:
+    if notify_budget_left(b) <= 0:
         nb = notify_budget_normalize(b)
-        return False, (f"今日手动额度已用完（上限 {nb['limit']} 条，其中 {nb['reserved']} 条"
+        return False, (f"今日推送额度已用完（上限 {nb['limit']} 条，其中 {nb['reserved']} 条"
                        f"留给 18:00 日报，已推 {len(nb['sent'])} 条）。"
                        "要再多发，去左侧「📱 微信提醒」把上限调高。")
     key = notify_send_key()
@@ -496,7 +780,8 @@ def notify_send_guarded(title, content, kind, code="", name=""):
                        "也可能今天的 5 条在别处已经用掉了。")
     nb = notify_budget_normalize(b)
     nb["sent"].append({"ts": now_cn_str('%Y-%m-%d %H:%M:%S'), "kind": str(kind),
-                       "code": str(code), "name": str(name), "title": title})
+                       "src": str(src), "code": str(code), "name": str(name),
+                       "title": title})
     nb["updated_at"] = now_cn_str('%Y-%m-%d %H:%M:%S')
     nb = notify_budget_set(nb)
     _ok, _m = notify_budget_push(nb)
@@ -566,9 +851,12 @@ def _notify_row(c, exhausted, already, gkey, idx):
         if c.get('defense'):
             _bits.append(f"防守 {_fmt_price(c['defense'])}")
         _meta = "　".join(_bits)
+        _wl_mark = ("　<span style='color:#f9e2af;'>🎯 自动推送</span>"
+                    if notify_whitelist_has(notify_whitelist_get(), c.get('code')) else "")
         st.markdown(
             f"**{c.get('name')}（{c.get('code')}）** "
             f"<span style='color:#89b4fa;'>{c.get('status') or c.get('kind')}</span>"
+            + _wl_mark
             + (f"　<span style='color:#9aa0a6;font-size:12px;'>{_meta}</span>" if _meta else ""),
             unsafe_allow_html=True)
         if c.get('ts'):
@@ -591,24 +879,30 @@ def _notify_row(c, exhausted, already, gkey, idx):
 
 
 def notify_center_ui(mem):
-    """📤 今日推送：额度 + 候选 + 手动推送（2026-09-22 按用户要求新建）。
+    """📤 今日推送：额度 + 自动推送白名单 + 候选 + 手动推送。
 
-    用户原话：「因为我每天微信通知只有五条的限制，留下一条给六点的通知，
-    剩下的全部交给我来手动选择」。
+    用户口径（2026-09-22 两次澄清后的最终版）：
+      「因为我每天微信通知只有五条的限制，留下一条给六点的通知」
+      「剩下四条正常推送，不过是要我选定的股票才能自动推送，
+       所以你需要给我一个可以自主选择哪只股票可以自动推送的板块」
+    ⇒ 1 条留给 18:00 日报；剩 4 条由**白名单自动推送** + **你手动点**共用，用完都停。
     """
     st.markdown("---")
-    st.subheader("📤 今日推送（手动）")
+    st.subheader("📤 今日推送")
     _b = notify_budget_get()
     st.caption("额度：" + notify_budget_line(_b))
-    st.caption("🚫 自动推送已全部关闭 —— 云端巡检和本页都不再自己发微信，"
-               "下面每个候选都由你点才发。"
-               "18:00 日报照旧（它占预留的那一条）。")
-    _left = notify_budget_manual_left(_b)
+    st.caption("✅ 白名单里的票出现信号时**自动发**；其余的不会自己发，"
+               "只列在下面等你点。18:00 日报照旧（它占预留的那一条）。")
+    notify_whitelist_ui(mem)
+    st.markdown("---")
+    st.markdown("**手动推送**（没进白名单的票，你点哪条发哪条）")
+    _left = notify_budget_left(_b)
     _sent_codes = {str(it.get('code')) for it in notify_budget_normalize(_b)['sent']}
     _cands = notify_candidates(mem)
     _intra = list(st.session_state.get('manual_push_candidates') or [])
     if _left <= 0:
-        st.warning("今日手动额度已用完 —— 想再推只能把上限调高，或等明天。")
+        st.warning("今日额度已用完 —— 自动推送和手动推送都停了；"
+                   "想再多发只能把上限调高，或等明天。")
     if not _cands and not _intra:
         st.caption("（现在没有可推的候选：记忆里没有处于预警/启动状态的票，"
                    "本页巡检也没发现新的日内信号。）")
@@ -2142,6 +2436,7 @@ def monitor_all_watchlist(send_key, market_change):
     cands = list(st.session_state.get('manual_push_candidates') or [])
     _known = {(c.get('code'), c.get('kind')) for c in cands}
     fired = []
+    _wl = notify_whitelist_get()      # 白名单：命中的票自动发，其余仍只登记候选
     for sym in watchlist:
         try:
             sym_code = _get_code(sym); df_min = get_minute_data(sym_code)
@@ -2162,7 +2457,7 @@ def monitor_all_watchlist(send_key, market_change):
                 _known.add((sym, _sig))
                 _t = f"{_row['Time'][:2]}:{_row['Time'][2:]}"
                 _is_buy = (_sig == 'buy')
-                cands.append({
+                _cd = {
                     'code': str(sym), 'name': sym_name, 'kind': _sig,
                     'status': '买点' if _is_buy else '卖点',
                     'price': _price, 'ts': now_cn_str('%Y-%m-%d %H:%M:%S'),
@@ -2173,9 +2468,22 @@ def monitor_all_watchlist(send_key, market_change):
                              + ('回踩均价线缩量，MACD 拐头向上' if _is_buy
                                 else '冲高乖离均价线放量，MACD 拐头向下')
                              + "\n\n仅做参考，请自行判断。"),
-                })
+                }
                 _emoji = '🔴' if _is_buy else '🟢'
                 _label = '买点' if _is_buy else '卖点'
+                # ★ 白名单命中的票**自动发**（用户要求「我选定的股票才能自动推送」）；
+                #   发失败（额度用完 / 没配 key）就退回下面的候选登记，让它仍然看得见 ——
+                #   绝不静默丢弃（丢一次就等于"信号出现过但你没得到任何提示"）。
+                if notify_whitelist_has(_wl, sym):
+                    _okauto, _mauto = notify_send_guarded(
+                        _cd['title'], _cd['body'], kind=_sig, code=str(sym),
+                        name=sym_name, src='auto')
+                    if _okauto:
+                        fired.append(f"{_emoji} {sym_name} {_label} "
+                                     f"{_price:.3f}　📤已自动推送")
+                        continue
+                    _log("monitor_all_watchlist/auto", RuntimeError(str(_mauto)))
+                cands.append(_cd)
                 fired.append(f"{_emoji} {sym_name} {_label} {_price:.3f}")
         except Exception as e:
             _log(f"monitor_all_watchlist/{sym}", e)
