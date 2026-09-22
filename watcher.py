@@ -182,7 +182,41 @@ def get_market_change():
                 _log("get_market_change:float(parts[32])", e)
     return 0.0
 
+# ★ 2026-09-22 起巡检**默认不发微信**，只登记候选（用户要求）。
+#   用户原话：「因为我每天微信通知只有五条的限制，留下一条给六点的通知，
+#   剩下的全部交给我来手动选择」。Server酱 免费版每天只有 5 条，
+#   其中 1 条由 18:00 日报（daily_digest.py）占用，剩 4 条由用户在网页端
+#   「📤 今日推送」面板里手动点。
+#   为什么不直接删掉发送能力：万一以后想恢复自动推送，
+#   在 Actions 的 Variables 里把 NOTIFY_AUTO_PUSH 设成 1 就行，不用改代码。
+AUTO_PUSH = os.environ.get("NOTIFY_AUTO_PUSH", "0").strip() == "1"
+
+
+def _print_candidate(title, content):
+    """把「本该推送」的候选打进 Action 日志，一行一条。
+
+    不记入去重日志：那份日志是「已推送」的账，把候选混进去会让
+    日后真要恢复自动推送时少发。候选量本来就少（就是那几条以前会被推的），
+    重复打印不会淹没其他信息。
+    """
+    first = ""
+    for line in (content or "").splitlines():
+        if line.strip():
+            first = line.strip()
+            break
+    print(f"  📤 候选（未推送，等你在网页端选）：{title}　{first}")
+
+
 def send_wechat(title, content):
+    """微信推送的**唯一出口**（巡检侧 4 个调用点全走这里）。
+
+    ★ 2026-09-22 起默认**不发送**，只登记候选 —— 见上面 AUTO_PUSH 的说明。
+    返回 True 表示“真的发出去了” —— 关闭状态下恒为 False，
+    调用方据此不记去重日志、不累加推送计数（含义与之前一致）。
+    """
+    if not AUTO_PUSH:
+        _print_candidate(title, content)
+        return False
     if not SEND_KEY:
         return False
     try:
