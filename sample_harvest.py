@@ -96,10 +96,15 @@ NET_CONSTS = {"_REQUEST_HEADERS", "_EM_HOSTS", "_HTTP_HEADERS", "_QQ_APP_HOSTS",
               "_EM_KLINE_HOSTS", "FEED_HEALTH", "FEED_DEAD_AFTER", "FEED_DEAD_SECONDS",
               "_FEED_CODE_LEVEL",
               "_TLS_LOCAL"}
-METRIC_FUNCS = {"_calculate_band_metrics", "_band_score", "_band_status", "_band_evaluate"}
+METRIC_FUNCS = {"_calculate_band_metrics", "_band_score", "_band_status", "_band_evaluate",
+                # 2026-09-22：`_calculate_band_metrics` 用它算「本轮启动起点」，
+                # 漏抽会被内部 try 吞掉 → days 恒为 0，日报/回测里「已启动」整块静默消失。
+                "_band_run_start"}
 # ★ 指标层自己的常量：`_calculate_band_metrics` 现在要用顶背离的 MACD 门槛。
 #   漏了 → NameError（这里没 try 兜底，会直接炸，属于"幸运的"失败方式）。
-METRIC_CONSTS = {"BAND_DIVERGENCE_MACD_MIN_PCT"}
+METRIC_CONSTS = {"BAND_DIVERGENCE_MACD_MIN_PCT",
+                 # 启动起点回溯上限 与 前景分拥挤度起扣线（2026-09-22）
+                 "BAND_RUN_MAX_LOOKBACK", "BAND_RUN_CROWD_FREE_PCT"}
 
 SAMPLE_FUNCS = {
     "_sample_key", "_sample_hash_hit", "_sample_tier", "_sample_prefilter", "_sample_tradable",
@@ -139,6 +144,17 @@ REVIEW_CONSTS = {
 
 WANT_FUNCS = NET_FUNCS | METRIC_FUNCS | SAMPLE_FUNCS | OUTCOME_FUNCS | CRYPTO_FUNCS
 WANT_CONSTS = NET_CONSTS | SAMPLE_CONSTS | REVIEW_CONSTS | METRIC_CONSTS
+
+# ---- 全市场清单分页的自我保护参数 ----
+# 与 ai_stock_terminal.py 里 band_samples_harvest_forward 的同名局部量保持一致。
+# ★ 为什么需要这些：东财分页接口会「半死」——前几页正常、之后每页都空。
+#   旧写法遇空页就 break，于是只拿了几页清单就去采集，产出的是「按主力净额排序的
+#   前 N 只」这种**有偏子集**，而且退出码为 0、日志无声。比彻底采不到更危险。
+UNIV_PAGE_MAX = 60        # 页上限：60 页 × 100 只 = 6000，覆盖沪深 A 股并留余量
+UNIV_PAGE_RETRY = 2       # 单页返回空时的重试次数
+UNIV_RETRY_WAIT = 1.5     # 重试间隔（秒）
+UNIV_EMPTY_STOP = 2       # 连续空页达到这个数，才认定「真的到底了」
+UNIV_MIN_CODES = 3000     # 清单低于此数 → 判定残缺，放弃本次采集
 
 
 # ============================ 一、把主应用当"库"来加载 ============================
@@ -319,16 +335,37 @@ def market_universe(ns, verbose=True):
       而"这部分是给机器验证逻辑用的"，预筛等于自己蒙自己的眼睛。
     """
     codes = {}
-    for pn in range(1, 41):
-        page = ns["fetch_market_page"](pn)
+    _fetch_page = ns["fetch_market_page"]
+    empty_run = 0
+    pages_ok = 0
+    for pn in range(1, UNIV_PAGE_MAX + 1):
+        page = []
+        for _attempt in range(UNIV_PAGE_RETRY + 1):
+            page = _fetch_page(pn)
+            if page:
+                break
+            if _attempt < UNIV_PAGE_RETRY:
+                time.sleep(UNIV_RETRY_WAIT)
         if not page:
-            break
+            empty_run += 1
+            sys.stderr.write(f"[harvest] 全市场清单第 {pn} 页为空"
+                             f"（已重试 {UNIV_PAGE_RETRY} 次），连续空页 {empty_run}\n")
+            if empty_run >= UNIV_EMPTY_STOP:
+                break
+            continue                      # ★ 单页失败只丢该页，绝不终止整个清单
+        empty_run = 0
+        pages_ok += 1
         for s in page:
             c = str(s.get("f12") or "").zfill(6)
             if len(c) == 6 and c.isdigit():
                 codes[c] = str(s.get("f14") or "")
         if verbose:
             print(f"  沪深清单：第 {pn} 页累计 {len(codes)} 只", flush=True)
+    # ★ 完整性校验：接口「半死」时会安静地少返几页，直接拿去采集就会产出有偏子集。
+    if codes and len(codes) < UNIV_MIN_CODES:
+        raise StoreError(
+            f"全市场清单残缺：仅取到 {len(codes)} 只 / {pages_ok} 页，低于下限 "
+            f"{UNIV_MIN_CODES} —— 放弃本次采集以免产出有偏样本")
     try:      # 北交所
         r = ns["requests"].get(f"{ns['_EM_HOSTS'][0]}/api/qt/clist/get",
                                params={"pn": "1", "pz": "1000", "po": "1", "np": "1",
@@ -630,8 +667,10 @@ def main():
         if rep.get("error"):
             print(f"!! {rep['error']}")
             return 4
-        print(f"  全市场 {rep.get('universe')} 只，扫描 {rep.get('codes')} 只，"
-              f"取数成功 {rep.get('fetched')}，失败 {rep.get('failed')} → {len(rows)} 条")
+        print(f"  全市场 {rep.get('universe')} 只（清单 {rep.get('pages_ok')} 页），"
+              f"扫描 {rep.get('codes')} 只，"
+              f"取数成功 {rep.get('fetched')}，失败 {rep.get('failed')}，"
+              f"陈旧序列剔除 {rep.get('stale', 0)} → {len(rows)} 条")
         if rep.get("limit"):
             print(f"  ⚠️ 本次为冒烟测试（limit={rep['limit']}），这批样本不代表全市场，"
                   f"正式采集请留空 limit")
