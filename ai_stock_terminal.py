@@ -527,17 +527,26 @@ def notify_candidates(mem):
         defense = band_defense_price(node)
         ts = node.get('status_ts') or ''
         is_end = status in ('跌破支撑', '顶背离预警')
+        # 本轮启动标注（2026-09-22）：推送候选上也写清「已启动 N 日 · 至今 +X%」，
+        # 免得在微信里看到「波段启动」四个字又误以为它今天才启动。
+        _run_txt = band_run_text(node)
         out.append({
             "code": str(code), "name": name, "status": status,
             "kind": "band", "price": price, "pivot": pivot, "defense": defense, "ts": ts,
+            "run": _run_txt, "score": float(node.get('score') or 0.0),
             "title": (f"【波段结束预警】{name}" if is_end
                       else f"【波段启动】{name}"),
             "body": (f"股票：{name}（{code}）\n状态：{status}\n"
                      f"现价：{_fmt_price(price)}　突破位：{_fmt_price(pivot)}"
                      f"　防守（20 日线）：{_fmt_price(defense)}\n"
-                     f"状态时间：{ts}\n\n仅做参考，请自行判断。"),
+                     + (f"{_run_txt}\n" if _run_txt else "")
+                     + f"状态时间：{ts}\n\n仅做参考，请自行判断。"),
         })
-    out.sort(key=lambda c: (-BAND_STATUS_LEVEL.get(c['status'], 0), c['code']))
+    # 同一档状态内**按前景分降序**（2026-09-22 用户要求：越靠前越有前景）；
+    # 状态层级仍是第一关键字 —— 预警必须排在最前，那是"该动手"的信号，
+    # 与"哪只更有前景"是两件事。
+    out.sort(key=lambda c: (-BAND_STATUS_LEVEL.get(c['status'], 0),
+                            -c.get('score', 0.0), c['code']))
     return out
 
 
@@ -612,6 +621,139 @@ def notify_center_ui(mem):
         st.markdown(f"**波段候选（来自「🧠 波段记忆」，{len(_cands)} 条）**")
         for _i, _c in enumerate(_cands):
             _notify_row(_c, _left <= 0, _c['code'] in _sent_codes, "band", _i)
+
+# ---------- 📰 18:00 日报上网页（2026-09-22）----------
+
+def digest_last_load_local():
+    """读本地那份日报正文（可能是密文）→ (data 或 None, err)。"""
+    if not os.path.exists(DIGEST_LAST_FILE):
+        return None, (f"本地还没有 {os.path.basename(DIGEST_LAST_FILE)}"
+                      "（云端日报任务跑过一次之后才会有）")
+    try:
+        with open(DIGEST_LAST_FILE, encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return None, "日报文件不是 JSON 对象"
+        ok, data, err = band_decrypt_obj(payload)
+        if not ok:
+            # ★ 与 band_watch.json 同一条红线：解不开就**明确报错**，
+            #   绝不静默当成"今天没有日报"（那会让人以为日报没生成）。
+            return None, f"日报解不开：{err}"
+        if not isinstance(data, dict) or not str(data.get("text") or "").strip():
+            return None, "日报内容为空或结构异常"
+        return data, ""
+    except Exception as e:
+        _log("digest_last_load_local", e)
+        return None, f"日报读取失败：{e}"
+
+
+def digest_last_fetch_remote():
+    """从仓库拉最新那份日报 → (ok, msg, data 或 None)。"""
+    if not _github_token():
+        return False, "未配置 GitHub Token（读云端日报要用它，和记忆同步是同一个）", None
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_DIGEST_PATH}"
+    try:
+        r = requests.get(url, headers=_github_headers(_github_token()),
+                         params={"ref": "main"}, timeout=(5, 15))
+        if r.status_code == 404:
+            return False, f"仓库里还没有 {GITHUB_DIGEST_PATH}（云端日报任务跑过之后才会创建）", None
+        if r.status_code != 200:
+            return False, f"拉取失败 HTTP {r.status_code}: {r.text[:120]}", None
+        raw = base64.b64decode(r.json().get("content") or "").decode("utf-8", errors="replace")
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return False, "云端日报结构异常，已忽略", None
+        ok, data, err = band_decrypt_obj(payload)
+        if not ok:
+            return False, f"云端日报解不开：{err}", None
+        if not isinstance(data, dict) or not str(data.get("text") or "").strip():
+            return False, "云端日报内容为空", None
+        return True, f"已拉取 {data.get('date') or '?'} 的日报", data
+    except Exception as e:
+        _log("digest_last_fetch_remote", e)
+        return False, f"拉取异常：{type(e).__name__}: {str(e)[:100]}", None
+
+
+def _digest_last_resolve():
+    """这次显示哪一份 → (data 或 None, err, 来源文案)。
+
+    优先用「已经是今天的」本地副本 —— Streamlit Cloud 每次提交都会重新部署，
+    所以仓库里那份通常就在本地磁盘上，读它零成本也零延迟。
+    只有「不是今天的 / 本地压根没有」才去云端拉一次，而且**限制频率**
+    （DIGEST_LAST_TTL），否则每点一次按钮都会打一次 GitHub API。
+    """
+    data, err = digest_last_load_local()
+    _today = now_cn_str('%Y-%m-%d')
+    if data and str(data.get('date') or '') == _today:
+        return data, "", "本地仓库副本"
+    _last = 0.0
+    try:
+        _last = float(st.session_state.get('digest_last_try_at') or 0)
+    except Exception as e:
+        _log("_digest_last_resolve/ts", e)
+    # ★ 必须用 _time_module —— 本模块顶部有 `from datetime import ... time ...`，那个 `time` 是**类**、
+    #   不是模块，所以 `time.time()` 会 AttributeError（2026-09-22 实测踩到，页面把它吞成了「跟踪清单渲染出错」）。
+    #   那个 time 是**类**，不是模块 —— 写 time.time() 会 AttributeError（已实测踩到）。
+    if _time_module.time() - _last < DIGEST_LAST_TTL:
+        return data, err, "本地仓库副本"
+    st.session_state['digest_last_try_at'] = _time_module.time()
+    ok, msg, rdata = digest_last_fetch_remote()
+    if ok and rdata:
+        return rdata, "", "云端最新"
+    # 拉不到就退回本地那份 —— 但把原因如实写出来，不做静默降级
+    return data, ((err + "；") if err else "") + (msg or ""), "本地仓库副本"
+
+
+def digest_last_ui():
+    """📰 18:00 日报（网页端回看）—— 2026-09-22 按用户要求新增。
+
+    用户原话：「每天六点的总结 万一说没有微信通知的机会了的话 怎么办？
+    最好在网页中有地方可以呈现，让我无论是在微信上还是在网页上都能看到」。
+
+    微信每天只有 5 条额度、日报要预留的那 1 条也可能因为别的原因发不出去。
+    所以云端日报任务把**同一条正文**加密写进仓库，这里解密后**原样渲染**。
+    ★ 刻意不在这里重算一份：重算就会有两个版本（网页版 / 微信版），
+      数字一旦不一致，用户根本无从判断哪个对 —— 那比看不到更糟。
+    """
+    st.markdown("---")
+    st.subheader("📰 18:00 日报（网页回看）")
+    st.caption("与微信里收到的那条**逐字一致** —— 云端日报任务生成后加密存进仓库，"
+               "这里解密显示，不是重新算的摘要。没收到微信（例如当天额度用完）时就看这里。")
+
+    if st.button("🔄 从云端拉取最新日报", key="digest_last_pull"):
+        _okp, _msgp, _datap = digest_last_fetch_remote()
+        st.session_state['digest_last_pull_msg'] = ("✅ " if _okp else "❌ ") + _msgp
+        if _okp:
+            st.session_state['digest_last_try_at'] = _time_module.time()
+        st.rerun()
+
+    _pull_msg = st.session_state.pop('digest_last_pull_msg', None)
+    if _pull_msg:
+        if _pull_msg.startswith("✅"):
+            st.success(_pull_msg)
+        else:
+            st.warning(_pull_msg)
+
+    _data, _err, _src = _digest_last_resolve()
+    if not _data:
+        st.warning("现在拿不到日报正文：" + (_err or "原因未知"))
+        st.caption("常见原因：① 云端日报还没跑过（每天 18:00 一次）；"
+                   "② **没配 BAND_KEY** —— 日报正文含股票代码，脚本会拒绝以明文写进 public 仓库，"
+                   "于是根本没有落盘（这是刻意的，不是故障）；"
+                   "③ 没配 GITHUB_TOKEN，读不到云端那份。")
+        return
+
+    _d = str(_data.get('date') or '?')
+    _stale = (_d != now_cn_str('%Y-%m-%d'))
+    st.caption(f"📅 日报日期 **{_d}**　·　生成于 {_data.get('saved_at') or '?'}"
+               f"　·　来源：{_src}"
+               + ("　·　⚠️ **不是今天的**（今天那份可能还没生成，或云端任务失败了）" if _stale else ""))
+    if _err:
+        st.caption(f"⚠️ 顺带说明：{_err}")
+    _title = str(_data.get('title') or f"做T助手日报 {_d}")
+    with st.expander(f"📄 {_title}（点开/收起）", expanded=True):
+        st.markdown(_data.get('text') or '')
+
 
 # ================= 3.5 网络请求层 + 代码前缀 + 日线缓存 =================
 # 背景（本次修复）：原先 get_daily_data 用 timeout=3、无 headers、无重试、无备用源，
@@ -2142,6 +2284,72 @@ def _get_daily_history(symbol):
             continue
     return None
 
+BAND_RUN_MAX_LOOKBACK = 120   # 一轮「启动」最多往回找多少根 K 线，防止极端行情下算到一年前
+BAND_RUN_CROWD_FREE_PCT = 15.0  # 离启动点涨幅在多少以内不扣分（超过部分才按拥挤度扣）
+
+def _band_run_start(df):
+    """本轮「波段启动」连续区间是从哪根 K 线开始的？→ {'days','date','price','idx'}。
+
+    ★ 为什么需要它（2026-09-22 用户反馈原话）：
+      「你看之前挑选出来的像是百亚股份这种，看起来已经涨了很多很多了的，
+        为什么还要说它是启动呢？所以说能不能在股票启动确认的位置标注出来，
+        让我明确地知道它已经启动确认了」。
+
+      根因：「波段启动确认」是一个**可以持续很多天**的状态 —— 判定只看**当日**是否
+      「突破 60 日平台 + 放量」（见 `_band_status`）。一只 8 月启动、之后一路创新高放量的票，
+      **每天都在满足**这个条件，于是标签一直挂着「启动确认」不放。
+      标签本身不带时间，看上去就成了「它今天才启动」—— 而实际它已经走了两个月。
+      所以这里把「这一轮是从哪天开始的」单独算出来，交给展示层写成
+      「已启动 N 个交易日 · 起点 2026-07-15 · 至今 +38.2%」。
+
+    ★ 算法：把「启动确认」的两个条件**按日向量化重算**一遍，再从最后一根往回走，
+      走到第一个不满足的 K 线为止，它的下一根就是本轮起点。
+      **阈值必须与 `_calculate_band_metrics` 里那一份逐字相同**（0.995 / 0.999 / 1.5），
+      否则会出现「卡片说今天启动、涨幅却按另一天算」这种自相矛盾。
+      ⚠️ 改动这里必须同时改 watcher.py 的 `_band_run_start`（有跨文件一致性测试守着）。
+
+    返回 days=0 表示**最后一根 K 线不满足启动条件**（例如已经跌破 20 日线）——
+    这不是"没算出来"，调用方据此显示「—」，绝不编一个数出来。
+    """
+    try:
+        close = df['Close']; high = df['High']; vol = df['Volume']
+        lookback = 60
+        n = len(df)
+        if n < lookback + 2:
+            return {'days': 0, 'date': '', 'price': 0.0, 'idx': -1}
+        plat_high = high.rolling(lookback).max()
+        close_high = close.rolling(lookback).max()
+        vol5 = vol.rolling(5).mean()
+        vol20 = vol.rolling(20).mean()
+        with np.errstate(divide='ignore', invalid='ignore'):
+            vr = vol5 / vol20
+        # 与 _calculate_band_metrics 同一组阈值：突破平台 + 量能放大
+        ok = ((close >= plat_high * 0.995) & (close >= close_high * 0.999)
+              & ((vr >= 1.5) | (vol >= vol20 * 1.5)))
+        ok = ok.fillna(False).astype(bool)
+        # rolling 窗口没填满的那些日子不作判定（fillna 只挡 NaN，不挡"窗口只有 3 根"）
+        ok.iloc[:lookback - 1] = False
+        last = n - 1
+        if not bool(ok.iloc[last]):
+            return {'days': 0, 'date': '', 'price': 0.0, 'idx': -1}
+        floor = max(lookback - 1, last - BAND_RUN_MAX_LOOKBACK)
+        i = last
+        while i > floor and bool(ok.iloc[i - 1]):
+            i -= 1
+        date = ''
+        try:
+            if 'Date' in df.columns:
+                date = str(df['Date'].iloc[i])[:10]
+        except Exception as e:
+            _log("_band_run_start/date", e)
+        return {'days': int(last - i + 1), 'date': date,
+                'price': float(close.iloc[i]), 'idx': int(i)}
+    except Exception as e:
+        # 算不出来不能拖垮选股/刷新：如实记日志，返回"没算出来"，由展示层降级成「—」
+        _log("_band_run_start", e)
+        return {'days': 0, 'date': '', 'price': 0.0, 'idx': -1}
+
+
 def _calculate_band_metrics(df):
     """计算波段相关指标：平台区间、突破、均线、MACD、顶背离、跌破支撑。"""
     close = df['Close']; high = df['High']; low = df['Low']; vol = df['Volume']
@@ -2202,6 +2410,10 @@ def _calculate_band_metrics(df):
     high_250 = float(close.tail(250).max()); low_250 = float(close.tail(250).min())
     position_pct = 50.0 if high_250 <= low_250 else (current - low_250) / (high_250 - low_250) * 100
 
+    # ★ 本轮启动起点（2026-09-22 新增）：标签「波段启动确认」可以持续很多天，
+    #   没有它就说不清「它到底是哪天启动的、到现在涨了多少」。见 _band_run_start 的说明。
+    _run = _band_run_start(df)
+
     return {
         'current': current, 'ma20': ma20, 'ma60': ma60,
         'platform_high': platform_high, 'platform_low': platform_low,
@@ -2212,6 +2424,11 @@ def _calculate_band_metrics(df):
         'top_divergence': top_divergence, 'top_divergence_gap_pct': top_divergence_gap_pct,
         'below_support': below_support,
         'position_pct': position_pct, 'lookback': lookback,
+        'run_days': _run['days'], 'run_start_date': _run['date'],
+        'run_start_price': _run['price'],
+        # 起点价缺失（days=0）时给 0，绝不用现价顶替 —— 否则"至今 +0.0%"看着像刚启动
+        'run_gain_pct': (((current / _run['price']) - 1.0) * 100.0
+                         if _run['price'] > 0 else 0.0),
     }
 
 def _band_status(metrics):
@@ -2266,6 +2483,21 @@ def _band_score(m):
     elif m['position_pct'] <= 75:
         score += 5; reasons.append(f"中位({m['position_pct']:.0f}%)")
 
+    # ★ 2026-09-22 新增「拥挤度减分」：用户要求「顺序排列要按它们的前景来排列，越靠前的越有前景」。
+    #   启动确认是个**可持续多日**的状态，标签本身不含时间信息；离启动起点越远，
+    #   可用的向上空间越小、回撤风险越高 —— 这正是「前景」该扣分的地方。
+    #   起步线 15%：涨到 15% 以内不扣（正常突破后的第一波），之后每多涨 1% 扣 0.8 分，最多扣 30 分。
+    #   ★ 这**只影响排序与展示**，不会把票踢出结果：启动确认的底分
+    #     （突破 35 + 放量 25 + 均线 15 + MACD 15 ≈ 90）远高于选股门槛 20，
+    #     扣满 30 分仍有 60 分以上。有单测盯着"扣分后仍在门槛之上"。
+    #   ★ 用 .get 取值：历史/外部构造的 metrics（含 watcher 那份、老测试夹具）没有这个字段，
+    #     下标硬取会直接 KeyError —— 展示与打分对缺字段一律降级。
+    _run_gain = m.get('run_gain_pct')
+    if isinstance(_run_gain, (int, float)) and _run_gain >= BAND_RUN_CROWD_FREE_PCT:
+        _crowd = min(30.0, (_run_gain - BAND_RUN_CROWD_FREE_PCT) * 0.8)
+        score -= _crowd
+        reasons.append(f"离启动点+{_run_gain:.0f}%（扣{_crowd:.0f}分）")
+
     if m['top_divergence']:
         score -= 40; reasons.append("⚠️顶背离")
     if m['below_support']:
@@ -2299,6 +2531,9 @@ def _band_evaluate(code, name='', price=0.0, change_pct=0.0):
         'Reasons': ' | '.join(reasons), 'LastClose': m['current'],
         'Breakout': bool(m['breakout']), 'VolumeExpansion': bool(m['volume_expansion']),
         'TopDivergence': bool(m['top_divergence']), 'BelowSupport': bool(m['below_support']),
+        # 本轮启动起点（2026-09-22）：卡片/记忆/推送候选都靠它写「已启动 N 日 · 至今 +X%」
+        'RunDays': m['run_days'], 'RunStartDate': m['run_start_date'],
+        'RunStartPrice': m['run_start_price'], 'RunGainPct': m['run_gain_pct'],
     }
 
 def _analyze_band(row):
@@ -2550,6 +2785,13 @@ GITHUB_REPO = "lipeixinOVO/stock-t-terminal"
 # 本地那份 band_memory.json 本身仍旧不提交（避免同一份数据两条提交链路互相踩）。
 # ⚠️ 本仓库是 public：想保密就配 BAND_KEY（提交上去的是密文），**不要靠删字段**。
 GITHUB_WATCH_PATH = "band_watch.json"
+# ★ 18:00 日报正文在仓库里的路径（2026-09-22 新增）。
+#   正文含股票代码与名称 ⇒ 进 public 仓库前必须由 band_encrypt_obj 加密；
+#   云端（daily_digest.py）没配 BAND_KEY 时会**拒绝落盘**，所以这里读不到就是"没配密钥"，
+#   而不是"日报坏了" —— 展示层要如实区分这两种情况。
+GITHUB_DIGEST_PATH = "digest_last.json"
+DIGEST_LAST_FILE = os.path.join(BASE_DIR, "digest_last.json")
+DIGEST_LAST_TTL = 600      # 自动去云端拉日报的最小间隔（秒）
 
 
 def _band_memory_empty():
@@ -2595,6 +2837,19 @@ def _band_memory_apply(node, r, event):
     #   窗口前移它就会变；停在上一次刷新的值会让"回踩位"越来越失真。
     node['breakout_pivot'] = float(r.get('BreakoutPivot')
                                    or node.get('breakout_pivot') or 0.0)
+    # ★ 本轮启动起点（2026-09-22）：与 breakout_pivot 同一个理由 —— 它是**滚动回溯**出来的，
+    #   停在上一次刷新的值会让「已启动 N 日」越算越错（尤其这一轮中途断过几天、
+    #   或者早就跌破 20 日线时，旧值会让界面继续显示一个不存在的"启动中"）。
+    #   所以也必须写在「状态没变就直接 return」**之前**。
+    #   ★ 用 `is not None` 判存在、而不是 `or`：RunDays=0 是**合法值**
+    #     （意思是"最后一根 K 线已经不在启动区"），用 `or` 会退回过期旧值，
+    #     于是已经结束的波段会一直显示「已启动 47 个交易日」。
+    _rdays = r.get('RunDays')
+    if _rdays is not None:
+        node['run_days'] = int(_rdays)
+        node['run_start_date'] = str(r.get('RunStartDate') or '')
+        node['run_start_price'] = float(r.get('RunStartPrice') or 0.0)
+        node['run_gain_pct'] = float(r.get('RunGainPct') or 0.0)
     old_status = node.get('status')
     if new_status == old_status:
         return False
@@ -2654,6 +2909,15 @@ def _band_memory_new_node(r, source, batch_id=None, bench_above=None):
         # breakout_pivot：突破位（突破前的 60 日平台上沿，不含当天）。
         #   取不到就是 0 → 展示层显示「—」；旧节点没有这个字段，刷新一次会补上。
         "breakout_pivot": float(r.get('BreakoutPivot') or 0.0),
+        # run_*：入册那一刻，这一轮「启动」是从哪天开始的（2026-09-22）。
+        #   卡片/记忆清单/推送候选据此写「已启动 N 个交易日 · 起点 X · 至今 +Y%」——
+        #   因为「波段启动确认」是个可以持续很多天的状态，标签本身不带时间，
+        #   用户会误以为"它今天才启动"（原话：「已经涨了很多很多了，为什么还说它是启动」）。
+        #   取不到就是 0/''，展示层降级成「—」，绝不编。
+        "run_start_date": str(r.get('RunStartDate') or ''),
+        "run_start_price": float(r.get('RunStartPrice') or 0.0),
+        "run_days": int(r.get('RunDays') or 0),
+        "run_gain_pct": float(r.get('RunGainPct') or 0.0),
         "alert_ack": "",
         "history": [],
     }
@@ -3737,6 +4001,69 @@ def band_defense_price(node):
     return _band_num(node.get("ma20"))
 
 
+# ---------- 本轮启动信息的展示（2026-09-22）----------
+BAND_RUN_FAR_PCT = 25.0   # 离启动点涨幅达到它 → 标「追高区」，卡片换警示色
+
+def _band_run_pick(src, *keys):
+    """按候选键名依次取值；取到空/None 就当没有。字段缺失绝不抛异常。"""
+    for k in keys:
+        try:
+            if k in src:
+                v = src.get(k)
+                if v is not None and v != '':
+                    return v
+        except Exception:
+            continue
+    return None
+
+
+def band_run_info(src):
+    """取本轮启动信息 → {'days','date','price','gain'}（缺什么给 0 / ''）。
+
+    两种容器的字段名不同：**评估结果行**是 `RunDays/RunStartDate/RunGainPct`（大写驼峰），
+    **记忆节点**是 `run_days/run_start_date/run_gain_pct`（小写下划线）。
+    这里统一读一次 —— 三个展示点（选股页卡片 / 记忆清单 / 今日推送候选）
+    各写一套 if 的话，早晚会有一处漏改，然后同一只票在两页显示不同的天数。
+    ★ 老记忆节点、老扫描结果、手写测试夹具都没有这些字段，所以一律 `.get` + 降级，绝不下标硬取。
+    """
+    try:
+        days = int(float(_band_run_pick(src, 'RunDays', 'run_days') or 0))
+    except Exception:
+        days = 0
+    try:
+        price = float(_band_run_pick(src, 'RunStartPrice', 'run_start_price') or 0.0)
+    except Exception:
+        price = 0.0
+    try:
+        gain = float(_band_run_pick(src, 'RunGainPct', 'run_gain_pct') or 0.0)
+    except Exception:
+        gain = 0.0
+    try:
+        date = str(_band_run_pick(src, 'RunStartDate', 'run_start_date') or '')[:10]
+    except Exception:
+        date = ''
+    return {'days': days, 'date': date, 'price': price, 'gain': gain}
+
+
+def band_run_text(src):
+    """本轮启动的一句话标注；**算不出来就返回空串**（调用方决定显示「—」还是整段省略）。
+
+    为什么必须写清楚（而不是只给个天数）：用户看到的困惑是
+    「已经涨了很多很多了，为什么还说它是启动」—— 因为这是一个**可以持续很多天**的状态。
+    所以这句话的作用就是把「启动」翻译成「**哪天**启动的、**到现在**涨了多少」。
+    """
+    info = band_run_info(src)
+    if info['days'] <= 0:
+        return ''
+    if info['days'] == 1:
+        return '本轮启动：今天刚确认'
+    txt = (f"本轮启动：已 {info['days']} 个交易日 · 起点 {info['date'] or '—'}"
+           f" · 至今 {info['gain']:+.1f}%")
+    if info['gain'] >= BAND_RUN_FAR_PCT:
+        txt += f"　⚠️ 已离启动点较远（≥{BAND_RUN_FAR_PCT:.0f}%，追涨空间小）"
+    return txt
+
+
 def band_alert_need_expand(node):
     """这一条预警要不要**自动展开**（「只展开新出现的预警」）。
 
@@ -4117,6 +4444,9 @@ def band_evaluate_asof(code, name, df, i, bench_df=None):
             'Reasons': ' | '.join(reasons), 'LastClose': m['current'],
             'Breakout': bool(m['breakout']), 'VolumeExpansion': bool(m['volume_expansion']),
             'TopDivergence': bool(m['top_divergence']), 'BelowSupport': bool(m['below_support']),
+            # 与 _band_evaluate 同构（回测/归因直接复用同一批字段）
+            'RunDays': m['run_days'], 'RunStartDate': m['run_start_date'],
+            'RunStartPrice': m['run_start_price'], 'RunGainPct': m['run_gain_pct'],
         }
     except Exception as e:
         _log(f"band_evaluate_asof/{code}", e)
@@ -4932,19 +5262,59 @@ def band_samples_harvest_forward(progress_cb=None, bench_df=None, limit=0):
       ② 基准（沪深300）必须一起传进采样引擎。不传的话 band_outcome_compute 拿不到
          bench_df → excess_pct 恒为 None → 分桶报表里所有「相对基准」全是空的，
          这批样本就永远回答不了「它到底有没有产生超额」——采集全白做。
+      ③ 清单分页**不能遇空页就 break**（2026-09-22 踩到）：东财分页接口会「半死」——
+         前几页正常、之后每页都空。旧逻辑一 break 就只拿了几页就去采样，产出的是
+         「按主力净额排序的前 N 只」这种**有偏子集**，退出码却是 0、日志也不报错。
+         现在改成：空页重试 + 只在**连续**空页时才收尾 + 清单总量低于下限就显式报错退出。
     """
     report = {"codes": 0, "fetched": 0, "failed": 0, "kept": 0, "fail_examples": []}
     meta = {}
     names = {}
+    # ★ 清单分页的自我保护参数，刻意写成**函数内局部量**：
+    #   sample_harvest.py 是按白名单（WANT_CONSTS）用 AST 抽模块级常量的，
+    #   新增的模块级常量不会被注入；函数体里的局部量则随函数一起被抽走。
+    _pn_max = 60          # 页上限：60 页 × 100 只 = 6000，覆盖沪深 A 股并留余量
+    _page_retry = 2       # 单页返回空时的重试次数
+    _retry_wait = 1.5     # 重试间隔（秒）
+    _empty_stop = 2       # 连续空页达到这个数，才认定「真的到底了」
+    _universe_min = 3000  # 清单低于此数 → 判定残缺，放弃本次采集（宁可不采，不采有偏样本）
     try:
         raw = []
-        for pn in range(1, 41):
-            page = fetch_market_page(pn)
+        empty_run = 0
+        pages_ok = 0
+        for pn in range(1, _pn_max + 1):
+            page = []
+            for _attempt in range(_page_retry + 1):
+                page = fetch_market_page(pn)
+                if page:
+                    break
+                if _attempt < _page_retry:
+                    time.sleep(_retry_wait)
             if not page:
-                break
+                empty_run += 1
+                _log("band_samples_harvest_forward/page_empty",
+                     RuntimeError(f"第 {pn} 页返回空（已重试 {_page_retry} 次）；"
+                                  f"连续空页 {empty_run}"))
+                if empty_run >= _empty_stop:
+                    break
+                continue        # ★ 关键：单页失败只丢该页，绝不终止整个清单
+            empty_run = 0
+            pages_ok += 1
             raw.extend(page)
         if not raw:
             report["error"] = "全市场接口暂不可用（非交易时段/网络限制）"
+            return [], report
+        uniq_codes = {str(s.get("f12") or "").zfill(6) for s in raw}
+        # ★ 清单完整性校验：接口「半死」时的典型形态是「前几页正常、之后每页都空」。
+        #   旧逻辑遇空页即 break，于是安静地只拿了几页清单就去采样 —— 产出的其实是
+        #   「按主力净额排序的前 N 只」这种有偏子集，而且退出码仍是 0，
+        #   比彻底采不到更危险（脏样本进库后无法区分）。
+        #   这里宁可显式失败，也不产出冒充「全市场」的有偏样本。
+        if len(uniq_codes) < _universe_min:
+            report["error"] = (f"全市场清单残缺：仅取到 {len(uniq_codes)} 只 / {pages_ok} 页，"
+                               f"低于下限 {_universe_min} —— 放弃本次采集以免污染语料库")
+            report["universe"] = len(uniq_codes)
+            report["pages_ok"] = pages_ok
             return [], report
         for s in raw:
             _sample_meta_add(meta, names, s)
@@ -4974,6 +5344,7 @@ def band_samples_harvest_forward(progress_cb=None, bench_df=None, limit=0):
         market_meta=meta, bench_df=bench_df, progress=(progress_cb or None),
         max_codes=max(0, int(limit or 0)))
     rep["universe"] = len(meta)
+    rep["pages_ok"] = pages_ok                # 清单取到几页 —— 用于事后判断有没有被截断
     rep["limit"] = max(0, int(limit or 0))     # 报告里显式留痕：这次是不是冒烟测试
     rep["no_bench"] = bench_df is None        # 必须显式告知：没有基准就没有超额
     return rows, rep
@@ -5246,6 +5617,8 @@ def band_memory_ui():
     # ★ 今日推送（手动）：额度 + 候选。放在清单**之前** ——
     #   用户打开这一页通常就是想看"今天要推什么"，不该让他先滚完长名单。
     notify_center_ui(mem)
+    # 日报回看紧跟今日推送：两块说的都是「通知」，微信没收到时来这一页找（2026-09-22）
+    digest_last_ui()
 
     if not mem['stocks']:
         st.caption("（还没有记录。点上方按钮扫描一次，或在这里手动记入。）")
@@ -5427,9 +5800,14 @@ def band_memory_ui():
 
     # ---- 记忆清单 ----
     st.markdown("#### 📋 记忆清单")
+    # ★ 2026-09-22 换序（用户要求）：「顺序排列要按它们的前景来排列，越靠前的越有前景」。
+    #   旧口径是「状态层级 → 入册时间」，于是刚启动、上方空间大的票会被压在若干只预警票下面。
+    #   新口径：归档的沉底，其余**一律按前景分降序**（同分再比入册时间，保证顺序稳定可复现）。
+    #   ★ 预警票不会因为排在后面就漏看 —— 「只展开新出现的预警」（band_alert_need_expand）
+    #     与红框仍然生效。**提醒靠的是标记，不是位置。**
     order = sorted(mem['stocks'].values(),
                    key=lambda n: (bool(n.get('closed')),
-                                  -BAND_STATUS_LEVEL.get(n.get('status'), 0),
+                                  -float(n.get('score') or 0),
                                   str(n.get('added_at', ''))))
     # 批量多选处理（归档 / 删除）—— 不用再一只只展开去找删除按钮
     _band_bulk_manage_ui(mem, order)
@@ -5441,10 +5819,14 @@ def band_memory_ui():
         add_col, add_icon = _band_status_badge(node.get('added_status'))
         changed = bool(node.get('added_status')) and node.get('added_status') != cur
         stage_txt = band_levels_text(node)
+        # 本轮启动标注（2026-09-22）：让「启动确认」这个能持续很多天的标签带上时间 ——
+        # 一眼看出它**早就启动**了、还是今天刚启动（见 band_run_text 的说明）。
+        _run_txt = band_run_text(node)
         title = (f"{icon} {node.get('name')}（{code}）　{cur}"
                  + ("　⚠️ 状态已变化" if changed else "")
                  + ("　🗄️ 已归档" if node.get('closed') else "")
-                 + (f"　·　{stage_txt}" if stage_txt else ""))
+                 + (f"　·　{stage_txt}" if stage_txt else "")
+                 + (f"　·　{_run_txt}" if _run_txt else ""))
         # ★ 「只展开新出现的预警」—— 判定抽在 band_alert_need_expand 里（可单测），
         #   这里只负责接线。别把条件再内联回来：AppTest 断言不了展开状态。
         need_show = band_alert_need_expand(node)
@@ -5741,17 +6123,36 @@ def _render_band_card(r, tracked=None):
     # ★ 防守位与「🧠 波段记忆」同口径：就是 20 日线（同一列 MA20），缺值降级成「—」。
     #   和突破位一样，**绝不在展示串里直接下标取字段** —— 缺字段的调用路径不能打崩整页。
     _def_txt = _fmt_price(_band_num(r.get('MA20')))
+    # ★ 本轮启动标注 + 前景分（2026-09-22）。用户在选股页看到「已涨很多还写启动确认」，
+    #   就是因为这个标签不带时间 —— 判定只看**当日**是否突破+放量，一只持续创新高的票
+    #   每天都在满足它。这里把「哪天启动的、至今涨了多少」印在卡片上。
+    #   ★ 全部走 .get + 降级：老扫描结果与手写夹具都没有这几个字段，
+    #     下标硬取会让"缺字段的那条调用路径"整页白屏（2026-09-21 实测踩过）。
+    _run_info = band_run_info(r)
+    _run_txt = band_run_text(r)
+    _run_line = (_run_txt if _run_txt
+                 else "本轮启动：—（最后一根 K 线不在启动区，或历史不足 62 根）")
+    _run_color = ("#f9e2af" if (_run_info['days'] > 0
+                                and _run_info['gain'] >= BAND_RUN_FAR_PCT) else "#a6e3a1")
+    _score_v = r.get('Score')
+    try:
+        _score_line = (f"前景分 <b>{float(_score_v):.0f}</b>"
+                       if _score_v is not None else "前景分 —")
+    except (TypeError, ValueError):
+        _score_line = "前景分 —"
     st.markdown(f"""
                 <div style="background:#1e1e2e; border-radius:10px; padding:14px 18px; margin-bottom:10px; border-left:4px solid {r['StatusColor']};">
                     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
                         <div><span style="font-size:18px; font-weight:bold; color:#f0f2f6;">{r['Name']}</span>
                         <span style="color:#89b4fa; font-size:14px; margin-left:8px;">({r['Code']})</span>
                         <span style="color:{chg_color}; font-size:14px; margin-left:10px;">{r['ChangePct']:+.2f}%</span>{_tag}</div>
-                        <div style="text-align:right;"><span style="color:{r['StatusColor']}; font-size:16px; font-weight:bold;">{r['Status']}</span></div>
+                        <div style="text-align:right;"><span style="color:{r['StatusColor']}; font-size:16px; font-weight:bold;">{r['Status']}</span>
+                        <div style="color:#c9d1d9; font-size:12px; margin-top:2px;">{_score_line}</div></div>
                     </div>
                     <div style="margin-top:8px; color:#c9d1d9; font-size:13px; line-height:1.8;">
                         <span style="color:#89b4fa;">现价:</span> {r['Price']:.2f}（加入记忆后即「入选价」） | <span style="color:#89b4fa;">突破位:</span> {_pivot_txt} | <span style="color:#89b4fa;">防守位:</span> {_def_txt}（20 日线） | <span style="color:#89b4fa;">量比:</span> {r['VolRatio']:.1f} | <span style="color:#89b4fa;">250日分位:</span> {r['Position250']:.0f}%
                     </div>
+                    <div style="margin-top:6px; color:{_run_color}; font-size:13px;">🚀 {_run_line}</div>
                     <div style="margin-top:6px; color:#f9e2af; font-size:13px;">📋 {r['Reasons']}</div>
                 </div>
                 """, unsafe_allow_html=True)
