@@ -41,6 +41,14 @@ LOG_PATH = os.environ.get("NOTIFY_LOG", os.path.join(HERE, "notify_log.json"))
 #   只能从这份账本看 —— 巡检的 notify_log 现在恒为空。
 BUDGET_PATH = os.environ.get("NOTIFY_BUDGET", os.path.join(HERE, "notify_budget.json"))
 STATE_PATH = os.environ.get("DIGEST_STATE", os.path.join(HERE, "digest_state.json"))
+# ★ 日报正文的落盘位置（2026-09-22 新增）。为什么要落盘：
+#   用户原话「万一说没有微信通知的机会了的话，怎么办？最好在网页中有地方可以呈现，
+#   让我无论是在微信上还是在网页上都能看到」。微信额度只有 5 条，日报要预留的那 1 条
+#   也可能因为别的原因没发出去；所以正文同时存一份到仓库，网页端解密后原样显示。
+#   ⚠️ 仓库是 **public** —— 必须经 band_encrypt_obj 加密后写，且**没配 BAND_KEY 时拒绝落盘**
+#     （见 save_last）。宁可网页端看不到，也不能把股票代码明文提交上去。
+LAST_PATH = os.environ.get("DIGEST_LAST", os.path.join(HERE, "digest_last.json"))
+SAVE_LAST = os.environ.get("DIGEST_SAVE", "1").strip() != "0"
 DRY = os.environ.get("DIGEST_DRY", "").strip() == "1"
 
 
@@ -368,7 +376,66 @@ def sec_health(ns, notes, t_start, bench_ok, bench_cost):
         lines.append("- 语料 / 波段摘要 / 推送日志均正常，无异常")
     lines.append(f"\n_日报生成耗时 {time.time() - t_start:.1f}s。"
                  f"完整报表可在网页端「🧪 逻辑有效性验证」里看，采集由 15:40 的盘后任务自动完成。_")
+    # ★ 告诉用户"微信没收到时去哪看"（2026-09-22）：正文会加密同步到仓库，
+    #   网页端「🧠 波段记忆」页的「📰 18:00 日报」里能读到**同一条**。
+    lines.append("_这条日报的正文已同步到网页端「🧠 波段记忆」→「📰 18:00 日报」；"
+                 "没收到微信（例如当天额度用完）时去那里看得到一模一样的全文。_")
     return lines
+
+
+def build_digest(ns, rows, watch, keys, log_err, budget, budget_err,
+                 notes, state, bench_ok, bench_cost, t_start):
+    """把五节拼成一份日报正文并返回。
+
+    ★ 抽出来的唯一理由（2026-09-22）：**正文只允许在这一处生成**。
+      网页端要能回看"和微信里一模一样的那条"，靠的就是读这里落盘的那一份；
+      如果让网页另写一套拼装，两边早晚漂移 —— 这个项目已经因为口径漂移吃过一次亏
+      （分时买卖点主图 0.4 / 巡检 0.5），所以宁可多传几个参数也不复制逻辑。
+    """
+    body = []
+    body += sec_header()
+    body += sec_corpus(ns, rows, state)
+    body.append("")
+    body += sec_lift(ns, rows)
+    body.append("")
+    body += sec_memory(ns, watch, state)
+    body.append("")
+    body += sec_notify(keys, log_err, budget, budget_err)
+    body.append("")
+    body += sec_health(ns, notes, t_start, bench_ok, bench_cost)
+    return "\n".join(body)
+
+
+def save_last(ns, title, text):
+    """把日报正文**加密**落盘，供网页端回看 → (ok, msg)。
+
+    ★ fail-closed（与 band_watch.json 同一条红线，不许改）：
+      - 没配 BAND_KEY → **拒绝写**。日报正文里有股票代码与名称，
+        明文提交等于把清单直接公开在 public 仓库里。宁可网页端看不到，也不明文落盘。
+      - 加密本身失败 → 抛出来、返回失败，绝不退化成明文写盘。
+    """
+    if not SAVE_LAST:
+        return False, "DIGEST_SAVE=0，本次跳过落盘"
+    try:
+        if not ns["band_crypto_enabled"]():
+            return False, ("没配 BAND_KEY —— 日报正文含股票代码，拒绝以明文写进 public 仓库"
+                           "（配好 BAND_KEY 后网页端才能回看）")
+    except Exception as e:
+        _log("save_last/crypto_check", e)
+        return False, f"加密可用性检查失败：{e}"
+    try:
+        payload = ns["band_encrypt_obj"]({
+            "date": _cn_now().strftime("%Y-%m-%d"),
+            "title": title,
+            "text": text,
+            "saved_at": _cn_now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        with open(LAST_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return True, f"已加密写入 {os.path.basename(LAST_PATH)}"
+    except Exception as e:
+        _log("save_last", e)
+        return False, f"日报落盘失败：{e}"
 
 
 # ============================ 主流程 ============================
@@ -412,18 +479,8 @@ def main():
         notes.append("基准（沪深300）本次没取到 —— 若采集当时也取不到，该批样本的超额收益为空")
 
     state = load_state()
-    body = []
-    body += sec_header()
-    body += sec_corpus(ns, rows, state)
-    body.append("")
-    body += sec_lift(ns, rows)
-    body.append("")
-    body += sec_memory(ns, watch, state)
-    body.append("")
-    body += sec_notify(keys, log_err, budget, budget_err)
-    body.append("")
-    body += sec_health(ns, notes, t_start, bench_ok, bench_cost)
-    text = "\n".join(body)
+    text = build_digest(ns, rows, watch, keys, log_err, budget, budget_err,
+                        notes, state, bench_ok, bench_cost, t_start)
 
     print("=" * 72)
     print(text)
@@ -436,6 +493,11 @@ def main():
         print("!! 未配置 SERVERCHAN_KEY，跳过推送（网页端可在侧边栏看到配置说明）")
     else:
         print("推送结果：", "成功" if send_wechat(title, text) else "失败")
+
+    # 落一份加密正文供网页端回看（2026-09-22）。落盘失败**不让日报判红**：
+    # 定时任务的失败信号只留给"脚本本身崩了"，否则红灯久了就没人信（见文件头）。
+    _saved, _saved_msg = save_last(ns, title, text)
+    print(f"网页端回看：{'✅' if _saved else '⚠️'} {_saved_msg}")
 
     # ---- 落状态，供明天算「今日变化」----
     new_state = dict(state)
