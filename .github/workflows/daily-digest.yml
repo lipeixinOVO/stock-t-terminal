@@ -6,11 +6,21 @@ name: 每日全量日报（微信）
 # 这里一天只跑一次，负责**日终汇总**：语料攒了多少、逻辑有没有出现超额、记忆里有哪些变化、
 # 今天推了多少条、数据源健康不健康。
 #
-# 数据从哪来（都是只读，本工作流**不回写任何文件**）：
+# 数据从哪来：
 #   ① 语料：承接 sample-harvest 的缓存 band_samples.enc（加密，需要 BAND_KEY）
 #   ② 波段摘要：仓库里的 band_watch.json（由网页端/巡检维护）
 #   ③ 今日推送：承接 notify.yml 的缓存 notify_log.json
 #   ④ 自己的状态：digest_state.json，用来算「相对昨天有哪些变化」
+#
+# ★ 2026-09-22 起本工作流**会回写一个文件**：digest_last.json。
+#   原因（用户原话）：「万一说没有微信通知的机会了的话，怎么办？最好在网页中有地方可以呈现，
+#   让我无论是在微信上还是在网页上都能看到」。微信每天只有 5 条额度，日报要预留的那 1 条
+#   也可能因为别的原因没发出去 —— 所以正文同时**加密**存一份到仓库，网页端解密后原样显示，
+#   与微信里发出去的**逐字一致**。
+#   ⚠️ 正因为要写仓库，本工作流必须有 contents: write（原来是 read）。
+#   ⚠️ 写进去的必须是密文：脚本侧的 band_encrypt_obj 保证了这一点，
+#     而且**没配 BAND_KEY 时脚本会直接拒绝落盘**（public 仓库的隐私红线，见 daily_digest.save_last）。
+#   代价：仓库每天多一次提交，Streamlit Cloud 会因此重新部署一次（个人自用工具，可接受）。
 
 on:
   schedule:
@@ -25,7 +35,7 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write        # ★ 2026-09-22：要提交 digest_last.json（日报正文，密文）
 
 concurrency:
   group: daily-digest
@@ -38,6 +48,9 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          # 默认 depth=1 在 `git pull --rebase` 时容易失败；仓库很小，取全量最省心。
+          fetch-depth: 0
 
       - name: 配置 Python
         uses: actions/setup-python@v5
@@ -81,6 +94,38 @@ jobs:
           BAND_KEY: ${{ secrets.BAND_KEY }}
           DIGEST_DRY: ${{ github.event.inputs.dry == '1' && '1' || '0' }}
         run: python daily_digest.py
+
+      - name: 提交日报正文（供网页端回看）
+        # 只在真正运行时提交：workflow_dispatch 的 dry 模式与"只生成不推送"的语义一致，
+        # 不应该顺手把一份草稿发布到仓库里让人看到。
+        if: always() && github.event.inputs.dry != '1'
+        run: |
+          if [ ! -f digest_last.json ]; then
+            echo "没有 digest_last.json —— 多半是没配 BAND_KEY（脚本会说明原因），跳过提交"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add digest_last.json
+          if git diff --cached --quiet; then
+            echo "日报正文与上次相同，跳过提交"
+            exit 0
+          fi
+          git commit -m "日报正文 $(TZ=Asia/Shanghai date +%F)"
+          # 网页端也在往同一个分支提交（波段记忆同步），所以推送可能撞车 —— 重试几次，
+          # 每次都先 rebase 到远端最新。**失败不判红**：定时任务的失败信号只留给
+          # "脚本本身崩了"，否则红灯久了就没人信（见文件头）。
+          for i in 1 2 3; do
+            if git pull --rebase --autostash origin "${GITHUB_REF_NAME}" \
+               && git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "✅ 日报正文已提交"
+              exit 0
+            fi
+            echo "第 $i 次推送失败（多半是网页端同时提交了），5 秒后重试"
+            sleep 5
+          done
+          echo "::warning::日报正文连续 3 次推送失败 —— 网页端会显示上一次的日报"
+          exit 0
 
       - name: 保证状态文件存在
         if: always()
