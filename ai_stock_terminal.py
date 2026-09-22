@@ -283,6 +283,336 @@ def mark_notified(symbol, signal_type, price):
     if key not in log[today]: log[today].append(key)
     _save_notify_log(log)
 
+# ================= 3.1 ★ 微信推送「每日限额」（2026-09-22 新增）=================
+# 用户原话：「因为我每天微信通知只有五条的限制，留下一条给六点的通知，
+#   剩下的全部交给我来手动选择」。
+# 所以：**所有自动推送一律关掉** —— 网页端 monitor_all_watchlist 不再发，
+# 云端巡检 watcher 也不再发（见 watcher.send_wechat），只留 18:00 日报那一条。
+# 剩 4 条由用户在「📤 今日推送」面板里点哪条发哪条。
+#
+# 账本 `notify_budget.json` 提交进仓库（2026-09-22 用户同意）：网页端容器一重启本地
+# 文件就没了，计数归零会让用户点到第 6 条被 Server酱 直接拒。
+# 与 band_watch.json 同一套保密规则：配了 BAND_KEY 就整段加密 ——
+# 否则「今天推了哪几只票」会以明文出现在 public 仓库里。
+NOTIFY_BUDGET_FILE = os.path.join(BASE_DIR, "notify_budget.json")
+GITHUB_BUDGET_PATH = "notify_budget.json"
+NOTIFY_LIMIT_DEFAULT = 5        # Server酱 免费版每天 5 条（硬限制在服务端，这边只是刹车）
+NOTIFY_RESERVE_DEFAULT = 1      # 其中 1 条预留给 18:00 日报
+NOTIFY_LIMIT_MAX = 20           # 可调，但别声称能超过服务端配额
+# 候选池：只有这三种状态值得打扰用户
+NOTIFY_CAND_STATUSES = ('跌破支撑', '顶背离预警', '波段启动确认')
+
+
+def _clamp_int(v, lo, hi, default):
+    """收敛进 [lo, hi]。坏值落到 default（**不是** lo）。"""
+    try:
+        n = int(float(v))
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
+
+
+def notify_budget_empty():
+    """空账本。日期用**北京时间**（云端运行在 UTC，用 UTC 会在每天早上 8 点前算成昨天）。"""
+    return {"date": now_cn().strftime('%Y-%m-%d'), "limit": NOTIFY_LIMIT_DEFAULT,
+            "reserved": NOTIFY_RESERVE_DEFAULT, "sent": [], "updated_at": ""}
+
+
+def notify_budget_normalize(b):
+    """收敛成干净账本，**跨天自动清空 sent**。
+
+    ★ 跨天必须清空：留着昨天的 sent，今天一开页面就是「额度已用完」。
+    ★ reserved 必须 ≤ limit：否则手动额度算成负数，界面会出现"还能推 -1 条"。
+    ★ sent 只保留结构正确的条目：坏条目会让计数与实际推送数不符（额度算错）。
+    """
+    d = notify_budget_empty()
+    if not isinstance(b, dict):
+        return d
+    limit = _clamp_int(b.get("limit"), 1, NOTIFY_LIMIT_MAX, NOTIFY_LIMIT_DEFAULT)
+    reserved = _clamp_int(b.get("reserved"), 0, limit, NOTIFY_RESERVE_DEFAULT)
+    out = {"date": d["date"], "limit": limit, "reserved": reserved,
+           "sent": [], "updated_at": str(b.get("updated_at") or "")}
+    if str(b.get("date") or "") == d["date"]:
+        for it in (b.get("sent") or []):
+            if isinstance(it, dict) and it.get("title"):
+                out["sent"].append(it)
+    return out
+
+
+def notify_budget_used(b):
+    return len(notify_budget_normalize(b)["sent"])
+
+
+def notify_budget_manual_left(b):
+    """手动还能推几条 = 上限 − 预留（日报）− 已用。"""
+    nb = notify_budget_normalize(b)
+    return max(0, nb["limit"] - nb["reserved"] - len(nb["sent"]))
+
+
+def notify_budget_line(b):
+    """界面用的一行话。数字只从账本算一次，不在别处另算。"""
+    nb = notify_budget_normalize(b)
+    left = notify_budget_manual_left(nb)
+    txt = (f"今日已用 **{len(nb['sent'])} / {nb['limit']}** 条"
+           f"（{nb['reserved']} 条预留 18:00 日报）→ 手动还能推 **{left}** 条")
+    return txt + ("　⚠️ 手动额度已用完，今天不再推送" if left == 0 else "")
+
+
+def notify_budget_load_local():
+    return notify_budget_normalize(_load_json(NOTIFY_BUDGET_FILE, {}))
+
+
+def notify_budget_save_local(b):
+    _save_json(NOTIFY_BUDGET_FILE, b)
+
+
+def notify_budget_set(b):
+    """更新会话缓存 + 本地文件（不提交远端，提交由调用方决定）。"""
+    nb = notify_budget_normalize(b)
+    st.session_state['notify_budget'] = nb
+    notify_budget_save_local(nb)
+    return nb
+
+
+def notify_budget_get():
+    """取当前账本。**默认不打网络** —— 本地文件（云端就是仓库检出那份）已经最新：
+    只有本应用会写账本，而每次写入都同时落本地 + 提交远端，所以本地 ≥ 远端提交版。
+    要拉远端就调 notify_budget_pull()（设置区那个「从云端刷新」按钮）。
+    """
+    cached = st.session_state.get('notify_budget')
+    if isinstance(cached, dict):
+        return cached
+    nb = notify_budget_load_local()
+    st.session_state['notify_budget'] = nb
+    return nb
+
+
+def notify_budget_pull():
+    """从仓库读账本，返回 (ok, msg, budget 或 None)。
+
+    远端不存在（404）→ 当空账本（首次启用时的正常情况，不是错误）。
+    ★ 远端存在但**读不出来**（没密钥 / 密钥不对）时返回 ok=False、budget=None ——
+      绝不能当空账本！那等于把当日已用条数清零，用户会超发。
+    """
+    if not _github_token():
+        return False, "未配置 GitHub Token", None
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_BUDGET_PATH}"
+    try:
+        r = requests.get(url, headers=_github_headers(_github_token()),
+                         params={"ref": "main"}, timeout=(5, 15))
+    except Exception as e:
+        _log("notify_budget_pull", e)
+        return False, f"拉取异常：{type(e).__name__}: {str(e)[:100]}", None
+    if r.status_code == 404:
+        return True, "仓库里还没有通知账本（首次推送时创建）", None
+    if r.status_code != 200:
+        return False, f"拉取失败 HTTP {r.status_code}", None
+    try:
+        raw = base64.b64decode((r.json() or {}).get("content") or "").decode("utf-8")
+        data = json.loads(raw)
+    except Exception as e:
+        _log("notify_budget_pull:decode", e)
+        return False, f"账本解码失败：{str(e)[:100]}", None
+    ok, obj, err = band_decrypt_obj(data)
+    if not ok or obj is None:
+        return False, f"账本读取失败：{err}", None
+    return True, "", notify_budget_normalize(obj)
+
+
+def notify_budget_push(budget):
+    """把账本提交到仓库，返回 (ok, msg)。加密与冲突重试规则同 band_watch.json。"""
+    token = _github_token()
+    if not token:
+        return False, "未配置 GitHub Token（账本无法同步，云端重启后今日计数会丢）"
+    try:
+        payload_obj = band_encrypt_obj(budget)
+    except Exception as e:
+        _log("notify_budget_push:encrypt", e)
+        return False, f"加密失败，已中止同步（不会以明文提交）：{str(e)[:120]}"
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_BUDGET_PATH}"
+    content = base64.b64encode(json.dumps(payload_obj, ensure_ascii=False,
+                                         indent=2).encode("utf-8")).decode("ascii")
+    n = len(budget.get("sent") or [])
+    for attempt in (1, 2):
+        try:
+            sha = None
+            r = requests.get(url, headers=_github_headers(token),
+                             params={"ref": "main"}, timeout=(5, 15))
+            if r.status_code == 200:
+                sha = (r.json() or {}).get("sha")
+            body = {"message": f"更新微信推送账本（今日 {n} 条）",
+                    "content": content, "branch": "main"}
+            if sha:
+                body["sha"] = sha
+            r = requests.put(url, headers=_github_headers(token), json=body, timeout=(5, 25))
+            if r.status_code in (200, 201):
+                return True, "已同步"
+            if r.status_code in (409, 422) and attempt == 1:
+                continue        # sha 过期（别处刚提交过），重取后再试一次
+            return False, f"同步失败 HTTP {r.status_code}: {r.text[:150]}"
+        except Exception as e:
+            _log("notify_budget_push", e)
+            if attempt == 2:
+                return False, f"同步异常：{type(e).__name__}: {str(e)[:100]}"
+    return False, "同步失败（已重试）"
+
+
+def notify_send_key():
+    """当前可用的 Server酱 SendKey：Secrets 优先，其次侧边栏/本地配置。"""
+    try:
+        k = st.secrets.get("SERVERCHAN_KEY", "")
+        if k and isinstance(k, str):
+            return k.strip()
+    except Exception:
+        pass        # 本地无 secrets.toml 属预期情况
+    try:
+        return str(st.session_state.get('send_key') or (load_config().get('send_key') or '')).strip()
+    except Exception as e:
+        _log("notify_send_key", e)
+        return ""
+
+
+def notify_send_guarded(title, content, kind, code="", name=""):
+    """★ 微信推送的**唯一出口**：先校验额度 → 再发送 → 成功才记账。
+
+    顺序是刻意的，别改成"先发后记"：
+      · 先发后记 → 发送失败也扣了额度，用户白白少一条；
+      · 只校验不记账 → 连点两下就超发（每次点击都只是一次 rerun）。
+    寄文失败不回滚计数：消息已经发出去了，这时把账本改回去才是真的对不上。
+    返回 (ok, msg)，ok=False 时 msg 是给用户看的原因。
+    """
+    b = notify_budget_get()
+    if notify_budget_manual_left(b) <= 0:
+        nb = notify_budget_normalize(b)
+        return False, (f"今日手动额度已用完（上限 {nb['limit']} 条，其中 {nb['reserved']} 条"
+                       f"留给 18:00 日报，已推 {len(nb['sent'])} 条）。"
+                       "要再多发，去左侧「📱 微信提醒」把上限调高。")
+    key = notify_send_key()
+    if not key:
+        return False, ("未配置 Server酱 SendKey —— 左侧「📱 微信提醒」里填，"
+                       "或放到 Streamlit Secrets 的 SERVERCHAN_KEY")
+    if not send_wechat_notification(key, title, content):
+        return False, ("发送失败：Server酱 没返回 200。可能是 SendKey 失效，"
+                       "也可能今天的 5 条在别处已经用掉了。")
+    nb = notify_budget_normalize(b)
+    nb["sent"].append({"ts": now_cn_str('%Y-%m-%d %H:%M:%S'), "kind": str(kind),
+                       "code": str(code), "name": str(name), "title": title})
+    nb["updated_at"] = now_cn_str('%Y-%m-%d %H:%M:%S')
+    nb = notify_budget_set(nb)
+    _ok, _m = notify_budget_push(nb)
+    tail = "" if _ok else f"（账本同步失败：{_m}）"
+    return True, f"✅ 已推送「{title}」；今日已用 {len(nb['sent'])}/{nb['limit']} 条{tail}"
+
+
+def notify_candidates(mem):
+    """把记忆里「值得提醒」的票整理成候选清单（预警在前、启动在后）。
+
+    ★ 为什么从记忆里取、而不是等巡检上报：巡检现在只更新状态、不推送，
+      而状态本来就落在 band_watch.json 里 —— 网页端同步后就有，不必另造上报通道。
+    排序直接用 BAND_STATUS_LEVEL（预警等级高于启动），不另立一套顺序。
+    """
+    out = []
+    _stocks = mem.get('stocks') if isinstance(mem, dict) else None
+    if not isinstance(_stocks, dict):
+        _stocks = {}
+    for code, node in _stocks.items():
+        if not isinstance(node, dict):
+            continue
+        status = node.get('status')
+        if status not in NOTIFY_CAND_STATUSES or node.get('closed'):
+            continue
+        name = node.get('name') or str(code)
+        price = _band_num(node.get('price'))
+        pivot = band_breakout_pivot(node)
+        defense = band_defense_price(node)
+        ts = node.get('status_ts') or ''
+        is_end = status in ('跌破支撑', '顶背离预警')
+        out.append({
+            "code": str(code), "name": name, "status": status,
+            "kind": "band", "price": price, "pivot": pivot, "defense": defense, "ts": ts,
+            "title": (f"【波段结束预警】{name}" if is_end
+                      else f"【波段启动】{name}"),
+            "body": (f"股票：{name}（{code}）\n状态：{status}\n"
+                     f"现价：{_fmt_price(price)}　突破位：{_fmt_price(pivot)}"
+                     f"　防守（20 日线）：{_fmt_price(defense)}\n"
+                     f"状态时间：{ts}\n\n仅做参考，请自行判断。"),
+        })
+    out.sort(key=lambda c: (-BAND_STATUS_LEVEL.get(c['status'], 0), c['code']))
+    return out
+
+
+def _notify_row(c, exhausted, already, gkey, idx):
+    """一行候选 + 一个推送按钮。`already`=今天已推过 → 不给按钮（免得重复占额度）。
+
+    ★ 按钮 key 必须带 gkey + idx：同一只票可能同时出现在两组里，
+      光用 code 会 StreamlitDuplicateElementKey 把整页打崩。
+    """
+    _col, _act = st.columns([3.4, 1.0])
+    with _col:
+        _bits = []
+        if c.get('price'):
+            _bits.append(f"现价 {_fmt_price(c['price'])}")
+        if c.get('pivot'):
+            _bits.append(f"突破位 {_fmt_price(c['pivot'])}")
+        if c.get('defense'):
+            _bits.append(f"防守 {_fmt_price(c['defense'])}")
+        _meta = "　".join(_bits)
+        st.markdown(
+            f"**{c.get('name')}（{c.get('code')}）** "
+            f"<span style='color:#89b4fa;'>{c.get('status') or c.get('kind')}</span>"
+            + (f"　<span style='color:#9aa0a6;font-size:12px;'>{_meta}</span>" if _meta else ""),
+            unsafe_allow_html=True)
+        if c.get('ts'):
+            st.caption(f"状态时间 {c['ts']}")
+    with _act:
+        if already:
+            st.caption("✅ 今天已推")
+        elif st.button("📤 推送", key=f"notify_push_{gkey}_{idx}",
+                       use_container_width=True, disabled=exhausted,
+                       help=("今日额度已用完" if exhausted
+                             else "立刻发一条微信（占今日 1 条额度）")):
+            _ok, _m = notify_send_guarded(c.get('title') or "", c.get('body') or "",
+                                          kind=c.get('kind') or 'band',
+                                          code=c.get('code'), name=c.get('name'))
+            if _ok:
+                st.session_state['notify_flash'] = _m
+                st.rerun()
+            else:
+                st.error(_m)
+
+
+def notify_center_ui(mem):
+    """📤 今日推送：额度 + 候选 + 手动推送（2026-09-22 按用户要求新建）。
+
+    用户原话：「因为我每天微信通知只有五条的限制，留下一条给六点的通知，
+    剩下的全部交给我来手动选择」。
+    """
+    st.markdown("---")
+    st.subheader("📤 今日推送（手动）")
+    _b = notify_budget_get()
+    st.caption("额度：" + notify_budget_line(_b))
+    st.caption("🚫 自动推送已全部关闭 —— 云端巡检和本页都不再自己发微信，"
+               "下面每个候选都由你点才发。"
+               "18:00 日报照旧（它占预留的那一条）。")
+    _left = notify_budget_manual_left(_b)
+    _sent_codes = {str(it.get('code')) for it in notify_budget_normalize(_b)['sent']}
+    _cands = notify_candidates(mem)
+    _intra = list(st.session_state.get('manual_push_candidates') or [])
+    if _left <= 0:
+        st.warning("今日手动额度已用完 —— 想再推只能把上限调高，或等明天。")
+    if not _cands and not _intra:
+        st.caption("（现在没有可推的候选：记忆里没有处于预警/启动状态的票，"
+                   "本页巡检也没发现新的日内信号。）")
+        return
+    if _intra:
+        st.markdown(f"**日内信号（本页巡检发现，{len(_intra)} 条）**")
+        for _i, _c in enumerate(_intra):
+            _notify_row(_c, _left <= 0, str(_c.get('code')) in _sent_codes, "intra", _i)
+    if _cands:
+        st.markdown(f"**波段候选（来自「🧠 波段记忆」，{len(_cands)} 条）**")
+        for _i, _c in enumerate(_cands):
+            _notify_row(_c, _left <= 0, _c['code'] in _sent_codes, "band", _i)
+
 # ================= 3.5 网络请求层 + 代码前缀 + 日线缓存 =================
 # 背景（本次修复）：原先 get_daily_data 用 timeout=3、无 headers、无重试、无备用源，
 # 且 _get_code 前缀规则漏判北交所（43/83/87/88/92 开头）与沪市转债（110/111/113）。
@@ -828,6 +1158,45 @@ with st.sidebar:
     st.text_input("Server酱 SendKey", type="password", key="send_key", on_change=on_send_key_change, help="去 sct.ftqq.com 免费注册获取")
     if _secrets_has_key("SERVERCHAN_KEY"): st.success("✅ 已从 Streamlit Secrets 读取 SendKey")
     elif st.session_state.send_key: st.info("💾 SendKey 来自本地文件（云端重启后会丢）")
+    # ---- ★ 每日限额（2026-09-22 用户要求：5 条里留 1 条给 18:00 日报，其余手动选）----
+    _nb = notify_budget_get()
+    st.caption("📊 " + notify_budget_line(_nb))
+    with st.form("notify_budget_form"):
+        _nb1, _nb2 = st.columns(2)
+        _nb_lim = _nb1.number_input("每日上限", min_value=1,
+                                    max_value=NOTIFY_LIMIT_MAX, value=int(_nb['limit']),
+                                    step=1, key="nb_limit",
+                                    help="Server酱 免费版每天只有 5 条，这里只是防超发的刹车")
+        _nb_res = _nb2.number_input("留给 18:00 日报", min_value=0,
+                                    max_value=NOTIFY_LIMIT_MAX, value=int(_nb['reserved']),
+                                    step=1, key="nb_reserved",
+                                    help="固定预留给日报的条数，不参与手动额度")
+        _nb_c1, _nb_c2 = st.columns(2)
+        _nb_save = _nb_c1.form_submit_button("💾 保存限额", use_container_width=True)
+        _nb_sync = _nb_c2.form_submit_button("🔄 从云端刷新", use_container_width=True)
+    if _nb_save:
+        _nb_new = notify_budget_set({**_nb, "limit": _nb_lim, "reserved": _nb_res})
+        _ok, _m = notify_budget_push(_nb_new)
+        if _ok:
+            st.session_state['notify_flash'] = (f"已保存：每日 {_nb_new['limit']} 条，"
+                                              f"预留 {_nb_new['reserved']} 条给日报")
+            st.rerun()
+        else:
+            st.warning(f"已保存到本地，但账本提交失败：{_m}")
+    if _nb_sync:
+        _ok, _m, _remote = notify_budget_pull()
+        if _ok and _remote is not None:
+            notify_budget_set(_remote)
+            st.session_state['notify_flash'] = (f"已按云端账本刷新："
+                                              f"今日已用 {len(_remote['sent'])} 条")
+            st.rerun()
+        else:
+            st.warning(f"刷新失败：{_m}" if not _ok else f"{_m}（按本地计）")
+    st.caption("🚫 自动推送已全部关闭 —— 巡检和本页都不再自己发微信。"
+               "候选在「🌊 选股与跟踪」页的「📤 今日推送」里，"
+               "由你点哪条发哪条；18:00 日报照旧（占上面预留的那条）。")
+    _nf = st.session_state.pop('notify_flash', None)
+    if _nf: st.success(_nf)
 
     st.markdown("---")
     st.subheader("🧠 波段记忆同步")
@@ -847,23 +1216,34 @@ with st.sidebar:
     st.header("🔔 推送自检")
     st.caption(f"🕐 北京时间 {now_cn().strftime('%Y-%m-%d %H:%M:%S')}")
     st.caption("☁️ 关页面也能推送：已由 GitHub Actions 每 5 分钟云端巡检，与本页是否打开无关")
-    st.checkbox("本页也参与巡检（容易与云端重复推送，建议关闭）", value=False, key="enable_page_monitor")
+    st.checkbox("本页顺便帮我找日内信号（只登记候选，不自动推送）", value=False,
+                key="enable_page_monitor",
+                help="开启后每次刷新页面都会算一遍自选股的日内买卖点，"
+                     "把结果登记成候选等你挑；**不会**自动发微信。")
     if is_trading_time():
-        st.success("✅ 当前处于交易时段，监控运行中")
+        st.success("✅ 当前处于交易时段")
     else:
-        st.info("⏸ 非交易时段，暂监控不做推送")
+        st.info("⏸ 非交易时段")
     if st.session_state.get('enable_page_monitor', False):
-        st.success(f"✅ 网页巡检已开启，监控 {len(st.session_state.stock_list)} 只自选股")
+        st.success(f"✅ 本页巡检已开启（{len(st.session_state.stock_list)} 只自选股）"
+                   "—— 只登记候选，推送还是你来点")
     else:
-        st.info("💡 网页巡检已关闭，推送由云端定时任务负责（无需打开本页）")
+        st.info("💡 本页巡检已关闭（关着也行：推送入口在「📤 今日推送」）")
     if st.session_state.get('last_monitor_time'):
         st.caption(f"上次巡检: {st.session_state.last_monitor_time}（{st.session_state.get('last_monitor_count', 0)} 只）")
-    if st.button("🧪 发送测试推送", use_container_width=True, key="test_notify"):
-        if st.session_state.get('send_key'):
-            ok = send_wechat_notification(st.session_state.send_key, "【测试】做T助手连通性测试", f"北京时间 {now_cn_str('%Y-%m-%d %H:%M:%S')}\n收到这条说明微信推送链路正常。")
-            st.toast("✅ 测试推送已发送" if ok else "❌ 发送失败，检查 SendKey", icon="🔔")
-        else:
+    if st.button("🧪 发送测试推送（占用今日 1 条额度）", use_container_width=True, key="test_notify"):
+        if not notify_send_key():
             st.warning("请先填写 SendKey")
+        else:
+            _ok, _m = notify_send_guarded("【测试】做T助手连通性测试",
+                                          f"北京时间 {now_cn_str('%Y-%m-%d %H:%M:%S')}\n"
+                                          "收到这条说明微信推送链路正常。",
+                                          kind='test')
+            if _ok:
+                st.session_state['notify_flash'] = _m
+                st.rerun()
+            else:
+                st.warning(_m)
     st.markdown("---")
     if _secrets_has_key("WATCHLIST"): st.caption("📌 自选股来自 Streamlit Secrets")
 
@@ -1601,9 +1981,24 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change, pr
 
 # ================= 9. 全天候监控所有自选股 =================
 def monitor_all_watchlist(send_key, market_change):
-    if not send_key or not is_trading_time(): return []
+    """扫一遍自选股的分时信号，返回本次新出现的信号文案（供 toast）。
+
+    ★ 2026-09-22 按用户要求改：**不再自动发微信**，只把候选记进
+      `st.session_state['manual_push_candidates']`，由用户在「📤 今日推送」里点。
+      原因：Server酱 免费版每天 5 条，1 条留给 18:00 日报，
+      用户要自己决定剩下 4 条推什么（原话「剩下的全部交给我来手动选择」）。
+    ★ 参数 `send_key` 保留原签名（调用方与历史前测都按这个签名调）：
+      没配 key 时直接返回 —— 反正推不出去，连候选都不必算。
+    ★ should_notify/mark_notified 继续用，语义从「该不该推」变成「今天这个信号登记过没」：
+      不记的话，每 5 分钟一次 rerun 都会把同一条候选重复塞进列表。
+    """
+    if not send_key or not is_trading_time():
+        return []
     watchlist = st.session_state.get('stock_list', [])
-    if not watchlist: return []
+    if not watchlist:
+        return []
+    cands = list(st.session_state.get('manual_push_candidates') or [])
+    _known = {(c.get('code'), c.get('kind')) for c in cands}
     fired = []
     for sym in watchlist:
         try:
@@ -1612,21 +2007,39 @@ def monitor_all_watchlist(send_key, market_change):
             dev = dynamic_deviation(df_min)
             sig = compute_intraday_signals(df_min, dev)
             if not sig: continue
-            buy_pts = sig['buy']; sell_pts = sig['sell']
             sym_name = get_stock_name(sym)
-            if not buy_pts.empty:
-                best_row = buy_pts.loc[buy_pts['Price'].idxmin()]; buy_price = float(best_row['Price']); buy_time = f"{best_row['Time'][:2]}:{best_row['Time'][2:]}"
-                if market_change >= -1.0 and should_notify(sym, 'buy', buy_price):
-                    ok = send_wechat_notification(send_key, f"【买点提醒】{sym_name}", f"股票：{sym_name} ({sym})\n时间：{buy_time}\n价格：{buy_price:.3f}\n依据：回踩均价线缩量，MACD 拐头向上")
-                    if ok: mark_notified(sym, 'buy', buy_price); fired.append(f"🔴 {sym_name} 买点 {buy_price:.3f}")
-            if not sell_pts.empty:
-                best_row = sell_pts.loc[sell_pts['Price'].idxmax()]; sell_price = float(best_row['Price']); sell_time = f"{best_row['Time'][:2]}:{best_row['Time'][2:]}"
-                if should_notify(sym, 'sell', sell_price):
-                    ok = send_wechat_notification(send_key, f"【卖点提醒】{sym_name}", f"股票：{sym_name} ({sym})\n时间：{sell_time}\n价格：{sell_price:.3f}\n依据：冲高乖离均价线放量，MACD 拐头向下")
-                    if ok: mark_notified(sym, 'sell', sell_price); fired.append(f"🟢 {sym_name} 卖点 {sell_price:.3f}")
+            for _sig, _pts, _pick in (('buy', sig['buy'], 'min'), ('sell', sig['sell'], 'max')):
+                if _pts is None or _pts.empty: continue
+                _row = (_pts.loc[_pts['Price'].idxmin()] if _pick == 'min'
+                        else _pts.loc[_pts['Price'].idxmax()])
+                _price = float(_row['Price'])
+                if _sig == 'buy' and market_change < -1.0: continue   # 大盘暴跌不报买点（原逻辑保留）
+                if not should_notify(sym, _sig, _price): continue
+                mark_notified(sym, _sig, _price)
+                if (sym, _sig) in _known: continue
+                _known.add((sym, _sig))
+                _t = f"{_row['Time'][:2]}:{_row['Time'][2:]}"
+                _is_buy = (_sig == 'buy')
+                cands.append({
+                    'code': str(sym), 'name': sym_name, 'kind': _sig,
+                    'status': '买点' if _is_buy else '卖点',
+                    'price': _price, 'ts': now_cn_str('%Y-%m-%d %H:%M:%S'),
+                    'title': (f"【买点提醒】{sym_name}" if _is_buy
+                              else f"【卖点提醒】{sym_name}"),
+                    'body': (f"股票：{sym_name} ({sym})\n时间：{_t}（北京时间）\n"
+                             f"价格：{_price:.3f}\n依据："
+                             + ('回踩均价线缩量，MACD 拐头向上' if _is_buy
+                                else '冲高乖离均价线放量，MACD 拐头向下')
+                             + "\n\n仅做参考，请自行判断。"),
+                })
+                _emoji = '🔴' if _is_buy else '🟢'
+                _label = '买点' if _is_buy else '卖点'
+                fired.append(f"{_emoji} {sym_name} {_label} {_price:.3f}")
         except Exception as e:
             _log(f"monitor_all_watchlist/{sym}", e)
             continue
+    if cands:
+        st.session_state['manual_push_candidates'] = cands[-30:]   # 别无限长
     return fired
 
 # ================= 10. 波段做T选股助手 =================
@@ -4829,6 +5242,10 @@ def band_memory_ui():
             st.info("ℹ️ 另有状态变化（已记录，未推送）：\n\n" + "\n".join(
                 f"- **{c['name']}（{c['code']}）**：{c['from']} → **{c['to']}**"
                 f"　现价 {c['price']:.2f}" for c in others))
+
+    # ★ 今日推送（手动）：额度 + 候选。放在清单**之前** ——
+    #   用户打开这一页通常就是想看"今天要推什么"，不该让他先滚完长名单。
+    notify_center_ui(mem)
 
     if not mem['stocks']:
         st.caption("（还没有记录。点上方按钮扫描一次，或在这里手动记入。）")
