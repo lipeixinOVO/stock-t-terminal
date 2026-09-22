@@ -182,14 +182,217 @@ def get_market_change():
                 _log("get_market_change:float(parts[32])", e)
     return 0.0
 
-# ★ 2026-09-22 起巡检**默认不发微信**，只登记候选（用户要求）。
-#   用户原话：「因为我每天微信通知只有五条的限制，留下一条给六点的通知，
-#   剩下的全部交给我来手动选择」。Server酱 免费版每天只有 5 条，
-#   其中 1 条由 18:00 日报（daily_digest.py）占用，剩 4 条由用户在网页端
-#   「📤 今日推送」面板里手动点。
-#   为什么不直接删掉发送能力：万一以后想恢复自动推送，
-#   在 Actions 的 Variables 里把 NOTIFY_AUTO_PUSH 设成 1 就行，不用改代码。
-AUTO_PUSH = os.environ.get("NOTIFY_AUTO_PUSH", "0").strip() == "1"
+# ================= 微信推送「自动发送许可」+「每日限额账本」（2026-09-22）========
+# 用户口径（两次澄清后）：
+#   「因为我每天微信通知只有五条的限制，留下一条给六点的通知」
+#   「剩下四条正常推送，不过是要我选定的股票才能自动推送」
+# ⇒ 1 条留给 18:00 日报；剩 4 条由**白名单自动推送**与网页端手动点共用，用完都停。
+#
+# ★★ 白名单**只决定"能不能自动发"**，与监控范围无关 —— 用户原话：
+#   「云端巡检如果是监控启动终止点以及日内买卖点的话，这些要正常进行，
+#    需要约束的只是微信通知权限」。
+#   所以本文件该盯的照旧盯（WATCHLIST 的分时 + 波段记忆的日线），
+#   名单外的票照旧走 `_print_candidate()` 打进日志，等用户在网页端选。
+#
+# ★ 账本与网页端（ai_stock_terminal.py）**共用同一份 notify_budget.json**：
+#   云端自动发了也要记账，否则网页端看到的「还能推 N 条」就是假的。
+#   ⚠️ 下面 _clamp_int / notify_budget_* / notify_whitelist_* 与主应用**逐字同源**
+#     （有测试用 ast.unparse 逐个比对）—— 口径漂移的代价是两边额度和名单对不上。
+# ★ 解密纪律（两个方向刻意相反，别"统一"掉）：
+#   · 账本文件在、却读不出来 → **禁止自动发**（当空账本＝把当日已用清零＝超发）；
+#   · 白名单文件在、却读不出来 → 视为**空名单**（空名单＝谁都不自动发＝安全）。
+_NOTIFY_BUDGET_FILE = os.environ.get("NOTIFY_BUDGET", "notify_budget.json")
+_NOTIFY_WHITELIST_FILE = os.environ.get("NOTIFY_WHITELIST", "notify_whitelist.json")
+NOTIFY_LIMIT_DEFAULT = 5        # 与 ai_stock_terminal.py 同值
+NOTIFY_RESERVE_DEFAULT = 1
+NOTIFY_LIMIT_MAX = 20
+NOTIFY_WHITELIST_MAX = 20
+
+
+def _clamp_int(v, lo, hi, default):
+    """收敛进 [lo, hi]。坏值落到 default（**不是** lo）。
+
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**
+      （测试会比对两边 ast.unparse 后的整个函数）—— 它决定额度算不算得对。
+    """
+    try:
+        n = int(float(v))
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
+
+
+def notify_budget_empty():
+    """空账本。日期用**北京时间**（云端运行在 UTC，用 UTC 会在每天早上 8 点前算成昨天）。"""
+    return {"date": now_cn().strftime('%Y-%m-%d'), "limit": NOTIFY_LIMIT_DEFAULT,
+            "reserved": NOTIFY_RESERVE_DEFAULT, "sent": [], "updated_at": ""}
+
+
+def notify_budget_normalize(b):
+    """收敛成干净账本，**跨天自动清空 sent**。
+
+    ★ 跨天必须清空：留着昨天的 sent，今天一开页面就是「额度已用完」。
+    ★ reserved 必须 ≤ limit：否则额度算成负数，界面会出现"还能推 -1 条"。
+    ★ sent 只保留结构正确的条目：坏条目会让计数与实际推送数不符（额度算错）。
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
+    d = notify_budget_empty()
+    if not isinstance(b, dict):
+        return d
+    limit = _clamp_int(b.get("limit"), 1, NOTIFY_LIMIT_MAX, NOTIFY_LIMIT_DEFAULT)
+    reserved = _clamp_int(b.get("reserved"), 0, limit, NOTIFY_RESERVE_DEFAULT)
+    out = {"date": d["date"], "limit": limit, "reserved": reserved,
+           "sent": [], "updated_at": str(b.get("updated_at") or "")}
+    if str(b.get("date") or "") == d["date"]:
+        for it in (b.get("sent") or []):
+            if isinstance(it, dict) and it.get("title"):
+                out["sent"].append(it)
+    return out
+
+
+def notify_budget_used(b):
+    return len(notify_budget_normalize(b)["sent"])
+
+
+def notify_budget_left(b):
+    """今日还能推几条 = 上限 − 预留（日报）− 已用。
+
+    ★ 2026-09-22 起从 `notify_budget_manual_left` 改名：**自动推送（白名单）与手动点
+      共用这一份额度**，叫「manual_left」已经名不副实。
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
+    nb = notify_budget_normalize(b)
+    return max(0, nb["limit"] - nb["reserved"] - len(nb["sent"]))
+
+
+def notify_budget_line(b):
+    """界面 / 日志用的一行话。数字只从账本算一次，不在别处另算。
+
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
+    nb = notify_budget_normalize(b)
+    left = notify_budget_left(nb)
+    txt = (f"今日已用 **{len(nb['sent'])} / {nb['limit']}** 条"
+           f"（{nb['reserved']} 条预留 18:00 日报）→ 还能推 **{left}** 条"
+           f"（自动白名单 + 手动共用）")
+    return txt + ("　⚠️ 今日额度已用完：自动和手动都停了" if left == 0 else "")
+
+
+def notify_whitelist_empty():
+    """空名单。**这就是"谁都不自动发"** —— 默认状态，也是读不出来时的兜底。"""
+    return {"updated_at": "", "items": []}
+
+
+def notify_whitelist_normalize(w):
+    """收敛成干净名单：只留 6 位数字代码、去重、按代码升序。
+
+    ★ 超上限时**截断**而不是整份丢掉：整份丢掉会让用户以为"我明明勾了却保存不上"。
+    ★ `name` 只用于界面显示，丢了不影响判定（判定只认 code，见 notify_whitelist_has）。
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
+    out = notify_whitelist_empty()
+    if not isinstance(w, dict):
+        return out
+    out["updated_at"] = str(w.get("updated_at") or "")
+    seen, items = set(), []
+    for it in (w.get("items") or []):
+        if not isinstance(it, dict):
+            continue
+        code = str(it.get("code") or "").strip()
+        if not (len(code) == 6 and code.isdigit()) or code in seen:
+            continue
+        seen.add(code)
+        items.append({"code": code, "name": str(it.get("name") or "").strip(),
+                      "added_at": str(it.get("added_at") or "")})
+    items.sort(key=lambda x: x["code"])
+    out["items"] = items[:NOTIFY_WHITELIST_MAX]
+    return out
+
+
+def notify_whitelist_codes(w):
+    """名单里的代码集合（判定只认它）。"""
+    return {it["code"] for it in notify_whitelist_normalize(w)["items"]}
+
+
+def notify_whitelist_has(w, code):
+    """`code` 是否在白名单里 —— **自动推送的唯一判据**。
+
+    ★ 空名单恒为 False：这是刻意的默认安全（谁都不自动发）。
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
+    c = str(code or "").strip()
+    return bool(c) and c in notify_whitelist_codes(w)
+
+
+def _notify_json_read(path):
+    """读 JSON 文件 → (对象, 文件是否存在)。
+
+    ★ 必须把"不存在"和"读不动"分开：两者在账本上的含义完全相反
+      （不存在＝首次运行，空账本正常；读不动＝不可信，必须禁止自动发）。
+    """
+    if not os.path.exists(path):
+        return None, False
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f), True
+    except Exception as e:
+        _log(f"_notify_json_read:{path}", e)
+        return None, True
+
+
+def notify_budget_state():
+    """读账本 → (normalize 后的账本, trust)。trust=False ⇒ 文件在但读不出来 ⇒ 禁止自动发。"""
+    raw, exists = _notify_json_read(_NOTIFY_BUDGET_FILE)
+    if not exists:
+        return notify_budget_empty(), True
+    ok, obj, err = band_decrypt_obj(raw)
+    if not ok or obj is None:
+        print(f"  ⚠️ 账本 {_NOTIFY_BUDGET_FILE} 读不出来（{err}）→ 本次不自动发"
+              f"（把它当空账本会把当日已用清零 → 超发）")
+        return notify_budget_empty(), False
+    return notify_budget_normalize(obj), True
+
+
+def notify_budget_save(b):
+    """加密写回账本。★ 加密失败就**不写**（绝不落明文），返回 False 由调用方打告警。"""
+    try:
+        payload = band_encrypt_obj(notify_budget_normalize(b))
+    except Exception as e:
+        _log("notify_budget_save:encrypt", e)
+        return False
+    try:
+        with open(_NOTIFY_BUDGET_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        _log("notify_budget_save", e)
+        return False
+
+
+def notify_whitelist_load():
+    """读白名单 → (normalize 后的名单, trust)。
+
+    ★ 文件在却读不出来 → 视为**空名单**（谁都不自动发）+ 打醒目告警。
+      方向与账本相反：账本读不出来要"拒发"，白名单读不出来"不发"本身就是安全侧，
+      只是必须让人看得见（否则表现成"我明明勾了却不生效"，比报错难查）。
+    """
+    raw, exists = _notify_json_read(_NOTIFY_WHITELIST_FILE)
+    if not exists:
+        return notify_whitelist_empty(), True
+    ok, obj, err = band_decrypt_obj(raw)
+    if not ok or obj is None:
+        print(f"  ⚠️ 白名单 {_NOTIFY_WHITELIST_FILE} 读不出来（{err}）→ 视为空名单："
+              f"本次谁都不自动发（检查 BAND_KEY 是否与网页端一致）")
+        return notify_whitelist_empty(), False
+    return notify_whitelist_normalize(obj), True
+
+
+# ★ 总闸（**紧急关闭开关**，正常不用动）：仓库 Settings → Secrets and variables →
+#   Actions → Variables 里把 NOTIFY_AUTO_PUSH 设成 **0**，就退回"谁都不自动发"。
+#   ★ 2026-09-22 语义**反过来了**：以前"不设＝关"，现在"不设＝开（但仍要过白名单）"。
+#     为什么敢默认开：真正的闸是**白名单**，而白名单文件不存在时就是空名单＝谁都不发。
+#     所以不配置任何东西时，行为与上一版完全一致（全手动），不会突然刷屏。
+AUTO_PUSH = os.environ.get("NOTIFY_AUTO_PUSH", "1").strip() != "0"
 
 
 def _print_candidate(title, content):
@@ -207,25 +410,55 @@ def _print_candidate(title, content):
     print(f"  📤 候选（未推送，等你在网页端选）：{title}　{first}")
 
 
-def send_wechat(title, content):
+def send_wechat(title, content, code="", name=""):
     """微信推送的**唯一出口**（巡检侧 4 个调用点全走这里）。
 
-    ★ 2026-09-22 起默认**不发送**，只登记候选 —— 见上面 AUTO_PUSH 的说明。
-    返回 True 表示“真的发出去了” —— 关闭状态下恒为 False，
-    调用方据此不记去重日志、不累加推送计数（含义与之前一致）。
+    ★ 2026-09-22 起三道闸，**顺序不许调**（有源码守卫盯着"闸门必须在 requests.post 之前"）：
+      ① 总闸 AUTO_PUSH —— 仓库 Variable `NOTIFY_AUTO_PUSH=0` 时紧急全关；
+      ② 白名单闸 —— `code` 不在名单里就只登记候选、**绝不发送**
+         （名单为空＝谁都不自动发，这是默认状态）；
+      ③ 额度闸 —— 账本剩余 ≤ 0 就不发（4 条与网页端手动点共用，1 条预留 18:00 日报）。
+    返回 True 表示"真的发出去了" —— 调用方据此记去重日志、累加计数（含义与之前一致）。
     """
     if not AUTO_PUSH:
         _print_candidate(title, content)
         return False
+    _wl, _wl_trust = notify_whitelist_load()
+    if not notify_whitelist_has(_wl, code):
+        # 名单外（或名单读不出来＝空名单）：只登记，不发送。
+        # ★ 这里**不问**白名单为什么空 —— 空就是不发，方向永远偏安全。
+        _print_candidate(title, content)
+        return False
+    _budget, _b_trust = notify_budget_state()
+    if not _b_trust:
+        print(f"  ⏸ 账本读不出来，无法确认今日已用条数 → 本次不自动发：{title}")
+        return False
+    if notify_budget_left(_budget) <= 0:
+        print(f"  ⏸ 今日推送额度已用完（{len(_budget['sent'])}/{_budget['limit']} 条，"
+              f"{_budget['reserved']} 条留给 18:00 日报）→ 本次不自动发：{title}")
+        return False
     if not SEND_KEY:
+        print("  ⏸ 未配置 SERVERCHAN_KEY → 不发（候选已打进上面的日志）")
         return False
     try:
         res = requests.post(f"https://sctapi.ftqq.com/{SEND_KEY}.send",
                             data={"title": title, "desp": content}, timeout=10)
-        return res.status_code == 200
+        if res.status_code != 200:
+            print(f"  推送 HTTP {res.status_code}: {res.text[:160]}")
+            return False
     except Exception as e:
         print(f"  推送异常: {e}")
         return False
+    # ★ 失败不扣额度（上面已经 return False 了）；**成功才记账**。
+    #   记账/写盘失败**不回滚**：消息已经发出去了，改回去才是真的对不上，
+    #   只能打告警让人知道"这一条没进账本，下次可能超发"。
+    _ts = now_cn().strftime('%Y-%m-%d %H:%M:%S')
+    _budget["sent"].append({"ts": _ts, "kind": "auto", "src": "auto",
+                            "code": str(code), "name": str(name), "title": title})
+    _budget["updated_at"] = _ts
+    if not notify_budget_save(_budget):
+        print("  ⚠️ 账本写盘失败 —— 这条已经发出去了但没记上，下次可能超发")
+    return True
 
 # ============ 去重机制 ============
 
@@ -621,7 +854,8 @@ def check_band_end(sym, log, today):
             f"【波段结束预警】{name}",
             f"股票：{name} ({sym})\n日期：{today}\n"
             f"依据：{' + '.join(reasons)}\n\n"
-            f"该股票波段可能结束，请注意止盈/止损。"
+            f"该股票波段可能结束，请注意止盈/止损。",
+            code=sym, name=name
         )
         if ok:
             log.setdefault(today, []).append(key)
@@ -865,7 +1099,7 @@ def check_band_memory(mem, log, today):
                if to_alert == "end" else
                "\n该股票出现波段启动信号（来自你的波段记忆清单）。")
         )
-        if send_wechat(title, body):
+        if send_wechat(title, body, code=sym, name=name):
             log.setdefault(today, []).append(key)
             pushed += 1
             print(f"  ⚠️ {name}({sym}) {old_status} → {status} → 已推送微信")
@@ -949,7 +1183,8 @@ def check_symbol(sym, market_change, log, today):
                         f"股票：{name} ({sym})\n时间：{t_str}（北京时间）\n"
                         f"价格：{price:.3f}\n依据：回踩均价线缩量 + MACD 拐头向上\n"
                         f"偏离均价：{(price / float(row['AvgPrice']) - 1) * 100:.2f}%\n\n"
-                        f"仅做参考，请自行判断。"
+                        f"仅做参考，请自行判断。",
+                        code=sym, name=name
                     )
                     if ok:
                         log.setdefault(today, []).append(key)
@@ -969,7 +1204,8 @@ def check_symbol(sym, market_change, log, today):
                         f"股票：{name} ({sym})\n时间：{t_str}（北京时间）\n"
                         f"价格：{price:.3f}\n依据：分时卖点触发（冲高乖离或日内高点滞涨）\n"
                         f"偏离均价：{(price / float(row['AvgPrice']) - 1) * 100:+.2f}%\n\n"
-                        f"仅做参考，请自行判断。"
+                        f"仅做参考，请自行判断。",
+                        code=sym, name=name
                     )
                     if ok:
                         log.setdefault(today, []).append(key)
@@ -985,6 +1221,18 @@ def main():
     print(f"===== 巡检开始 北京时间 {now_cn().strftime('%Y-%m-%d %H:%M:%S')} =====")
     print(f"🔧 配置检查：SEND_KEY={'已配置' if SEND_KEY else '缺失'} | "
           f"WATCHLIST={len(WATCHLIST)} 只 | BAND_WATCHLIST={len(BAND_WATCHLIST)} 只 | 新鲜窗口={WINDOW_MIN} 分钟")
+    # ★ 每次运行都把「谁能自动发 / 还剩几条」打出来：额度被谁吃掉、白名单有没有生效，
+    #   事后只能靠这两行日志判。缺了它们，出问题就只剩"猜"。
+    _wl0, _wl_ok = notify_whitelist_load()
+    _bd0, _bd_ok = notify_budget_state()
+    print("🎯 自动推送白名单：" + (
+        f"{len(_wl0['items'])} 只（{'、'.join(sorted(notify_whitelist_codes(_wl0)))}）"
+        if _wl0['items'] else "空 —— 谁都不自动发（全手动）")
+        + ("" if _wl_ok else "　⚠️ 白名单读取失败，已按空名单处理"))
+    print("📊 推送额度：" + notify_budget_line(_bd0)
+          + ("" if _bd_ok else "　⚠️ 账本读取失败，本次禁止自动发"))
+    if not _wl_ok or not _bd_ok:
+        print("   ↑ 这两行出问题时先查 BAND_KEY 是否与网页端/Streamlit Secrets 完全一致")
     print(f"🔒 摘要加密：{'已开启（仓库里是密文）' if band_crypto_enabled() else '未开启（仓库里可读出代码清单）'}")
     if not SEND_KEY:
         print("✗ 未配置 SERVERCHAN_KEY。请到 GitHub 仓库 → Settings → Secrets and variables → "
