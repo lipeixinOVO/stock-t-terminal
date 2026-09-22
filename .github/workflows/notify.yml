@@ -63,6 +63,10 @@ jobs:
           BAND_KEY: ${{ secrets.BAND_KEY }}
           ALERT_WINDOW_MIN: "10"
           FORCE_RUN: ${{ github.event.inputs.force == 'true' && '1' || '0' }}
+          # ★ 默认不发：只把候选打进日志，推送由网页端「📤 今日推送」手动点。
+          #   想恢复自动推送：仓库 Settings → Secrets and variables →
+          #   Actions → Variables 新建 NOTIFY_AUTO_PUSH = 1（不设就是关）。
+          NOTIFY_AUTO_PUSH: ${{ vars.NOTIFY_AUTO_PUSH }}
         run: python watcher.py
 
       - name: 保证去重记录存在
