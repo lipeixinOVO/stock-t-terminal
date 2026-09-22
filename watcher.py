@@ -433,6 +433,58 @@ def _get_daily_history(symbol):
     return None
 
 
+BAND_RUN_MAX_LOOKBACK = 120   # 一轮「启动」最多往回找多少根 K 线（与主应用同值）
+
+def _band_run_start(df):
+    """本轮「波段启动」连续区间从哪根 K 线开始？→ {'days','date','price','idx'}。
+
+    ★ 这是 ai_stock_terminal.py 同名函数的**镜像**，必须逐字同公式（有跨文件一致性测试守着）。
+      为什么要两侧都算：「波段启动确认」是一个**可以持续很多天**的状态 —— 判定只看当日是否
+      「突破 60 日平台 + 放量」。一只持续创新高的票每天都在满足它，于是标签一直挂着「启动确认」，
+      用户看到「已经涨了很多很多了，为什么还说它是启动」。把「这一轮是哪天开始的」算出来，
+      界面才能写成「已启动 N 个交易日 · 起点 X · 至今 +Y%」。
+      巡检每 5 分钟就会写一次节点，所以这一侧也必须算 —— 否则网页端不刷新时，
+      节点里的启动起点会一直停在网页上次刷新的那天。
+
+    返回 days=0 表示**最后一根 K 线不满足启动条件**（例如已经跌破 20 日线），
+    这不是"没算出来"，调用方据此显示「—」。
+    """
+    try:
+        close = df['Close']; high = df['High']; vol = df['Volume']
+        lookback = 60
+        n = len(df)
+        if n < lookback + 2:
+            return {'days': 0, 'date': '', 'price': 0.0, 'idx': -1}
+        plat_high = high.rolling(lookback).max()
+        close_high = close.rolling(lookback).max()
+        vol5 = vol.rolling(5).mean()
+        vol20 = vol.rolling(20).mean()
+        with np.errstate(divide='ignore', invalid='ignore'):
+            vr = vol5 / vol20
+        ok = ((close >= plat_high * 0.995) & (close >= close_high * 0.999)
+              & ((vr >= 1.5) | (vol >= vol20 * 1.5)))
+        ok = ok.fillna(False).astype(bool)
+        ok.iloc[:lookback - 1] = False
+        last = n - 1
+        if not bool(ok.iloc[last]):
+            return {'days': 0, 'date': '', 'price': 0.0, 'idx': -1}
+        floor = max(lookback - 1, last - BAND_RUN_MAX_LOOKBACK)
+        i = last
+        while i > floor and bool(ok.iloc[i - 1]):
+            i -= 1
+        date = ''
+        try:
+            if 'Date' in df.columns:
+                date = str(df['Date'].iloc[i])[:10]
+        except Exception as e:
+            _log("_band_run_start/date", e)
+        return {'days': int(last - i + 1), 'date': date,
+                'price': float(close.iloc[i]), 'idx': int(i)}
+    except Exception as e:
+        _log("_band_run_start", e)
+        return {'days': 0, 'date': '', 'price': 0.0, 'idx': -1}
+
+
 def _band_metrics(df):
     """计算波段指标（与 ai_stock_terminal.py 的 _calculate_band_metrics 等价）。
 
@@ -489,6 +541,9 @@ def _band_metrics(df):
     high_250 = float(close.tail(250).max()); low_250 = float(close.tail(250).min())
     position_pct = 50.0 if high_250 <= low_250 else (current - low_250) / (high_250 - low_250) * 100
 
+    # 本轮启动起点（2026-09-22，与主应用同公式）
+    _run = _band_run_start(df)
+
     return {
         'current': current, 'ma20': ma20, 'ma60': ma60,
         'platform_high': platform_high, 'platform_low': platform_low,
@@ -499,6 +554,10 @@ def _band_metrics(df):
         'top_divergence': top_divergence, 'top_divergence_gap_pct': top_divergence_gap_pct,
         'below_support': below_support,
         'position_pct': position_pct, 'lookback': lookback,
+        'run_days': _run['days'], 'run_start_date': _run['date'],
+        'run_start_price': _run['price'],
+        'run_gain_pct': (((current / _run['price']) - 1.0) * 100.0
+                         if _run['price'] > 0 else 0.0),
     }
 
 
@@ -754,6 +813,19 @@ def check_band_memory(mem, log, today):
         node["price"] = m['current']
         node["ma20"] = m['ma20']
         node["last_check"] = now_cn().strftime('%Y-%m-%d %H:%M:%S')
+        # ★ 本轮启动起点（2026-09-22）：必须写在「状态没变就 continue」**之前** ——
+        #   它是滚动回溯出来的，状态不变的日子里它照样会变（这一轮又走了一天）。
+        #   用 `is not None` 判存在而不是 `or`：RunDays=0 是**合法值**
+        #   （最后一根 K 线已不在启动区），用 `or` 会退回过期旧值，
+        #   于是波段早就结束了、界面还写着「已启动 47 个交易日」。
+        # ★ 用「键在不在」判，不用 `m.get(...) or 0` —— 后者会把「这次没算出来」
+        #   写成「已启动 0 天 / 涨幅 0%」，那是**编数据**。键缺失时保持旧值，
+        #   与主应用 `_band_memory_apply` 的 `if _rdays is not None:` 同语义。
+        if 'run_days' in m:
+            node["run_days"] = int(m.get('run_days') or 0)
+            node["run_start_date"] = str(m.get('run_start_date') or '')
+            node["run_start_price"] = float(m.get('run_start_price') or 0.0)
+            node["run_gain_pct"] = float(m.get('run_gain_pct') or 0.0)
 
         if status == old_status:
             continue
