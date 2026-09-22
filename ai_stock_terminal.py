@@ -691,9 +691,9 @@ def _digest_last_resolve():
         _last = float(st.session_state.get('digest_last_try_at') or 0)
     except Exception as e:
         _log("_digest_last_resolve/ts", e)
-    # ★ 必须用 _time_module —— 本模块顶部有 `from datetime import ... time ...`，那个 `time` 是**类**、
-    #   不是模块，所以 `time.time()` 会 AttributeError（2026-09-22 实测踩到，页面把它吞成了「跟踪清单渲染出错」）。
-    #   那个 time 是**类**，不是模块 —— 写 time.time() 会 AttributeError（已实测踩到）。
+    # ★ 必须用 _time_module —— 本模块顶部有 `from datetime import ... time ...`，
+    #   那个 `time` 是**类**、不是模块；裸用它的 time() 就是 AttributeError
+    #   （2026-09-22 实测踩到，页面把它吞成了「跟踪清单渲染出错」）。
     if _time_module.time() - _last < DIGEST_LAST_TTL:
         return data, err, "本地仓库副本"
     st.session_state['digest_last_try_at'] = _time_module.time()
@@ -4104,6 +4104,26 @@ def band_levels_text(node):
     return " · ".join(parts)
 
 
+def band_memory_order(nodes):
+    """记忆清单的展示顺序 → 排好序的列表。
+
+    ★ 规则（用户 2026-09-22 原话「顺序排列要按它们的前景来排列，越靠前的越有前景」）：
+      ① **归档的沉底**（它已经结束，不该占着最上面）；
+      ② 其余**一律按前景分降序** —— 不再按「状态层级」排。旧口径把刚启动、上方空间大的票
+         压在若干只预警票下面，和"越靠前越有前景"正好相反；
+      ③ 同分再比入册时间，保证顺序**稳定可复现**（否则同样的数据两次渲染顺序会跳）。
+
+    ★ 预警票不会因为排在后面就漏看：「只展开新出现的预警」（band_alert_need_expand）
+      与红框仍然生效 —— **提醒靠的是标记，不是位置**。
+
+    ★ 为什么是独立函数：原来这段 `sorted(...)` 内联在 `band_memory_ui` 里，
+      UI 层断言不了顺序，只能靠肉眼盯网页。抽出来后可以直接喂节点列表验顺序。
+    """
+    return sorted(nodes, key=lambda n: (bool(n.get('closed')),
+                                        -float(n.get('score') or 0),
+                                        str(n.get('added_at', ''))))
+
+
 def _band_bulk_manage_ui(mem, nodes):
     """记忆清单的批量管理：勾选 → 归档 / 删除（一行常驻，不再折叠）。
 
@@ -5289,7 +5309,11 @@ def band_samples_harvest_forward(progress_cb=None, bench_df=None, limit=0):
                 if page:
                     break
                 if _attempt < _page_retry:
-                    time.sleep(_retry_wait)
+                    # ★ 必须走 _time_module：本模块顶部有 `from datetime import ... time ...`，
+                    #   那个 `time` 被覆盖成了**类**。用裸 time 的 sleep 时，清单一旦出现空页
+                    #   （正是『接口半死』的日常形态）就 AttributeError → 被外层 except 吞掉
+                    #   → 整轮全市场采集作废，而退出码仍是 0。
+                    _time_module.sleep(_retry_wait)
             if not page:
                 empty_run += 1
                 _log("band_samples_harvest_forward/page_empty",
@@ -5805,10 +5829,7 @@ def band_memory_ui():
     #   新口径：归档的沉底，其余**一律按前景分降序**（同分再比入册时间，保证顺序稳定可复现）。
     #   ★ 预警票不会因为排在后面就漏看 —— 「只展开新出现的预警」（band_alert_need_expand）
     #     与红框仍然生效。**提醒靠的是标记，不是位置。**
-    order = sorted(mem['stocks'].values(),
-                   key=lambda n: (bool(n.get('closed')),
-                                  -float(n.get('score') or 0),
-                                  str(n.get('added_at', ''))))
+    order = band_memory_order(mem['stocks'].values())
     # 批量多选处理（归档 / 删除）—— 不用再一只只展开去找删除按钮
     _band_bulk_manage_ui(mem, order)
 
