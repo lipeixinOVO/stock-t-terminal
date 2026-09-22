@@ -63,9 +63,10 @@ jobs:
           BAND_KEY: ${{ secrets.BAND_KEY }}
           ALERT_WINDOW_MIN: "10"
           FORCE_RUN: ${{ github.event.inputs.force == 'true' && '1' || '0' }}
-          # ★ 默认不发：只把候选打进日志，推送由网页端「📤 今日推送」手动点。
-          #   想恢复自动推送：仓库 Settings → Secrets and variables →
-          #   Actions → Variables 新建 NOTIFY_AUTO_PUSH = 1（不设就是关）。
+          # ★ 2026-09-22 起真正的闸是「自动推送白名单」（网页端「📤 今日推送」里勾）：
+          #   只有名单里的票出现信号才自动发（日内买卖点 + 该票的波段启动/结束点），
+          #   名单为空＝谁都不自动发（默认，与上一版行为一致）。
+          #   这个 Variable 只是**紧急关闭开关**：设为 0 就退回"谁都不自动发"，不设＝开。
           NOTIFY_AUTO_PUSH: ${{ vars.NOTIFY_AUTO_PUSH }}
         run: python watcher.py
 
@@ -83,24 +84,35 @@ jobs:
           path: notify_log.json
           key: notify-log-${{ steps.ckey.outputs.key }}-${{ github.run_id }}
 
-      - name: 回写波段状态（有变化时）
+      - name: 回写波段状态与推送账本（有变化时）
         if: always()
         run: |
           echo "---- 当前波段摘要 ----"
           if [ -f band_watch.json ]; then cat band_watch.json; else echo "(文件不存在)"; fi
+          # ★ 2026-09-22 起还要回写 notify_budget.json：云端自动推了一条也得记账，
+          #   否则网页端读到的是旧账本，「还能推 N 条」就是假的 → 会超发。
+          #   白名单只读不写（它由网页端维护），所以不在这里提交。
+          echo "---- 当前推送账本 ----"
+          if [ -f notify_budget.json ]; then cat notify_budget.json; else echo "(文件不存在)"; fi
           # ⚠️ 不能用 `git diff --quiet` 判断：对「未跟踪的新文件」它也返回无变化，
           #    首次创建时会被跳过。git status --porcelain 对新增(??)与修改(M)都会输出。
-          if [ -f band_watch.json ] && [ -n "$(git status --porcelain -- band_watch.json)" ]; then
+          CHANGED_FILES=""
+          for f in band_watch.json notify_budget.json; do
+            if [ -f "$f" ] && [ -n "$(git status --porcelain -- "$f")" ]; then
+              CHANGED_FILES="$CHANGED_FILES $f"
+            fi
+          done
+          if [ -n "$CHANGED_FILES" ]; then
             git config user.name  "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add band_watch.json
-            git commit -m "chore: 巡检回写波段状态 [skip ci]"
+            git add $CHANGED_FILES
+            git commit -m "chore: 巡检回写波段状态与推送账本 [skip ci]"
             # 并发场景下远端可能刚更新过，先 rebase 再推，最多重试 3 次
             for i in 1 2 3; do
-              if git push; then echo "✅ 波段状态已提交回仓库"; exit 0; fi
+              if git push; then echo "✅ 已提交回仓库：$CHANGED_FILES"; exit 0; fi
               echo "推送失败，拉取远端后重试（第 $i 次）..."; git pull --rebase --autostash || true
             done
-            echo "⚠️ 波段状态提交失败（已达最大重试次数），下次巡检会继续尝试"
+            echo "⚠️ 提交失败（已达最大重试次数），下次巡检会继续尝试"
           else
-            echo "band_watch.json 无变化，跳过提交"
+            echo "band_watch.json / notify_budget.json 均无变化，跳过提交"
           fi
