@@ -3640,14 +3640,35 @@ def _band_memory_digest(mem):
             out["stocks"][code] = json.loads(json.dumps(node, ensure_ascii=False, default=str))
     return out
 
+# ---------- 记忆合并：哪批字段属于「一次评估算出来的实时值」（2026-09-22）----------
+# 云端巡检（每 5 分钟）与网页端都会写这批字段。冲突时必须**整组按「谁的最后检查更新」
+# 决出胜负** —— 半新半旧（时间抄云端的、价格留本地的）会产出自相矛盾的卡片：
+# 同时显示「最近检查：今天 11:23」和「现价：入册那天的价」。自动入册的票入册价就是
+# 当时的现价 ⇒「入选价」永远等于「现价」、「自入选」永远 +0.0%
+# （用户 2026-09-22 反馈「这个入选价为什么全都是现价啊」即此）。
+# ★ 下面这些**不在这里**，它们永远不进这场仲裁：
+#   · 入册记录 added_at/added_price/added_status/added_source/batch_id/entry_context/snapshot
+#     —— 它们是「入册那一刻」的快照，被后来的行情改写就失去意义了；
+#   · 用户意图 note / closed；
+#   · 并集字段 history / alerts（走并集，不走整组替换）；
+#   · 复盘结果 outcome。
+_BAND_LIVE_FIELDS = ("price", "ma20", "score", "reasons",
+                     "platform_high", "breakout_pivot",
+                     "run_days", "run_start_date", "run_start_price", "run_gain_pct")
+
+
 def band_memory_merge_digest(local, digest):
     """把仓库里那一份（完整镜像）合并回本地完整记忆。
 
     冲突口径（★ 别改，这是两端不互相踩的前提）：
+      · 实时值（`_BAND_LIVE_FIELDS`：现价 / 20 日线 / 平台高点 / 突破位 / 本轮启动 / 得分…）
+        → **跟着 `last_check` 走**：云端那次检查更新就用云端的，本地更新就用本地的。
+        旧口径是「本地非空以本地为准」，会把网页端入册那天的价永远冻住，而 `last_check`
+        却照抄云端 ⇒ 卡片显示「今天检查过」+「入册当天的现价」（用户 2026-09-22 反馈）。
       · 状态/状态时间 → 取 `status_ts` 较新的一方（巡检可能比网页端新）；
       · 轨迹、各告警的最近推送时间 → 并集去重；
       · `closed` → **本地说了算**（用户手动归档的意图不能被云端覆盖）；
-      · 其余字段（备注/入选价/平台高点/快照/复盘结果…）→ **本地非空以本地为准**，
+      · 其余字段（备注 / 入选价 / 入册上下文 / 快照 / 复盘结果…）→ **本地非空以本地为准**，
         本地为空才用云端的值补上（容器重启后本地只剩个壳，能补就补，省得界面显示「暂缺」）。
     """
     out = _band_memory_empty()
@@ -3686,6 +3707,20 @@ def band_memory_merge_digest(local, digest):
             out['stocks'][code] = node
             continue
 
+        # ★★ 实时值跟着「最后一次检查」走（2026-09-22 修 bug）。
+        #   云端巡检每 5 分钟用最新行情重算一遍，网页端可能几小时没人碰 —— 这种情况
+        #   必须是**云端那份赢**。旧口径只「本地为空才用云端补」，于是网页端容器里那个
+        #   入册当天写下的 `price` 永远不被更新，而下面的 `last_check` 却是照抄云端的：
+        #   卡片上就同时出现「最近检查：今天 11:23」+「现价：入册那天的价」，
+        #   自动入册的票于是「入选价」永远等于「现价」。
+        #   ★ 反过来（用户刚点过「🔄 刷新全部状态」，本地 last_check 最新）本地照样说了算 ——
+        #     否则网页端刚算出来的东西会被一份旧的云端记录顶掉。
+        #   ★ 判空用 `is not None` 而不是 `or`：`run_days = 0` 是**合法值**（本轮已结束），
+        #     用 `or` 会让它退回过期的「已启动 N 日」。
+        if str(r_node.get("last_check") or "") > str(l_node.get("last_check") or ""):
+            for _f in _BAND_LIVE_FIELDS:
+                if r_node.get(_f) is not None:
+                    l_node[_f] = r_node[_f]
         # 两边都有：状态取 status_ts 较新的一方
         if str(r_node.get("status_ts") or "") > str(l_node.get("status_ts") or ""):
             l_node["status"] = r_node.get("status") or l_node.get("status")
@@ -3878,49 +3913,16 @@ def band_memory_push_github(mem, merge_remote=True):
 
 
 def band_memory_merge(local, remote):
-    """合并本地与云端的记忆：并集；同一只股票取 status_ts 较新者为主体，
-    再补上对方的轨迹条数，备注/归档状态以本地（用户手动操作）为准。"""
-    out = _band_memory_empty()
-    local_stocks = (local or {}).get('stocks', {}) or {}
-    remote_stocks = (remote or {}).get('stocks', {}) or {}
-    for code in set(local_stocks) | set(remote_stocks):
-        l_node, r_node = local_stocks.get(code), remote_stocks.get(code)
-        if l_node and not r_node:
-            out['stocks'][code] = l_node; continue
-        if r_node and not l_node:
-            out['stocks'][code] = r_node; continue
-        # 两边都有：以 status_ts 较新的为主体
-        base = l_node if str(l_node.get('status_ts', '')) >= str(r_node.get('status_ts', '')) else r_node
-        other = r_node if base is l_node else l_node
-        merged = dict(base)
-        # 轨迹取并集（按时间+状态去重后排序）
-        seen, hist = set(), []
-        for item in list(l_node.get('history') or []) + list(r_node.get('history') or []):
-            if not isinstance(item, dict):
-                continue
-            k = (str(item.get('ts', '')), str(item.get('status', '')))
-            if k in seen:
-                continue
-            seen.add(k); hist.append(item)
-        hist.sort(key=lambda x: str(x.get('ts', '')))
-        merged['history'] = hist[-BAND_MEMORY_HISTORY_MAX:]
-        # 用户手动维护的字段以本地为准
-        merged['note'] = l_node.get('note') or r_node.get('note') or ""
-        merged['closed'] = bool(l_node.get('closed'))
-        merged['added_at'] = l_node.get('added_at') or r_node.get('added_at')
-        merged['added_price'] = l_node.get('added_price', r_node.get('added_price', 0.0))
-        merged['added_status'] = l_node.get('added_status') or r_node.get('added_status')
-        merged['added_source'] = l_node.get('added_source') or r_node.get('added_source')
-        merged['snapshot'] = l_node.get('snapshot') or r_node.get('snapshot') or {}
-        # 各告警的最近推送时间去重合并，避免两端各推一次
-        alerts = dict(r_node.get('alerts') or {})
-        for k, v in (l_node.get('alerts') or {}).items():
-            if k not in alerts or str(v) > str(alerts[k]):
-                alerts[k] = v
-        merged['alerts'] = alerts
-        merged['name'] = l_node.get('name') or r_node.get('name') or other.get('name')
-        out['stocks'][code] = merged
-    return out
+    """合并本地与云端记忆（「从备份恢复 / 上传 band_memory.json」那条路用）。
+
+    ★ 2026-09-22 起**直接委托** `band_memory_merge_digest`，不再自己留一份实现。
+      理由：两份实现并存时冲突口径只能靠人对齐，只改了其中一份就是**静默不一致**
+      —— 实测踩过：`band_memory_merge_digest` 修好「实时值要跟着 last_check 走」之后，
+      这一份还在按 `status_ts` 挑整节点，于是导入备份后现价又被冻回去，
+      而且从代码上完全看不出两处规则不同。保留这个名字只是为了不动调用方，
+      **行为口径只有 `band_memory_merge_digest` 一处**。
+    """
+    return band_memory_merge_digest(local, remote)
 
 
 def _fmt_price(v, digits=2):
