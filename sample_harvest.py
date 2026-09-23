@@ -77,7 +77,7 @@ FORWARD_EXPORT_MAX = 60000
 NET_FUNCS = {
     "_log", "_http_get_json", "_http_get_text", "_quote_prefix", "_get_code",
     "_safe_float", "_safe_float_or_none", "_is_st_or_risk", "_diff_to_list",
-    "fetch_market_page", "_normalize_kline_rows", "_fetch_kline_qq", "_fetch_kline_sina",
+    "fetch_market_page", "_sina_market_universe", "_normalize_kline_rows", "_fetch_kline_qq", "_fetch_kline_sina",
     # ★ 2026-09-20 加东方财富备用源后新增的依赖：`_get_daily_history` 会依次调
     #   `_fetch_kline_qq → _fetch_kline_em → _fetch_kline_sina`，并过一遍熔断器。
     #   漏了 `_feed_alive/_feed_note` → 熔断静默失效（每次仍为死源付超时）；
@@ -95,7 +95,20 @@ NET_CONSTS = {"_REQUEST_HEADERS", "_EM_HOSTS", "_HTTP_HEADERS", "_QQ_APP_HOSTS",
               # 备用源域名池 + 熔断器常量（`_fetch_kline_em` / `_feed_alive` / `_feed_note` 依赖）
               "_EM_KLINE_HOSTS", "FEED_HEALTH", "FEED_DEAD_AFTER", "FEED_DEAD_SECONDS",
               "_FEED_CODE_LEVEL",
-              "_TLS_LOCAL"}
+              "_TLS_LOCAL",
+              "MARKET_LIST_DIAG_KEY",
+              "_MARKET_LIST_CACHE",
+              "SINA_LIST_HOST",
+              "SINA_LIST_URL",
+              "SINA_COUNT_URL",
+              "SINA_LIST_PAGE",
+              "SINA_LIST_MAX_PAGES",
+              "SINA_LIST_WORKERS",
+              "SINA_LIST_TTL",
+              "SINA_LIST_MAX_BAD",
+              "SINA_LIST_MIN_RATIO",
+              "_SINA_LIST_HEADERS",
+              "MARKET_EM_DEAD_SECONDS"}
 METRIC_FUNCS = {"_calculate_band_metrics", "_band_score", "_band_status", "_band_evaluate",
                 # 2026-09-22：`_calculate_band_metrics` 用它算「本轮启动起点」，
                 # 漏抽会被内部 try 吞掉 → days 恒为 0，日报/回测里「已启动」整块静默消失。
