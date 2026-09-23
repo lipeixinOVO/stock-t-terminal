@@ -209,6 +209,73 @@ NOTIFY_LIMIT_MAX = 20
 NOTIFY_WHITELIST_MAX = 20
 
 
+# ================= 3.2b ★ 日内买卖点「置信度」与推送门槛（2026-09-22 用户要求）=====
+# 用户口径：「只给我微信推送置信度高的买卖点」＋门槛要能自己调（下拉，默认「高」）。
+# ⇒ 置信度**只此一份**：页面展示、网页端巡检、Actions 巡检三处共用
+#   `intraday_point_confidence`，绝不再各写一份 if 链 ——
+#   分时买卖点偏离系数 0.4/0.5 漂移那次就是这么漂出去的。
+NOTIFY_CONF_LEVELS = ("高", "中", "低")     # 下拉顺序：从严到松
+NOTIFY_MIN_CONF_DEFAULT = "高"              # 默认门槛：只推「高」（用户选定）
+NOTIFY_CONF_ORDER = {"高": 2, "中": 1, "低": 0}
+
+
+def intraday_point_confidence(kind, price, avg_price, deviation,
+                              divergence_info="", market_change=0.0, macd_ok=False):
+    """给一个日内买卖点打置信度：高 / 中 / 低。
+
+    kind：'buy' 买点 / 'sell' 卖点；avg_price：当日分时均价；
+    macd_ok：该点 MACD 是否同向拐头；divergence_info：`_intraday_divergence` 的返回串。
+
+    ★ 大盘暴跌（上证 < -1.0%）时**买点直接判「低」**：这种环境下低吸胜率最差。
+      卖点**刻意不受它影响** —— 暴跌里高抛恰恰是对的，一刀切会把对的信号也砍掉。
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
+    try:
+        if kind == 'buy' and float(market_change or 0.0) < -1.0:
+            return "低"
+        avg = float(avg_price or 0.0)
+        if avg <= 0:
+            return "低"
+        price = float(price)
+        dev = float(deviation or 0.0)
+        tag = "底背离" if kind == 'buy' else "顶背离"
+        if kind == 'buy':
+            dev_pct = (avg - price) / avg
+            scheme_a = price < avg * (1 - dev * 0.7)
+        else:
+            dev_pct = (price - avg) / avg
+            scheme_a = price > avg * (1 + dev * 0.7)
+        if dev_pct > dev * 1.5 or tag in (divergence_info or ""):
+            return "高"
+        if dev_pct > dev * 0.8 or (scheme_a and macd_ok):
+            return "中"
+        return "低"
+    except Exception as e:
+        _log("intraday_point_confidence", e)
+        return "低"
+
+
+def notify_conf_threshold(w):
+    """取白名单里那份「最低推送置信度」。字段缺失/写歪 → 默认「高」。
+
+    ★ 兜底方向刻意偏严：字段坏了只会**少推**，绝不会因为读歪而把门槛降到「低」。
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
+    v = str(notify_whitelist_normalize(w).get("min_conf") or "").strip()
+    return v if v in NOTIFY_CONF_LEVELS else NOTIFY_MIN_CONF_DEFAULT
+
+
+def notify_conf_allowed(conf, threshold):
+    """置信度 `conf` 够不够 `threshold` 这道门槛。
+
+    未知/空的置信度一律**不放行**（-1 低于任何一档）——宁可少推，也不瞎推。
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
+    _th = threshold if threshold in NOTIFY_CONF_LEVELS else NOTIFY_MIN_CONF_DEFAULT
+    return (NOTIFY_CONF_ORDER.get(str(conf or "").strip(), -1)
+            >= NOTIFY_CONF_ORDER.get(_th, 2))
+
+
 def _clamp_int(v, lo, hi, default):
     """收敛进 [lo, hi]。坏值落到 default（**不是** lo）。
 
@@ -279,8 +346,12 @@ def notify_budget_line(b):
 
 
 def notify_whitelist_empty():
-    """空名单。**这就是"谁都不自动发"** —— 默认状态，也是读不出来时的兜底。"""
-    return {"updated_at": "", "items": []}
+    """空名单。**这就是"谁都不自动发"** —— 默认状态，也是读不出来时的兜底。
+
+    ★ `min_conf`（最低推送置信度）与名单**同存一份文件**（用户要求跟白名单一起存），
+      缺字段时按默认「高」处理 —— 老文件读出来照旧能用，不会因为新字段把名单读空。
+    """
+    return {"updated_at": "", "items": [], "min_conf": NOTIFY_MIN_CONF_DEFAULT}
 
 
 def notify_whitelist_normalize(w):
@@ -288,12 +359,16 @@ def notify_whitelist_normalize(w):
 
     ★ 超上限时**截断**而不是整份丢掉：整份丢掉会让用户以为"我明明勾了却保存不上"。
     ★ `name` 只用于界面显示，丢了不影响判定（判定只认 code，见 notify_whitelist_has）。
+    ★ `min_conf` 是**推送门槛**，不是名单的一部分：写歪了只落回默认「高」，
+      绝不因为一个坏字段就把整份名单丢掉（那等于"我勾了却不生效"）。
     ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
     """
     out = notify_whitelist_empty()
     if not isinstance(w, dict):
         return out
     out["updated_at"] = str(w.get("updated_at") or "")
+    _mc = str(w.get("min_conf") or "").strip()
+    out["min_conf"] = _mc if _mc in NOTIFY_CONF_LEVELS else NOTIFY_MIN_CONF_DEFAULT
     seen, items = set(), []
     for it in (w.get("items") or []):
         if not isinstance(it, dict):
@@ -1108,9 +1183,40 @@ def check_band_memory(mem, log, today):
 
 # ============ 主巡检 ============
 
-def check_symbol(sym, market_change, log, today):
-    """检查单只股票，返回是否触发推送"""
+def _intraday_divergence(df_min):
+    """日内 MACD 背离提示（参与置信度判定，也用于主图展示）。
+
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
+    info = ""
     try:
+        low_idx = df_min['Price'].idxmin()
+        if len(df_min.loc[:low_idx]) > 5:
+            recent_low = df_min.loc[low_idx, 'Price']; prev_lows = df_min[df_min['Price'] < recent_low * 1.005]
+            if len(prev_lows) > 0 and df_min.loc[low_idx, 'MACD'] > df_min.loc[prev_lows.index[0], 'MACD']:
+                info += " 底背离"
+        high_idx = df_min['Price'].idxmax()
+        if len(df_min.loc[:high_idx]) > 5:
+            recent_high = df_min.loc[high_idx, 'Price']; prev_highs = df_min[df_min['Price'] > recent_high * 0.995]
+            if len(prev_highs) > 0 and df_min.loc[high_idx, 'MACD'] < df_min.loc[prev_highs.index[-1], 'MACD']:
+                info += " 顶背离"
+    except Exception as e:
+        _log("_intraday_divergence", e)
+    return info
+
+
+def check_symbol(sym, market_change, log, today, wl=None):
+    """检查单只股票，返回是否触发推送。
+
+    ★ 2026-09-22：日内买卖点先算**置信度**，够不上「最低推送置信度」就只打印、不推微信
+      （用户要求「只给我微信推送置信度高的买卖点」）。
+    ★ `wl` 由 main() 传下来：门槛就存在白名单文件里，每只票各读一次纯属浪费，
+      而且文件读不出来时会逐只刷告警。传 None 时自己读一次（给直接调用的场合）。
+    """
+    try:
+        if wl is None:
+            wl, _ = notify_whitelist_load()
+        _conf_th = notify_conf_threshold(wl)
         sym_code = get_code(sym)
         df = get_minute_data(sym_code)
         if df is None or df.empty or len(df) < 10:
@@ -1132,6 +1238,7 @@ def check_symbol(sym, market_change, log, today):
         avg = df['AvgPrice'].mean()
         day_range = max(high - low, 0.001)
         dev = max(0.003, min(((high - low) / avg) * 0.5, 0.015)) if avg > 0 else 0.008
+        _div_info = _intraday_divergence(df)
 
         # 价格位置、止跌/滞涨结构
         buy_df['Price_Position'] = (buy_df['Price'] - low) / day_range
@@ -1175,20 +1282,29 @@ def check_symbol(sym, market_change, log, today):
             if not recent.empty:
                 row = recent.loc[recent['Price'].idxmin()]
                 price = float(row['Price'])
+                _conf = intraday_point_confidence('buy', price, float(row['AvgPrice']), dev,
+                                                  _div_info, market_change,
+                                                  bool(row.get('MACD_UP', False)))
                 key = key_of(sym, 'buy', price)
-                if key not in log.get(today, []):
+                if not notify_conf_allowed(_conf, _conf_th):
+                    # ★ 够不上门槛：**只打印，不推、也不占额度**。
+                    #   网页端照旧能看到这个买点 —— 过滤的只是"打扰你"这件事，不是数据。
+                    print(f"  ⏸ {name}({sym}) 买点 {price:.3f} 置信度{_conf} "
+                          f"< 门槛「{_conf_th}」→ 不推微信")
+                elif key not in log.get(today, []):
                     t_str = f"{row['Time'][:2]}:{row['Time'][2:]}"
                     ok = send_wechat(
-                        f"【买点】{name}",
+                        f"【买点·置信度{_conf}】{name}",
                         f"股票：{name} ({sym})\n时间：{t_str}（北京时间）\n"
-                        f"价格：{price:.3f}\n依据：回踩均价线缩量 + MACD 拐头向上\n"
+                        f"价格：{price:.3f}\n置信度：{_conf}\n依据：回踩均价线缩量 + MACD 拐头向上\n"
                         f"偏离均价：{(price / float(row['AvgPrice']) - 1) * 100:.2f}%\n\n"
                         f"仅做参考，请自行判断。",
                         code=sym, name=name
                     )
                     if ok:
                         log.setdefault(today, []).append(key)
-                        print(f"  🔴 {name}({sym}) 买点 {price:.3f} @ {t_str} → 已推送")
+                        print(f"  🔴 {name}({sym}) 买点 {price:.3f} @ {t_str} "
+                              f"置信度{_conf} → 已推送")
                         pushed = True
 
         if not sell_pts.empty:
@@ -1196,20 +1312,27 @@ def check_symbol(sym, market_change, log, today):
             if not recent.empty:
                 row = recent.loc[recent['Price'].idxmax()]
                 price = float(row['Price'])
+                _conf = intraday_point_confidence('sell', price, float(row['AvgPrice']), dev,
+                                                  _div_info, market_change,
+                                                  bool(row.get('MACD_DOWN', False)))
                 key = key_of(sym, 'sell', price)
-                if key not in log.get(today, []):
+                if not notify_conf_allowed(_conf, _conf_th):
+                    print(f"  ⏸ {name}({sym}) 卖点 {price:.3f} 置信度{_conf} "
+                          f"< 门槛「{_conf_th}」→ 不推微信")
+                elif key not in log.get(today, []):
                     t_str = f"{row['Time'][:2]}:{row['Time'][2:]}"
                     ok = send_wechat(
-                        f"【卖点】{name}",
+                        f"【卖点·置信度{_conf}】{name}",
                         f"股票：{name} ({sym})\n时间：{t_str}（北京时间）\n"
-                        f"价格：{price:.3f}\n依据：分时卖点触发（冲高乖离或日内高点滞涨）\n"
+                        f"价格：{price:.3f}\n置信度：{_conf}\n依据：分时卖点触发（冲高乖离或日内高点滞涨）\n"
                         f"偏离均价：{(price / float(row['AvgPrice']) - 1) * 100:+.2f}%\n\n"
                         f"仅做参考，请自行判断。",
                         code=sym, name=name
                     )
                     if ok:
                         log.setdefault(today, []).append(key)
-                        print(f"  🟢 {name}({sym}) 卖点 {price:.3f} @ {t_str} → 已推送")
+                        print(f"  🟢 {name}({sym}) 卖点 {price:.3f} @ {t_str} "
+                              f"置信度{_conf} → 已推送")
                         pushed = True
         return pushed
     except Exception as e:
@@ -1229,6 +1352,8 @@ def main():
         f"{len(_wl0['items'])} 只（{'、'.join(sorted(notify_whitelist_codes(_wl0)))}）"
         if _wl0['items'] else "空 —— 谁都不自动发（全手动）")
         + ("" if _wl_ok else "　⚠️ 白名单读取失败，已按空名单处理"))
+    print(f"⚖️ 最低推送置信度：「{notify_conf_threshold(_wl0)}」"
+          "（够不上的日内买卖点只打印、不推微信）")
     print("📊 推送额度：" + notify_budget_line(_bd0)
           + ("" if _bd_ok else "　⚠️ 账本读取失败，本次禁止自动发"))
     if not _wl_ok or not _bd_ok:
@@ -1263,7 +1388,7 @@ def main():
 
     pushed = 0
     for sym in tradeable:
-        if check_symbol(sym, market_change, log, today):
+        if check_symbol(sym, market_change, log, today, _wl0):
             pushed += 1
 
     # 波段结束预警（日线级别，每天同一股票只提醒一次）
