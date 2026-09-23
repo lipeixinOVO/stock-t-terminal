@@ -1791,8 +1791,15 @@ def get_daily_data(code):
     df, _src = _try_fetch_kline(code)
     return df
 
-def _fetch_minute_raw(code):
-    """拉取腾讯分时原始数据（多域名轮询）。返回 (raw 列表 | None, 错误列表)。"""
+def _fetch_minute_raw_dated(code):
+    """同 `_fetch_minute_raw`，但**同时返回该分时对应的交易日**（YYYY-MM-DD，取不到给空串）。
+
+    ★ 为什么必须带日期：分时接口只给「最近一个交易日」，周末/假日跑会拿到上一交易日的
+      数据。样本的 date 一旦按 `now_cn()` 猜，就会把周五的分时段标成周六，
+      按日期切样本内外时直接错位 —— 而且错得静默。
+    ★ 本函数不挂 @st.cache_data：它要给样本落盘提供**真实的交易日**，
+      缓存住会让跨日之后仍拿到旧日期；取数开销由调用方（盘后一次性采集）承担。
+    """
     errs = []
     for host in _QQ_APP_HOSTS:
         url = f"{host}/appstock/app/minute/query?code={code}"
@@ -1803,11 +1810,26 @@ def _fetch_minute_raw(code):
         if not isinstance(js, dict) or js.get("code") != 0:
             errs.append((tag, f"接口 code={js.get('code') if isinstance(js, dict) else '非JSON'}")); continue
         node = (js.get("data") or {}).get(code) or {}
-        raw = ((node.get("data") or {}) or {}).get("data")
+        inner = node.get("data") or {}
+        raw = (inner or {}).get("data")
         if not raw:
             errs.append((tag, "返回空分时")); continue
-        return raw, errs
-    return None, errs
+        d = str((inner or {}).get("date") or "")
+        if len(d) == 8 and d.isdigit():
+            d = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+        return raw, d[:10], errs
+    return None, "", errs
+
+
+def _fetch_minute_raw(code):
+    """拉取腾讯分时原始数据（多域名轮询）。返回 (raw 列表 | None, 错误列表)。
+
+    ★ 契约保持不变（调用方与 test_datalayer 都按两元组解包），日期另走
+      `_fetch_minute_raw_dated`。
+    """
+    raw, _date, errs = _fetch_minute_raw_dated(code)
+    return raw, errs
+
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_minute_data(code):
@@ -6169,6 +6191,855 @@ def band_samples_refresh_pending(rows_map, fetch=None, bench_df=None, max_items=
     return rows_map, updated
 
 
+# ============================================================================
+# 日内买卖点样本语料库（2026-09-23 新增）
+# ----------------------------------------------------------------------------
+# 为什么要有这一层：上面的波段样本库验证的是「突破＋放量值不值得买」，
+# 它一个字都没回答「页面和微信推给你的那个**日内买卖点**准不准」。
+# 于是做T的买卖点一直只有人工回看 —— 没有证据，也没有基准。
+#
+# ★ 与波段样本库最大的差别，也是本层唯一的硬约束：
+#     分时数据**只有当天**（腾讯 minute 接口只回最近一个交易日的分时），
+#     所以本层**不能历史回填**，只能一天天往前攒。样本库从空开始是正常的。
+#   ⇒ 也正因为如此，本层**不设 pending 状态**：观察窗口没走完的点直接不记，
+#     盘后（当天分时还读得到时）再跑一次就全了 —— 信号列表本身是确定的，
+#     不会因为「某一轮没跑」而漏掉任何点，重跑也是幂等的。
+#
+# ★★ 四条不许破（都踩过或差点踩，改这里之前必须读完）：
+#   1. **信号定义必须因果**：第 i 分钟算不算信号，只许用 `df[:i+1]` 判。
+#      绝不能拿整天去跑 `compute_intraday_signals` —— 它里面的
+#      `day_high / day_low / Price_Position` 是按**传入的那一段**归一的，
+#      拿整天算就等于用了「当时还不知道的当日高低点」，是实打实的前视。
+#      见 `intraday_live_signals`。
+#   2. **特征只许用该分钟及之前**的数据（`df.iloc[:pos+1]`）。
+#   3. 「达标」必须与**同一天、同一方向、同一判据**下的基准率对比。只报绝对
+#      达标率毫无意义 —— 单边上涨的一天里随便挑一分钟都「达标」。
+#   4. 买卖点 / 置信度 / 动态偏离只走 `compute_intraday_signals` /
+#      `intraday_point_confidence` / `dynamic_deviation`（唯一来源），
+#      本层不重写任何一条算式 —— 否则验证的就不是线上那套逻辑了。
+#
+# ★ 唯一一处刻意用「当日全景」的东西，是**尺子**（达标幅度 = 当日振幅 × 系数）：
+#   它是判成绩的标准，不是买入的输入。因为样本与基准用的是**同一把尺子**，
+#   差额（lift）不受它影响；绝对达标率会略偏乐观，这一点在面板上如实写明。
+# ============================================================================
+INTRADAY_SAMPLE_FILE = os.path.join(BASE_DIR, "intraday_samples.jsonl.gz")
+INTRADAY_SAMPLE_WINDOW = 15             # 观察窗口（分钟）：该点之后这么久的走势算成绩
+INTRADAY_SAMPLE_MIN_BARS = 20           # 分时根数下限，太少不采（判据本身也不稳；也是信号扫描的起点）
+INTRADAY_SAMPLE_TARGET_MIN_PCT = 0.30   # 「达标」幅度下限（%）
+INTRADAY_SAMPLE_TARGET_RANGE = 0.30     # 「达标」幅度 = max(下限, 当日振幅% × 此系数)
+INTRADAY_SAMPLE_MAX_ROWS = 60000        # 本地文件上限，超出按日期从旧到新裁剪
+INTRADAY_SAMPLE_SOURCES = ("intraday",)
+INTRADAY_SAMPLE_SOURCE_LABEL = {
+    "intraday": "当日分时采集（信号按「当时能看到的数据」判，特征只截至该分钟）",
+}
+INTRADAY_SAMPLE_KIND_LABEL = {"buy": "买点", "sell": "卖点"}
+# 分桶维度：顺序即面板上的显示顺序；键取自 dims（见 _intraday_sample_dims）
+INTRADAY_SAMPLE_DIMS = ("置信度", "入场方案", "偏离倍数", "日内位置", "量比", "背离", "时段")
+
+
+def _intraday_sample_key(row):
+    """去重键。同一只票同一天可能有好几个买卖点 ⇒ 必须带上方向与分钟，否则会互相覆盖。"""
+    r = row or {}
+    return "%s|%s|%s|%s|%s" % (str(r.get("code") or "").zfill(6),
+                               str(r.get("date") or "")[:10],
+                               str(r.get("kind") or ""),
+                               str(r.get("time") or ""),
+                               "" if r.get("pos") is None else str(r.get("pos")))
+
+
+def _intraday_sample_target_pct(day_range_pct):
+    """当日「达标」幅度（%）：跟当日振幅成比例，并有下限。
+
+    ★ 为什么必须跟振幅挂钩：0.6% 对一个振幅 10% 的票唾手可得，对一个振幅 1% 的票
+      是天方夜谭。用固定百分比的话，「达标率」实际上只是在比谁波动大。
+    ★ 下限的作用：极度缩量的一天（振幅 0.3%）不能把目标压到 0.09% ——
+      那种数字连一个最小变动单位都不到，等于白送「达标」。
+    """
+    try:
+        r = float(day_range_pct or 0.0)
+    except (TypeError, ValueError):
+        r = 0.0
+    if not (r > 0):
+        r = 0.0
+    return round(max(INTRADAY_SAMPLE_TARGET_MIN_PCT, r * INTRADAY_SAMPLE_TARGET_RANGE), 4)
+
+
+def intraday_live_signals(df_minute, min_bars=None):
+    """该日**盘中真实会发出来**的买卖点。返回 [{"kind","pos","dev","macd_ok"}, …]。
+
+    ★★ 为什么不能直接 `compute_intraday_signals(整天)`：
+      那个函数里的 `day_high / day_low / Price_Position` 是按**传给它的整段**归一的。
+      盘中 10:00 时它看到的只有 09:30-10:00（高低点是「至今」的）；盘后拿整天去算，
+      同一分钟的 `Price_Position` 就变了 —— 于是会凭空多出（或抹掉）一些点。
+      那等于把**当时还不知道的当日高低点**用进了买入判定，是最容易骗过自己的一类前视。
+    ⇒ 正确口径：第 i 分钟发出信号 ⟺ `compute_intraday_signals(df[:i+1])` 命中第 i 分钟。
+      （`buy(df[:i])` 不可能含 i，所以不必再跟上一分钟比「是不是新出现的」。）
+    ★ 代价：一只票约 len(df) 次调用（一天 240 根 ⇒ 200 多次），盘后一次性采集可以接受。
+    """
+    out = []
+    try:
+        mb = int(min_bars or INTRADAY_SAMPLE_MIN_BARS)
+        if df_minute is None or len(df_minute) < mb:
+            return out
+        for i in range(mb - 1, len(df_minute)):
+            pre = df_minute.iloc[:i + 1]
+            dev = dynamic_deviation(pre)
+            res = compute_intraday_signals(pre, dev)
+            if not res:
+                continue
+            for kind in ('buy', 'sell'):
+                sig = res.get(kind)
+                if sig is None or len(sig) == 0:
+                    continue
+                if i not in set(sig.index.tolist()):
+                    continue
+                try:
+                    pos = int(sig.loc[i].name)
+                except Exception:
+                    pos = i
+                if pos != i:            # 定位不到就跳过，绝不猜
+                    continue
+                try:
+                    macd_ok = (bool(sig.loc[i].get('MACD_UP')) if kind == 'buy'
+                               else bool(sig.loc[i].get('MACD_DOWN')))
+                except Exception as e:
+                    _log("intraday_live_signals/macd", e)
+                    macd_ok = False
+                out.append({"kind": kind, "pos": i, "dev": dev, "macd_ok": macd_ok})
+    except Exception as e:
+        _log("intraday_live_signals", e)
+    return out
+
+
+def _intraday_sample_pos_pct(sub):
+    """该分钟为止的日内位置（0~1）。★ 只用传进来的切片，绝不看后面。"""
+    try:
+        hi = float(sub['Price'].max()); lo = float(sub['Price'].min())
+        cur = float(sub['Price'].iloc[-1])
+        return (cur - lo) / max(hi - lo, 0.001)
+    except Exception as e:
+        _log("_intraday_sample_pos_pct", e)
+        return 0.0
+
+
+def _intraday_sample_dev_mult(price, avg, deviation):
+    """偏离幅度 ÷ 动态偏离阈值（取绝对值）。买点看「低于均价」、卖点看「高于均价」，都为正。"""
+    try:
+        a = float(avg or 0.0)
+        if a <= 0:
+            return 0.0
+        return round(abs(float(price) - a) / a / max(float(deviation or 0.0), 1e-9), 4)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _intraday_sample_time_slot(t):
+    """时段分档。纯字符串比较，不碰行情。"""
+    s = str(t or "")
+    if s <= "1030":
+        return "早盘(≤10:30)"
+    if s <= "1130":
+        return "上午盘(10:30-11:30)"
+    if s <= "1400":
+        return "午后盘(13:00-14:00)"
+    return "尾盘(≥14:00)"
+
+
+def _intraday_sample_vol_ratio(df, pos):
+    """量比 = 该分钟成交量 ÷ 最近 5 根均量。缺失给 None（不编 1.0）。
+
+    ★ 为什么不读 `Vol_MA5` 列：那一列是 `compute_intraday_signals` 加在它**内部**那份
+      df 上的；而本层对每个前缀都要重算一次信号，跨前缀去读同一列会串味（拿到的可能是
+      最后一个前缀算出来的）。这里直接取 `df.iloc[pos-4 : pos+1]` 自己算 —— 与
+      `rolling(5).mean()` 完全同一个口径，且天然只用到该分钟及之前。
+    """
+    try:
+        if pos < 4:
+            return None          # 不足 5 根时 rolling 本来就是 NaN，别硬凑一个数
+        v = float(df['Volume'].iloc[pos])
+        m = float(df['Volume'].iloc[pos - 4: pos + 1].mean())
+        if not (m > 0):
+            return None
+        return round(v / m, 4)
+    except Exception as e:
+        _log("_intraday_sample_vol_ratio", e)
+        return None
+
+
+def _intraday_sample_conf_bucket(conf):
+    return conf if conf in NOTIFY_CONF_LEVELS else "低"
+
+
+def _intraday_sample_mult_bucket(mult):
+    try:
+        v = float(mult)
+    except (TypeError, ValueError):
+        v = 0.0
+    if v < 0.8:
+        return "<0.8×"
+    if v < 1.5:
+        return "0.8-1.5×"
+    return "≥1.5×"
+
+
+def _intraday_sample_pos_bucket(p):
+    try:
+        v = float(p)
+    except (TypeError, ValueError):
+        v = 0.0
+    if v <= 0.30:
+        return "低位(≤30%)"
+    if v >= 0.70:
+        return "高位(≥70%)"
+    return "中位(30-70%)"
+
+
+def _intraday_sample_vol_bucket(r):
+    if r is None:
+        return "（缺失）"
+    try:
+        v = float(r)
+    except (TypeError, ValueError):
+        return "（缺失）"
+    if v < 0.85:
+        return "<0.85（缩量）"
+    if v < 1.20:
+        return "0.85-1.2（平量）"
+    return "≥1.2（放量）"
+
+
+def _intraday_sample_dims(ctx):
+    """一个样本的归因标签。★ 每个维度都取自「该分钟及之前」，没有一个例外。"""
+    c = ctx or {}
+    return {
+        "置信度": _intraday_sample_conf_bucket(c.get("conf")),
+        "入场方案": c.get("scheme") or "",
+        "偏离倍数": _intraday_sample_mult_bucket(c.get("dev_mult")),
+        "日内位置": _intraday_sample_pos_bucket(c.get("pos_pct")),
+        "量比": _intraday_sample_vol_bucket(c.get("vol_ratio")),
+        "背离": "有" if str(c.get("divergence") or "").strip() else "无",
+        "时段": c.get("time_slot") or "",
+    }
+
+
+def _intraday_sample_judge(dom, pos, kind, target_pct, window=None):
+    """判定一个点的成绩。**返回 None 表示观察窗口不完整 ⇒ 该点不采**。
+
+    ★ 窗口必须完整：本层刻意不设 pending。分时一滚走就永远补不上，留 pending 只会
+      在统计里堆一批永远未知的行，而「未知」被当成「失败」或「成功」都是错的。
+    ★ 有利/不利方向统一成「正数=有利」：买点看涨、卖点看跌。符号写反是这类代码
+      最常见的错，所以下面两个分支刻意分开写，不用一个式子凑。
+    """
+    try:
+        w = int(window or INTRADAY_SAMPLE_WINDOW)
+        if w <= 0 or pos < 0:
+            return None
+        if pos + w >= len(dom):        # 后面不足 w 根 ⇒ 窗口没走完
+            return None
+        price = float(dom['Price'].iloc[pos])
+        if not (price > 0):
+            return None
+        seg = dom['Price'].iloc[pos + 1: pos + 1 + w]
+        if len(seg) < w:
+            return None
+        hi = float(seg.max()); lo = float(seg.min())
+        if kind == 'buy':
+            fav = (hi - price) / price * 100.0      # 有利：上涨
+            adv = (lo - price) / price * 100.0      # 不利：下跌（≤0）
+        elif kind == 'sell':
+            fav = (price - lo) / price * 100.0      # 有利：下跌
+            adv = -((hi - price) / price * 100.0)   # 不利：上涨 ⇒ 取负，仍是「越负越不利」
+        else:
+            return None
+        return {"judged": True,
+                "mfe_pct": round(fav, 3), "mae_pct": round(adv, 3),
+                "minutes": w, "hit": bool(fav >= float(target_pct))}
+    except Exception as e:
+        _log("_intraday_sample_judge", e)
+        return None
+
+
+def intraday_sample_baseline(dom, kind, target_pct, window=None):
+    """当日同方向的「随便挑一分钟」基准率。
+
+    ★ 这是整个面板最不能省的一个数：只报「买点达标率 68%」没有意义 ——
+      单边上涨的一天里随便挑一分钟都有 60%。只有**同一天、同一方向、同一判据**下
+      「随便挑」的水平，才能说明这个买点本身贡献了多少。
+    ★ 判据完全复用 `_intraday_sample_judge`，不另写一套 —— 否则基准和样本
+      就不是在比同一件事了。
+    """
+    out = {"n": 0, "hit": 0, "rate": None}
+    try:
+        w = int(window or INTRADAY_SAMPLE_WINDOW)
+        lo_t, hi_t = (INTRADAY_BUY_WINDOW if kind == 'buy' else INTRADAY_SELL_WINDOW)
+        times = dom['Time'].tolist()
+        for i in range(len(dom) - w):
+            t = str(times[i])
+            if not (lo_t <= t <= hi_t):
+                continue
+            j = _intraday_sample_judge(dom, i, kind, target_pct, w)
+            if j is None:
+                continue
+            out["n"] += 1
+            if j["hit"]:
+                out["hit"] += 1
+        if out["n"]:
+            out["rate"] = round(out["hit"] / out["n"] * 100.0, 2)
+    except Exception as e:
+        _log("intraday_sample_baseline", e)
+    return out
+
+
+def _intraday_market_change_map(df_idx_min, prev_close):
+    """把上证分时转成「该分钟的上证涨跌%」查表字典。取不到返回 None。
+
+    ★ 为什么不能直接用 `get_market_status()`：那是个**实时快照**。盘后补采时它给的
+      是收盘值，套到 10:30 那个点上，置信度里「大盘暴跌 ⇒ 买点判低」这条就会判错 ——
+      而 `intraday_point_confidence` 正是本层要验证的对象，它的输入必须与当时一致。
+    """
+    try:
+        if df_idx_min is None or len(df_idx_min) == 0:
+            return None
+        pc = float(prev_close or 0.0)
+        if not (pc > 0):
+            return None
+        return {str(t): round((float(p) / pc - 1.0) * 100.0, 3)
+                for t, p in zip(df_idx_min['Time'].tolist(), df_idx_min['Price'].tolist())}
+    except Exception as e:
+        _log("_intraday_market_change_map", e)
+        return None
+
+
+def _index_prev_close(index_symbol, date_s):
+    """取该指数在 date_s **之前**最近一个交易日的收盘价。取不到返回 None。
+
+    ★ 必须严格早于 date_s：`_get_index_history` 在盘后会包含**今天**，
+      拿今天收盘当昨收 ⇒ 涨跌永远算成 0，「大盘暴跌」这条永远不触发。
+    """
+    try:
+        df = _get_index_history(index_symbol, limit=60)
+        if df is None or len(df) == 0 or 'Date' not in df.columns:
+            return None
+        d = str(date_s or "")[:10]
+        idx = [i for i, x in enumerate(df['Date'].tolist()) if str(x)[:10] < d]
+        if not idx:
+            return None
+        c = float(df['Close'].iloc[idx[-1]])
+        return c if c > 0 else None
+    except Exception as e:
+        _log("_index_prev_close", e)
+        return None
+
+
+def intraday_samples_from_df(code, name, df_minute, date_s, market_change_map=None,
+                             market_change_fallback=0.0, recorded_at=None):
+    """把一只票**某一天**的分时转成一组样本。返回 (rows, report)。
+
+    本层唯一的「样本构造函数」：信号、特征、判定、基准全在这里对齐，不另开第二条路。
+    """
+    codes6 = str(code).zfill(6)
+    rep = {"code": codes6, "signals": 0, "kept": 0, "skipped_tail": 0,
+           "target_pct": None, "range_pct": None, "baseline": {}, "err": ""}
+    try:
+        if df_minute is None or len(df_minute) == 0:
+            rep["err"] = "没有分时"
+            return [], rep
+        df = df_minute[df_minute['Time'] <= "1500"].copy()
+        if len(df) < INTRADAY_SAMPLE_MIN_BARS:
+            rep["err"] = "分时不足 %d 根" % INTRADAY_SAMPLE_MIN_BARS
+            return [], rep
+        df = df.reset_index(drop=True)      # ★ 位置必须连续：行号就是「第几分钟」
+        sigs = intraday_live_signals(df)
+        rep["signals"] = len(sigs)
+        if not sigs:
+            rep["err"] = "当日没有会发出的买卖点"
+            return [], rep
+        # 尺子：用当日全景（样本与基准同一把尺子 ⇒ 差额不受影响；见文件头注释）
+        hi = float(df['Price'].max()); lo = float(df['Price'].min())
+        rng_pct = (hi - lo) / max(lo, 0.001) * 100.0
+        target = _intraday_sample_target_pct(rng_pct)
+        rep["target_pct"] = target
+        rep["range_pct"] = round(rng_pct, 3)
+        base = {"buy": intraday_sample_baseline(df, 'buy', target),
+                "sell": intraday_sample_baseline(df, 'sell', target)}
+        rep["baseline"] = base
+        stamp = recorded_at or now_cn_str()
+        rows = []
+        for s in sigs:
+            kind = s.get("kind"); pos = int(s.get("pos") or 0)
+            judge = _intraday_sample_judge(df, pos, kind, target)
+            if judge is None:
+                rep["skipped_tail"] += 1
+                continue
+            sub = df.iloc[:pos + 1]
+            price = float(df['Price'].iloc[pos])
+            avg = float(df['AvgPrice'].iloc[pos]) if 'AvgPrice' in df.columns else 0.0
+            t = str(df['Time'].iloc[pos])
+            dev = float(s.get("dev") or 0.0)
+            div = _intraday_divergence(sub)
+            if market_change_map:
+                mc = float(market_change_map.get(t, market_change_fallback) or 0.0)
+            else:
+                mc = float(market_change_fallback or 0.0)
+            conf = intraday_point_confidence(kind, price, avg, dev, div, mc,
+                                            bool(s.get("macd_ok")))
+            if avg > 0:
+                # 方案判定与 compute_intraday_signals 里用的是同一个不等式，不另立口径
+                if kind == 'buy':
+                    scheme = 'A' if price < avg * (1 - dev * 0.7) else 'B'
+                else:
+                    scheme = 'A' if price > avg * (1 + dev * 0.7) else 'B'
+            else:
+                scheme = ''
+            # ★ ctx 必须 100% 因果：任何用到该分钟之后数据的字段都不许进这里 ——
+            #   测试里有一条「把该点之后的价格整体放大，ctx 必须逐字不变」的守卫。
+            #   「达标幅度」那把尺子是唯一用当日全景的东西，它只在行级（target_pct）。
+            ctx = {"conf": conf,
+                   "price": round(price, 3), "avg": round(avg, 3),
+                   "deviation": round(dev, 5),
+                   "dev_mult": _intraday_sample_dev_mult(price, avg, dev),
+                   "pos_pct": round(_intraday_sample_pos_pct(sub), 4),
+                   "vol_ratio": _intraday_sample_vol_ratio(df, pos),
+                   "scheme": scheme,
+                   "divergence": div.strip(),
+                   "time_slot": _intraday_sample_time_slot(t),
+                   "market_change": round(mc, 3)}
+            rows.append({"kind": kind, "code": codes6, "name": name or codes6,
+                         "date": str(date_s)[:10], "time": t, "pos": pos,
+                         "source": "intraday", "recorded_at": stamp,
+                         "target_pct": target, "ctx": ctx,
+                         "dims": _intraday_sample_dims(ctx),
+                         "outcome": judge, "baseline_day": base.get(kind)})
+        rep["kept"] = len(rows)
+        if not rows:
+            rep["err"] = "所有点的观察窗口都没走完"
+        return rows, rep
+    except Exception as e:
+        _log("intraday_samples_from_df/%s" % codes6, e)
+        rep["err"] = "%s: %s" % (type(e).__name__, str(e)[:120])
+        return [], rep
+
+
+def _minute_session_date(code="sh000001"):
+    """该分时对应的交易日（YYYY-MM-DD）。取不到返回空串。
+
+    ★ 为什么必须问接口：分时只给「最近一个交易日」，周末/假日跑会拿到上一交易日的
+      数据。样本的 date 一旦按 `now_cn()` 猜，就会把周五的分时段标成周六，
+      按日期切样本内外时直接错位 —— 而且错得静默。
+    """
+    try:
+        raw, ds, _errs = _fetch_minute_raw_dated(code)
+        return ds if raw else ""
+    except Exception as e:
+        _log("_minute_session_date", e)
+        return ""
+
+
+def intraday_samples_harvest(codes=None, date=None, fetch=None, limit=0,
+                             progress_cb=None, market_index="sh000001",
+                             recorded_at=None):
+    """采集日内样本（当天分时）。返回 (rows, report)。
+
+    ★ 什么时候跑：**盘后**（当天分时还读得到的时候）。盘中跑只会采到「观察窗口已走完」
+      的那部分点；因为信号定义是因果的、与采集时刻无关，盘后再跑一次就把当天补全了（幂等）。
+    ★ `date` 不给就自己问接口要交易日；问不到才退回 now_cn，并在报告里标 inferred。
+    """
+    fetch = fetch or get_minute_data
+    rec = {"codes": 0, "ok": 0, "no_data": 0, "no_signal": 0,
+           "samples": 0, "skipped_tail": 0, "date": "", "date_inferred": False,
+           "index_ok": False, "baseline": {}, "fail_examples": []}
+
+    uni = []
+    _seen = set()
+    for c in (codes or []):
+        s = str(c or "").strip()
+        if not s:
+            continue
+        s6 = s.zfill(6)
+        if s6 not in _seen:
+            _seen.add(s6)
+            uni.append(s6)
+    if limit and int(limit) > 0:
+        uni = uni[:int(limit)]
+    rec["codes"] = len(uni)
+    if not uni:
+        return [], rec
+
+    date_s = str(date or "")[:10]
+    if not date_s:
+        date_s = _minute_session_date(market_index)
+        if not date_s:
+            date_s = now_cn().strftime("%Y-%m-%d")
+            rec["date_inferred"] = True
+    rec["date"] = date_s
+
+    # 大盘分时 → 逐分钟的涨跌%（拿不到就退回实时快照，并如实标注 index_ok=False）
+    mc_map = None
+    mc_fallback = 0.0
+    try:
+        df_idx = fetch(market_index) if market_index else None
+        if df_idx is not None and len(df_idx) > 0:
+            mc_map = _intraday_market_change_map(df_idx, _index_prev_close(market_index, date_s))
+            rec["index_ok"] = mc_map is not None
+    except Exception as e:
+        _log("intraday_samples_harvest/index", e)
+    if mc_map is None:
+        try:
+            mc_fallback = float(get_market_status() or 0.0)
+        except Exception as e:
+            _log("intraday_samples_harvest/market_status", e)
+            mc_fallback = 0.0
+
+    rows = []
+    total = len(uni)
+    for n, c in enumerate(uni, 1):
+        try:
+            df = fetch(c)
+        except Exception as e:
+            _log("intraday_samples_harvest/%s" % c, e)
+            df = None
+        if df is None or len(df) == 0:
+            rec["no_data"] += 1
+            if len(rec["fail_examples"]) < 8:
+                rec["fail_examples"].append(c)
+        else:
+            one, orep = intraday_samples_from_df(
+                c, "", df, date_s, market_change_map=mc_map,
+                market_change_fallback=mc_fallback, recorded_at=recorded_at)
+            if orep.get("err"):
+                rec["no_signal"] += 1
+            else:
+                rec["ok"] += 1
+                rec["skipped_tail"] += int(orep.get("skipped_tail") or 0)
+                rows.extend(one)
+                for k, v in (orep.get("baseline") or {}).items():
+                    b = rec["baseline"].setdefault(k, {"n": 0, "hit": 0})
+                    b["n"] += int(v.get("n") or 0)
+                    b["hit"] += int(v.get("hit") or 0)
+        if progress_cb:
+            try:
+                progress_cb(n, total, c)
+            except Exception as e:
+                _log("intraday_samples_harvest/progress", e)
+    for k, v in rec["baseline"].items():
+        v["rate"] = round(v["hit"] / v["n"] * 100.0, 2) if v["n"] else None
+    rec["samples"] = len(rows)
+    return rows, rec
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _load_intraday_samples_parsed(p, stamp):
+    """解压 + 解析 JSONL.gz。`stamp` 只是缓存键（文件 mtime+size），不参与解析。
+
+    ★ 参数不加下划线前缀（Streamlit 会把下划线参数排除出缓存键 ⇒ 永读旧文件）。
+    ★ 异常让它抛出去，由外层兜住：@st.cache_data 不缓存抛异常的调用，
+      所以损坏的文件不会被缓存成「空库」而长期显现为「没有样本」。
+    """
+    out = {}
+    with gzip.open(p, "rt", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception as e:
+                _log("load_intraday_samples/line", e)
+                continue
+            if not isinstance(row, dict) or not row.get("code") or not row.get("date"):
+                continue
+            out[_intraday_sample_key(row)] = row
+    return out
+
+
+def load_intraday_samples(path=None):
+    """读日内样本库，返回 {key: row}。文件不存在返回空（首次运行是正常情况，不是错误）。"""
+    p = path or INTRADAY_SAMPLE_FILE
+    if not os.path.exists(p):
+        return {}
+    try:
+        _st_ = os.stat(p)
+        stamp = "%d:%d" % (_st_.st_mtime_ns, _st_.st_size)
+    except OSError as e:
+        _log("load_intraday_samples/stat", e)
+        stamp = "unknown"
+    try:
+        return _load_intraday_samples_parsed(p, stamp)
+    except Exception as e:
+        _log("load_intraday_samples", e)
+        return {}
+
+
+def save_intraday_samples(rows, path=None):
+    """写日内样本库。rows 可以是 dict 或 list。返回实际写入行数。"""
+    p = path or INTRADAY_SAMPLE_FILE
+    items = list(rows.values()) if isinstance(rows, dict) else list(rows)
+    try:
+        tmp = p + ".tmp"
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            for row in items:
+                f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        os.replace(tmp, p)
+        return len(items)
+    except Exception as e:
+        _log("save_intraday_samples", e)
+        return 0
+
+
+def intraday_samples_merge(old, new):
+    """并入新采样本。返回 (merged, added, updated, trimmed)。
+
+    ★ 去重键带方向与分钟：一只票同一天会有好几个买卖点，不能像波段样本那样一天一条。
+      同一键重采结果必然相同（信号与判定完全由分时序列决定）⇒ 幂等。
+    """
+    merged = dict(old or {})
+    added = updated = 0
+    for row in (new or []):
+        k = _intraday_sample_key(row)
+        if merged.get(k) is None:
+            merged[k] = row
+            added += 1
+        else:
+            # 只有「新的这条是已判定的」才覆盖 —— 别让未判定的顶掉已判定的
+            if (row.get("outcome") or {}).get("judged"):
+                merged[k] = row
+                updated += 1
+    trimmed = 0
+    if len(merged) > INTRADAY_SAMPLE_MAX_ROWS:
+        ordered = sorted(merged.items(), key=lambda kv: str((kv[1] or {}).get("date") or ""))
+        over = len(merged) - INTRADAY_SAMPLE_MAX_ROWS
+        for k, _v in ordered[:over]:
+            merged.pop(k, None)
+            trimmed += 1
+    return merged, added, updated, trimmed
+
+
+def _intraday_sample_usable(row):
+    """能不能进统计：必须已判定、且有 outcome。未判定的行**既不进分子也不进分母**。"""
+    r = row or {}
+    o = r.get("outcome") or {}
+    return bool(o.get("judged")) and o.get("hit") is not None
+
+
+def intraday_samples_range(rows):
+    """覆盖的日期区间（面板上要如实显示「这份样本库有多长」，否则小样本会被误读）。"""
+    ds = sorted({str((r or {}).get("date") or "")[:10]
+                 for r in (rows or []) if (r or {}).get("date")})
+    return {"n": len(ds), "min": ds[0] if ds else "", "max": ds[-1] if ds else ""}
+
+
+def intraday_sample_lift(rows, split_ratio=0.7):
+    """核心报表：每个归因分桶的达标率，以及**与该日基准率的差**。
+
+    返回 {"n":…, "hit_rate":…, "baseline_rate":…, "lift":…, "days":…, "rows":[…]}
+
+    ★ 基准率取法：每条样本行里都冗余存了它当日的基准（`baseline_day`），这里按
+      「这些样本覆盖的那些天」加权平均 —— 等价于「同一批日子上随便挑一分钟」，
+      而不是全局一个常数。否则拿牛市的日子跟震荡的日子放在一起比，差额没意义。
+    ★ 样本内外按日期 70/30 切：桶的差额只有在**样本外仍保持同号**才算站得住。
+    """
+    use = [r for r in (rows or []) if _intraday_sample_usable(r)]
+    out = {"n": len(use), "hit_rate": None, "baseline_rate": None, "lift": None,
+           "days": intraday_samples_range(use), "split_ratio": split_ratio, "rows": []}
+    if not use:
+        return out
+
+    def _base_avg(items):
+        vals = [float((r.get("baseline_day") or {}).get("rate"))
+                for r in items if (r.get("baseline_day") or {}).get("n")]
+        return round(sum(vals) / len(vals), 2) if vals else None
+
+    hits = sum(1 for r in use if (r.get("outcome") or {}).get("hit"))
+    out["hit_rate"] = round(hits / len(use) * 100.0, 2)
+    base_all = _base_avg(use)
+    out["baseline_rate"] = base_all
+    if base_all is not None:
+        out["lift"] = round(out["hit_rate"] - base_all, 2)
+
+    dates = sorted({str(r.get("date") or "")[:10] for r in use})
+    cut = int(len(dates) * float(split_ratio or 0.7))
+    is_dates = set(dates[:cut])
+    raw_rows = []
+    for dim in INTRADAY_SAMPLE_DIMS:
+        groups = {}
+        for r in use:
+            name = ((r.get("dims") or {}) or {}).get(dim)
+            if name:
+                groups.setdefault(name, []).append(r)
+        for name in sorted(groups.keys()):
+            items = groups[name]
+            h = sum(1 for r in items if (r.get("outcome") or {}).get("hit"))
+            rate = round(h / len(items) * 100.0, 2)
+            b = _base_avg(items)
+            ins = [r for r in items if str(r.get("date") or "")[:10] in is_dates]
+            oos = [r for r in items if str(r.get("date") or "")[:10] not in is_dates]
+            ins_rate = (round(sum(1 for r in ins if (r.get("outcome") or {}).get("hit"))
+                              / len(ins) * 100.0, 2) if ins else None)
+            oos_rate = (round(sum(1 for r in oos if (r.get("outcome") or {}).get("hit"))
+                              / len(oos) * 100.0, 2) if oos else None)
+            ins_b, oos_b = _base_avg(ins), _base_avg(oos)
+            enough = len(items) >= REVIEW_MIN_SAMPLE
+            stable = None
+            if (enough and ins_rate is not None and oos_rate is not None
+                    and ins_b is not None and oos_b is not None):
+                stable = bool((ins_rate - ins_b > 0) == (oos_rate - oos_b > 0))
+            raw_rows.append({
+                "dim": dim, "bucket": name, "n": len(items), "enough": enough,
+                "hit_rate": rate, "baseline_rate": b,
+                "lift": (round(rate - b, 2) if b is not None else None),
+                "in_sample_rate": ins_rate, "oos_rate": oos_rate,
+                "oos_n": len(oos), "stable": stable,
+            })
+    _order = {d: i for i, d in enumerate(INTRADAY_SAMPLE_DIMS)}
+    raw_rows.sort(key=lambda d: (d["lift"] is None, -(d["lift"] or 0.0)))
+    raw_rows.sort(key=lambda d: _order.get(d["dim"], 99))
+    out["rows"] = raw_rows
+    return out
+
+
+def _intraday_sample_codes():
+    """采集范围：自选股 ∪ 波段记忆里的票（去重保序）。"""
+    out = []
+    seen = set()
+    try:
+        for c in (load_watchlist() or []):
+            s = str(c or "").strip().zfill(6)
+            if s and s not in seen:
+                seen.add(s); out.append(s)
+    except Exception as e:
+        _log("_intraday_sample_codes/watchlist", e)
+    try:
+        mem = load_band_memory()
+        for c in (mem.get('stocks') or {}).keys():
+            s = str(c or "").strip().zfill(6)
+            if s and s not in seen:
+                seen.add(s); out.append(s)
+    except Exception as e:
+        _log("_intraday_sample_codes/memory", e)
+    return out
+
+
+def _intraday_sample_lift_text(d):
+    """把差额说成一句人话 —— 面板上不能只有数字。"""
+    if d.get("lift") is None:
+        return "—"
+    v = float(d["lift"])
+    if abs(v) < 2.0:
+        return "≈ 无差别"
+    return ("跑赢 %+.1f 个点" % v) if v > 0 else ("跑输 %+.1f 个点" % v)
+
+
+def intraday_sample_ui():
+    """📈 日内买卖点有效性验证：把「这个买点/卖点准不准」变成可统计的诚实报表。
+
+    ★ 本面板只做统计，**不改任何参数**，也不产出推荐名单。理由同策略复盘：
+      样本量不够时调参就是噪音拟合。
+    ★ 渲染路径上**不发网络请求**：只有点「采集」按钮才会取分时。
+    """
+    st.markdown("---")
+    st.header("📈 日内买卖点有效性验证")
+    st.caption("这一块验证的是「做T的**买卖点准不准**」（分时级），"
+               "与上面「逻辑有效性验证」验的「波段**入场条件**值不值得买」（日线级）是两件事。")
+    st.caption("⚠️ 只统计、**不改任何参数**。判据：该点之后 "
+               f"**{INTRADAY_SAMPLE_WINDOW} 分钟**内，有利方向是否走够 "
+               f"**max({INTRADAY_SAMPLE_TARGET_MIN_PCT:.2f}%, 当日振幅×"
+               f"{INTRADAY_SAMPLE_TARGET_RANGE:.2f})**；分桶样本少于 "
+               f"{REVIEW_MIN_SAMPLE} 只标「样本不足」，不下结论。")
+    st.caption("🔬 口径：第 i 分钟算不算信号，只用 `df[:i+1]` 判（**因果**，不偷看后面的"
+               "当日高低点）；每个特征也只用到该分钟为止。达标幅度用的是当天全景的振幅 —— "
+               "它是「尺子」不是「买入依据」，而且基准率用同一把尺子，所以**差额不受影响**。")
+
+    rows_map = load_intraday_samples()
+    rows = list(rows_map.values())
+    rng = intraday_samples_range(rows)
+
+    _c1, _c2 = st.columns([1, 3])
+    with _c1:
+        _do = long_button("🧲 采集今日分时样本", key="intraday_sample_harvest",
+                          use_container_width=True)
+    with _c2:
+        st.caption("采集范围 = **自选股 ∪ 波段记忆**里的票。"
+                   "⚠️ **盘后**跑（当天分时还读得到时）才采得全：盘中跑只会采到观察窗口"
+                   "已走完的那部分点，收盘后再跑一次即可补全（重复采集是幂等的）。"
+                   "分时数据只有当天，所以这份样本库**没法历史回填**，只能一天天攒。")
+    if _do:
+        _codes = _intraday_sample_codes()
+        if not _codes:
+            st.warning("采集范围是空的：先在左侧加自选股，或让波段记忆里有点票。")
+        else:
+            _prog = st.progress(0.0, text="准备中…")
+
+            def _cb(done, total, code):
+                _prog.progress(min(done / max(total, 1), 1.0),
+                               text="取分时 %d/%d（%s）" % (done, total, code))
+            with st.spinner("正在按当天分时构造样本…"):
+                _new, _rep = intraday_samples_harvest(_codes, progress_cb=_cb)
+                _merged, _a, _u, _t = intraday_samples_merge(rows_map, _new)
+                _n_rows = save_intraday_samples(_merged)
+            _prog.empty()
+            st.success("采集完成：日期 %s%s｜取到分时 %d/%d 只｜新样本 %d 条"
+                       "（覆盖 %d 条）｜跳过窗口未走完的点 %d 个｜库内共 %d 条"
+                       % (_rep.get('date'),
+                          "（**日期是猜的** —— 没问到交易日）" if _rep.get('date_inferred') else "",
+                          _rep.get('ok'), _rep.get('codes'), _a, _u,
+                          _rep.get('skipped_tail'), _n_rows))
+            if _rep.get('fail_examples'):
+                st.caption("取不到分时的（最多列 8 个）：" + "、".join(_rep['fail_examples']))
+            if not _rep.get('index_ok'):
+                st.caption("⚠️ 这次没拿到上证分时，逐分钟大盘涨跌退回了**实时快照** —— "
+                           "置信度里的「大盘暴跌 ⇒ 买点判低」这条会用收盘值，"
+                           "与你盘中看到的口径不完全一致。")
+            st.rerun()
+
+    if not rows:
+        st.info("样本库还是空的。**这是正常的** —— 分时数据只有当天，没法回填，"
+                "只能从今天开始一天天攒。点上面「🧲 采集今日分时样本」采今天这一批。")
+        return
+
+    st.caption("📥 库内 %d 条样本｜覆盖 **%d 个交易日**（%s → %s）"
+               "　·　样本库文件 `intraday_samples.jsonl.gz`（本地，不提交）"
+               % (len(rows), rng['n'], rng['min'], rng['max']))
+
+    st_ = intraday_sample_lift(rows)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("已判定样本", "%d 条" % st_['n'])
+    m2.metric("达标率", "—" if st_['hit_rate'] is None else "%.1f%%" % st_['hit_rate'])
+    m3.metric("基准率（同日随便挑一分钟）",
+              "—" if st_['baseline_rate'] is None else "%.1f%%" % st_['baseline_rate'])
+    m4.metric("超额", "—" if st_['lift'] is None else "%+.1f 个点" % st_['lift'])
+    m5.metric("覆盖交易日", "%d 天" % st_['days']['n'])
+    if st_['lift'] is not None and abs(st_['lift']) < 2.0:
+        st.warning("整体达标率与「随便挑一分钟」几乎没有差别 —— "
+                   "这说明**目前的买卖点还没有证据**（也可能是样本太少）。"
+                   "别据此下任何结论，继续攒。")
+    elif st_['lift'] is not None and st_['lift'] < 0:
+        st.error("整体达标率**低于**随机时点 —— 这比「没有信号」更值得注意。"
+                 "先看下面分桶，确认是不是某个特定场景在拖后腿（例如只在一个时段发信号）。")
+
+    st.markdown("#### 📊 分桶：谁在真正贡献")
+    st.caption("「差额」= 该桶达标率 − **这些样本所在那些天**的基准率。"
+               "只看绝对达标率会自欺：单边上涨的一天里随便挑一分钟都「达标」。"
+               "「样本外」一列同号才算站得住（只有样本量够的桶才给结论）。")
+    _disp = []
+    for d in st_['rows']:
+        _disp.append({
+            "维度": d["dim"], "分桶": d["bucket"], "样本": d["n"],
+            "达标率": "—" if d["hit_rate"] is None else "%.1f%%" % d["hit_rate"],
+            "基准率": "—" if d["baseline_rate"] is None else "%.1f%%" % d["baseline_rate"],
+            "差额": _intraday_sample_lift_text(d),
+            "样本外": "—" if d["oos_rate"] is None else "%.1f%%" % d["oos_rate"],
+            "结论": ("样本不足" if not d["enough"]
+                     else ("样本外仍同号 ✅" if d["stable"] else "样本外反号 ⚠️")),
+        })
+    if _disp:
+        st.dataframe(_disp, use_container_width=True, hide_index=True)
+    else:
+        st.caption("还没有可归因的分桶。")
+
+    st.caption("🧭 怎么用这份表：先找**样本量够、样本外仍同号、差额为正**的桶 —— "
+               "那些才是真的在贡献超额的条件；差额为负的桶说明那个场景下不该发信号。"
+               "**在样本量够之前，这张表只是记录，不是结论。**")
+
 def band_review_ui():
 
     """📊 策略复盘：把「选了 → 结案 → 归因」变成可统计的看板。
@@ -7735,6 +8606,14 @@ try:
         except Exception as e:
             _log("band_sample_ui", e)
             st.warning("逻辑验证面板渲染出错（已拦截，不影响其他功能）")
+            with st.expander("查看错误详情"):
+                st.code(traceback.format_exc(), language="python")
+        # ★ 日内买卖点那一层的证据（2026-09-23）：与上面的波段样本库并列，但验的是分时级。
+        try:
+            intraday_sample_ui()
+        except Exception as e:
+            _log("intraday_sample_ui", e)
+            st.warning("日内买卖点验证面板渲染出错（已拦截，不影响其他功能）")
             with st.expander("查看错误详情"):
                 st.code(traceback.format_exc(), language="python")
 
