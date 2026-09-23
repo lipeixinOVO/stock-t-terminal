@@ -493,9 +493,80 @@ GITHUB_WHITELIST_PATH = "notify_whitelist.json"
 NOTIFY_WHITELIST_MAX = 20       # 上限：白名单不扩监控范围，没必要太长
 
 
+# ================= 3.2b ★ 日内买卖点「置信度」与推送门槛（2026-09-22 用户要求）=====
+# 用户口径：「只给我微信推送置信度高的买卖点」＋门槛要能自己调（下拉，默认「高」）。
+# ⇒ 置信度**只此一份**：页面展示、网页端巡检、Actions 巡检三处共用
+#   `intraday_point_confidence`，绝不再各写一份 if 链 ——
+#   分时买卖点偏离系数 0.4/0.5 漂移那次就是这么漂出去的。
+NOTIFY_CONF_LEVELS = ("高", "中", "低")     # 下拉顺序：从严到松
+NOTIFY_MIN_CONF_DEFAULT = "高"              # 默认门槛：只推「高」（用户选定）
+NOTIFY_CONF_ORDER = {"高": 2, "中": 1, "低": 0}
+
+
+def intraday_point_confidence(kind, price, avg_price, deviation,
+                              divergence_info="", market_change=0.0, macd_ok=False):
+    """给一个日内买卖点打置信度：高 / 中 / 低。
+
+    kind：'buy' 买点 / 'sell' 卖点；avg_price：当日分时均价；
+    macd_ok：该点 MACD 是否同向拐头；divergence_info：`_intraday_divergence` 的返回串。
+
+    ★ 大盘暴跌（上证 < -1.0%）时**买点直接判「低」**：这种环境下低吸胜率最差。
+      卖点**刻意不受它影响** —— 暴跌里高抛恰恰是对的，一刀切会把对的信号也砍掉。
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
+    try:
+        if kind == 'buy' and float(market_change or 0.0) < -1.0:
+            return "低"
+        avg = float(avg_price or 0.0)
+        if avg <= 0:
+            return "低"
+        price = float(price)
+        dev = float(deviation or 0.0)
+        tag = "底背离" if kind == 'buy' else "顶背离"
+        if kind == 'buy':
+            dev_pct = (avg - price) / avg
+            scheme_a = price < avg * (1 - dev * 0.7)
+        else:
+            dev_pct = (price - avg) / avg
+            scheme_a = price > avg * (1 + dev * 0.7)
+        if dev_pct > dev * 1.5 or tag in (divergence_info or ""):
+            return "高"
+        if dev_pct > dev * 0.8 or (scheme_a and macd_ok):
+            return "中"
+        return "低"
+    except Exception as e:
+        _log("intraday_point_confidence", e)
+        return "低"
+
+
+def notify_conf_threshold(w):
+    """取白名单里那份「最低推送置信度」。字段缺失/写歪 → 默认「高」。
+
+    ★ 兜底方向刻意偏严：字段坏了只会**少推**，绝不会因为读歪而把门槛降到「低」。
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
+    v = str(notify_whitelist_normalize(w).get("min_conf") or "").strip()
+    return v if v in NOTIFY_CONF_LEVELS else NOTIFY_MIN_CONF_DEFAULT
+
+
+def notify_conf_allowed(conf, threshold):
+    """置信度 `conf` 够不够 `threshold` 这道门槛。
+
+    未知/空的置信度一律**不放行**（-1 低于任何一档）——宁可少推，也不瞎推。
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
+    _th = threshold if threshold in NOTIFY_CONF_LEVELS else NOTIFY_MIN_CONF_DEFAULT
+    return (NOTIFY_CONF_ORDER.get(str(conf or "").strip(), -1)
+            >= NOTIFY_CONF_ORDER.get(_th, 2))
+
+
 def notify_whitelist_empty():
-    """空名单。**这就是"谁都不自动发"** —— 默认状态，也是读不出来时的兜底。"""
-    return {"updated_at": "", "items": []}
+    """空名单。**这就是"谁都不自动发"** —— 默认状态，也是读不出来时的兜底。
+
+    ★ `min_conf`（最低推送置信度）与名单**同存一份文件**（用户要求跟白名单一起存），
+      缺字段时按默认「高」处理 —— 老文件读出来照旧能用，不会因为新字段把名单读空。
+    """
+    return {"updated_at": "", "items": [], "min_conf": NOTIFY_MIN_CONF_DEFAULT}
 
 
 def notify_whitelist_normalize(w):
@@ -503,12 +574,16 @@ def notify_whitelist_normalize(w):
 
     ★ 超上限时**截断**而不是整份丢掉：整份丢掉会让用户以为"我明明勾了却保存不上"。
     ★ `name` 只用于界面显示，丢了不影响判定（判定只认 code，见 notify_whitelist_has）。
+    ★ `min_conf` 是**推送门槛**，不是名单的一部分：写歪了只落回默认「高」，
+      绝不因为一个坏字段就把整份名单丢掉（那等于"我勾了却不生效"）。
     ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
     """
     out = notify_whitelist_empty()
     if not isinstance(w, dict):
         return out
     out["updated_at"] = str(w.get("updated_at") or "")
+    _mc = str(w.get("min_conf") or "").strip()
+    out["min_conf"] = _mc if _mc in NOTIFY_CONF_LEVELS else NOTIFY_MIN_CONF_DEFAULT
     seen, items = set(), []
     for it in (w.get("items") or []):
         if not isinstance(it, dict):
@@ -687,6 +762,9 @@ def notify_whitelist_ui(mem):
     codes = notify_whitelist_codes(nw)
     st.caption("当前名单 **%d** 只：%s"
                % (len(codes), "、".join(sorted(codes)) if codes else "（空 —— 谁都不自动发）"))
+    st.caption("当前**最低推送置信度「%s」**（在下面调）—— 够不上的日内买卖点不会发微信，"
+               "但页面上的买卖点标注照旧，方便你自己判断。"
+               % notify_conf_threshold(nw))
     _pool = notify_watch_pool(mem)
     _labels = {f"{p['code']} {p['name']}（{p['src']}·{p['status']}）": p['code'] for p in _pool}
     _pool_codes = {p['code'] for p in _pool}
@@ -700,6 +778,13 @@ def notify_whitelist_ui(mem):
             "补充代码（逗号分隔）——注意：不在波段记忆/自选里的票，巡检本来就不会盯它，"
             "自动推送无从触发；想盯它请先加进「🧠 波段记忆」",
             value="", key="notify_wl_extra")
+        _th = st.selectbox(
+            "最低推送置信度（只管微信推送，不影响页面上的买卖点标注）",
+            list(NOTIFY_CONF_LEVELS),
+            index=list(NOTIFY_CONF_LEVELS).index(notify_conf_threshold(nw)),
+            key="notify_wl_conf",
+            help="「高」＝只有置信度高的日内买卖点才发微信；「中」＝高+中；"
+                 "「低」＝不过滤（等于关掉这道闸）。")
         _sub = st.form_submit_button("💾 保存白名单并同步云端")
     if not _sub:
         return
@@ -726,12 +811,14 @@ def notify_whitelist_ui(mem):
             _log("notify_whitelist_ui/get_stock_name", e)
             _nm = _c
         _by_code[_c] = {"code": _c, "name": _nm, "added_at": _now}
-    _new = notify_whitelist_set({"updated_at": _now, "items": list(_by_code.values())})
+    _new = notify_whitelist_set({"updated_at": _now, "items": list(_by_code.values()),
+                                 "min_conf": _th})
     _ok, _m = notify_whitelist_push(_new)
     if _bad:
         st.warning("这些不是 6 位代码，已忽略：" + "、".join(_bad))
     if _ok:
-        st.success(f"✅ 白名单已保存并同步云端（{len(notify_whitelist_codes(_new))} 只）")
+        st.success(f"✅ 白名单已保存并同步云端（{len(notify_whitelist_codes(_new))} 只，"
+                   f"最低置信度「{notify_conf_threshold(_new)}」）")
     else:
         st.warning(f"⚠️ 本地已保存，但**同步云端失败**：{_m} —— "
                    "云端巡检读的是仓库里那份，不同步就等于云端不会自动发。")
@@ -844,6 +931,8 @@ def _notify_row(c, exhausted, already, gkey, idx):
     _col, _act = st.columns([3.4, 1.0])
     with _col:
         _bits = []
+        if c.get('conf'):
+            _bits.append(f"置信度 {c['conf']}")
         if c.get('price'):
             _bits.append(f"现价 {_fmt_price(c['price'])}")
         if c.get('pivot'):
@@ -893,6 +982,9 @@ def notify_center_ui(mem):
     st.caption("额度：" + notify_budget_line(_b))
     st.caption("✅ 白名单里的票出现信号时**自动发**；其余的不会自己发，"
                "只列在下面等你点。18:00 日报照旧（它占预留的那一条）。")
+    st.caption("日内买卖点按**最低置信度「%s」**过滤 —— 够不上的既不发、也不进候选"
+               "（在下面的白名单板块里调）。"
+               % notify_conf_threshold(notify_whitelist_get()))
     notify_whitelist_ui(mem)
     st.markdown("---")
     st.markdown("**手动推送**（没进白名单的票，你点哪条发哪条）")
@@ -1867,7 +1959,10 @@ def compute_intraday_signals(df_minute, deviation):
         return None
 
 def _intraday_divergence(df_min):
-    """日内 MACD 背离提示（仅用于主图展示，不参与买卖点判定）。"""
+    """日内 MACD 背离提示（参与置信度判定，也用于主图展示）。
+
+    ⚠️ 本函数在 `ai_stock_terminal.py` 与 `watcher.py` 里**必须逐字同源**。
+    """
     info = ""
     try:
         low_idx = df_min['Price'].idxmin()
@@ -2338,7 +2433,10 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change, pr
             best_buy_price = float(best_row['Price'])
             dev_pct = (best_row['AvgPrice'] - best_row['Price']) / best_row['AvgPrice'] if best_row['AvgPrice'] > 0 else 0
             is_scheme_a = bool((best_row['Price'] < best_row['AvgPrice'] * (1 - deviation * 0.7)) and (best_row['MACD_UP'] if 'MACD_UP' in best_row else False))
-            conf = "低" if market_change < -1.0 else ("高" if dev_pct > deviation * 1.5 or "底背离" in divergence_info else ("中" if dev_pct > deviation * 0.8 or is_scheme_a else "低"))
+            # ★ 置信度只走共用函数（2026-09-22）：页面展示与两处巡检推送必须同一个口径。
+            conf = intraday_point_confidence('buy', best_row['Price'], best_row['AvgPrice'], deviation,
+                                             divergence_info, market_change,
+                                             bool(best_row['MACD_UP']) if 'MACD_UP' in best_row else False)
             b_type = "正T低吸" if direction == "正T" else "反T回补"
             reason = "回踩均价线" if is_scheme_a else "接近日内低点止跌"
             best_buy = f"{time_fmt} | {best_row['Price']:.3f} | {b_type} | {reason}{divergence_info} | 置信度{conf}{buy_warning}"
@@ -2347,7 +2445,10 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change, pr
             best_sell_price = float(best_row['Price'])
             dev_pct = (best_row['Price'] - best_row['AvgPrice']) / best_row['AvgPrice'] if best_row['AvgPrice'] > 0 else 0
             is_scheme_a = bool((best_row['Price'] > best_row['AvgPrice'] * (1 + deviation * 0.7)) and (best_row['MACD_DOWN'] if 'MACD_DOWN' in best_row else False))
-            conf = "高" if dev_pct > deviation * 1.5 or "顶背离" in divergence_info else ("中" if dev_pct > deviation * 0.8 or is_scheme_a else "低")
+            # ★ 同上：卖点也走共用函数（卖点不因大盘暴跌降级，这是刻意的不对称）。
+            conf = intraday_point_confidence('sell', best_row['Price'], best_row['AvgPrice'], deviation,
+                                             divergence_info, market_change,
+                                             bool(best_row['MACD_DOWN']) if 'MACD_DOWN' in best_row else False)
             s_type = "正T高抛" if direction == "正T" else "反T减仓"
             reason = "冲高乖离均价线" if is_scheme_a else "接近日内高点滞涨"
             best_sell = f"{time_fmt} | {best_row['Price']:.3f} | {s_type} | {reason}{divergence_info} | 置信度{conf}"
@@ -2437,6 +2538,7 @@ def monitor_all_watchlist(send_key, market_change):
     _known = {(c.get('code'), c.get('kind')) for c in cands}
     fired = []
     _wl = notify_whitelist_get()      # 白名单：命中的票自动发，其余仍只登记候选
+    _conf_th = notify_conf_threshold(_wl)   # 推送门槛（与白名单同存一份文件）
     for sym in watchlist:
         try:
             sym_code = _get_code(sym); df_min = get_minute_data(sym_code)
@@ -2445,12 +2547,22 @@ def monitor_all_watchlist(send_key, market_change):
             sig = compute_intraday_signals(df_min, dev)
             if not sig: continue
             sym_name = get_stock_name(sym)
+            _div_info = _intraday_divergence(sig['df_min'])
             for _sig, _pts, _pick in (('buy', sig['buy'], 'min'), ('sell', sig['sell'], 'max')):
                 if _pts is None or _pts.empty: continue
                 _row = (_pts.loc[_pts['Price'].idxmin()] if _pick == 'min'
                         else _pts.loc[_pts['Price'].idxmax()])
                 _price = float(_row['Price'])
                 if _sig == 'buy' and market_change < -1.0: continue   # 大盘暴跌不报买点（原逻辑保留）
+                # ★ 2026-09-22 用户要求「只给我微信推送置信度高的买卖点」：
+                #   够不上门槛就**一声不响地跳过** —— 连候选都不登记。
+                #   登记了等于换个地方又推一遍，还得用户自己认出来它不该推。
+                _macd_key = 'MACD_UP' if _sig == 'buy' else 'MACD_DOWN'
+                _conf = intraday_point_confidence(
+                    _sig, _price, _row['AvgPrice'], dev, _div_info, market_change,
+                    bool(_row[_macd_key]) if _macd_key in _row else False)
+                if not notify_conf_allowed(_conf, _conf_th):
+                    continue
                 if not should_notify(sym, _sig, _price): continue
                 mark_notified(sym, _sig, _price)
                 if (sym, _sig) in _known: continue
@@ -2459,12 +2571,12 @@ def monitor_all_watchlist(send_key, market_change):
                 _is_buy = (_sig == 'buy')
                 _cd = {
                     'code': str(sym), 'name': sym_name, 'kind': _sig,
-                    'status': '买点' if _is_buy else '卖点',
+                    'status': '买点' if _is_buy else '卖点', 'conf': _conf,
                     'price': _price, 'ts': now_cn_str('%Y-%m-%d %H:%M:%S'),
                     'title': (f"【买点提醒】{sym_name}" if _is_buy
                               else f"【卖点提醒】{sym_name}"),
                     'body': (f"股票：{sym_name} ({sym})\n时间：{_t}（北京时间）\n"
-                             f"价格：{_price:.3f}\n依据："
+                             f"价格：{_price:.3f}\n置信度：{_conf}\n依据："
                              + ('回踩均价线缩量，MACD 拐头向上' if _is_buy
                                 else '冲高乖离均价线放量，MACD 拐头向下')
                              + "\n\n仅做参考，请自行判断。"),
@@ -2480,11 +2592,11 @@ def monitor_all_watchlist(send_key, market_change):
                         name=sym_name, src='auto')
                     if _okauto:
                         fired.append(f"{_emoji} {sym_name} {_label} "
-                                     f"{_price:.3f}　📤已自动推送")
+                                     f"{_price:.3f}　置信度{_conf}　📤已自动推送")
                         continue
                     _log("monitor_all_watchlist/auto", RuntimeError(str(_mauto)))
                 cands.append(_cd)
-                fired.append(f"{_emoji} {sym_name} {_label} {_price:.3f}")
+                fired.append(f"{_emoji} {sym_name} {_label} {_price:.3f}　置信度{_conf}")
         except Exception as e:
             _log(f"monitor_all_watchlist/{sym}", e)
             continue
