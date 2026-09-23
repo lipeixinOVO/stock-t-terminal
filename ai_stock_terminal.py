@@ -2368,6 +2368,25 @@ def _intraday_rich_text(text, scen_mark=False):
     return s.replace("\n", "<br>")
 
 
+def market_color_class(change_pct):
+    """大盘涨跌幅要用的 CSS 类名。**A 股口径：涨=红、跌=绿**。
+
+    ★ 2026-09-23 修（自查发现的真 bug）：原实现内联在报告串里，写的是
+      `"color-green" if change_pct >= 0 else "color-red"` —— **方向是反的**，
+      于是「今日看盘」顶上把上证**上涨**显示成绿色（跌色）、下跌显示成红色（涨色）。
+    ★ 全站只有这一处是反的，其余全是涨红跌绿：`.color-red/.color-green` 的注释、
+      `chg_color`（选股卡片涨跌幅）、`color_price`（分时现价）、成交量柱、
+      日 K 的 `increasing=#ff3333 / decreasing=#00cc66`。
+    ★ 抽成函数不是为了好看：**内联在报告串里没人测得着**，这才是它活到现在的原因。
+      现在有单测钉住（`test_memory.py` 的「全站配色口径」一节）。
+    """
+    try:
+        v = float(change_pct)
+    except (TypeError, ValueError):
+        v = 0.0          # 脏输入（None/空串/非数值/pd.NA）→ 归到 0.0 那档，不抛
+    return "color-red" if v >= 0 else "color-green"
+
+
 # ================= 8. 核心策略判定 =================
 def generate_report_and_advice(df_daily, df_minute, deviation, market_change, prev_close=None):
     latest = df_daily.iloc[-1]; prev = df_daily.iloc[-2]
@@ -2453,7 +2472,7 @@ def generate_report_and_advice(df_daily, df_minute, deviation, market_change, pr
             reason = "冲高乖离均价线" if is_scheme_a else "接近日内高点滞涨"
             best_sell = f"{time_fmt} | {best_row['Price']:.3f} | {s_type} | {reason}{divergence_info} | 置信度{conf}"
     today_str = latest['Date'].strftime('%Y-%m-%d'); time_str = now_cn().strftime('%H:%M'); market_status = f"上证 {market_change:+.2f}%"
-    market_color = "color-green" if market_change >= 0 else "color-red"
+    market_color = market_color_class(market_change)
     report = f"""
     <div class="report-row"><span class="color-blue">日期:</span> <span class="color-white">{today_str}</span><span class="color-blue">数据时间:</span> <span class="color-white">{time_str}</span><span class="color-blue">大盘:</span> <span class="{market_color}">{market_status}</span><span class="color-blue">阈值:</span> <span class="color-white">{deviation*100:.2f}%</span></div>
     <div class="report-row"><span class="color-blue">日线趋势:</span> <span class="color-white">{trend}</span><span class="color-blue">是否企稳:</span> <span class="color-white">{'是' if is_steady else '否'}</span><span class="color-blue">企稳形态:</span> <span class="color-white">{pattern}{flat_warning}</span></div>
@@ -3580,6 +3599,26 @@ def band_memory_add_manual(mem, r, source="手动加入"):
     _band_memory_apply(node, r, event=f"手动刷新（{source}）")
     return False, code
 
+# ---- 手动入册的来源（★ 2026-09-23：清理时用来保护「你自己选过的票」）----
+# 为什么**不能**靠 `added_status` 判断"是不是手动记的"（这正是原来写错的地方）：
+#   `band_memory_add_manual`（选股卡片「➕ 加入记忆」）与面板「手动记入代码」两条路径，
+#   都会把**当时的真实状态**写进 `added_status`（`_band_memory_new_node(r, ...)` 里是
+#   `r.get('Status')`）。所以"手动记入 ⇒ added_status 为空"这个假设**从来不成立**，
+#   原来据此写的保护一条也没保护到。
+#   ⚠️ 更坑的是单测夹具恰好把手动条目写成 `added_status=None` —— 夹具与实现一起错，
+#      于是测试一直是绿的（`test_memory.py` 已改成真实形态 + 保留空的那一种）。
+#   ⇒ 改用来源判断。依据是界面自己写的话与用户原话（2026-09-21）：
+#     「把这些所谓的顶背离的都删了…因为我都没有选过他们」—— 「我选过的」正是手动加的。
+BAND_MANUAL_SOURCES = ("手动加入", "手动记入", "BAND_WATCHLIST")
+
+
+def band_memory_is_manual(node):
+    """这条记忆是不是**用户自己手动加进来的**（而不是扫描/巡检自动入册的）。"""
+    if not isinstance(node, dict):
+        return False
+    return str(node.get('added_source') or '').strip() in BAND_MANUAL_SOURCES
+
+
 def band_memory_purge(mem, mode="never_started"):
     """清理记忆，返回 (mem, 删除数量)。
 
@@ -3608,8 +3647,12 @@ def band_memory_purge(mem, mode="never_started"):
             stocks.pop(code, None)
             removed += 1
             continue
+        # ★ 手动加入的（含旧版靠 added_status 空判定的那批）一律不动 —— 见 BAND_MANUAL_SOURCES。
+        #   必须在 mode 分支**之前**：连 mode="alert" 也不许动它。
+        if band_memory_is_manual(node):
+            continue
         if mode == "alert":
-            # 只认「入选时就是预警状态」这一条 —— added_status 为空的（手动记入）不碰
+            # 只认「入选时就是预警状态」这一条
             if node.get('added_status') in BAND_ALERT_STATUSES:
                 stocks.pop(code, None)
                 removed += 1
@@ -3623,11 +3666,18 @@ def band_memory_purge(mem, mode="never_started"):
     return mem, removed
 
 def band_memory_purge_stats(mem):
-    """清理前的预估：返回 (将被删除的条数, 带备注会被保留的条数)。"""
+    """清理前的预估：返回 (将被删除的条数, 带备注会被保留的条数)。
+
+    ★ 必须与 `band_memory_purge(..., "never_started")` 的删法**逐条一致**：
+      按钮上写「这 N 只」，实际删掉的就必须是 N 只。手动加入的**两个桶都不进**
+      （它既不会被删、也不是"按备注保留"），单独由 `band_memory_manual_stats` 数出来。
+    """
     junk = noted = 0
     for node in (mem.get('stocks') or {}).values():
         if not isinstance(node, dict):
             junk += 1
+            continue
+        if band_memory_is_manual(node):
             continue
         if node.get('added_status') in BAND_ENTRY_STATUSES:
             continue
@@ -3645,9 +3695,23 @@ def band_memory_alert_stats(mem):
     """
     n = 0
     for node in (mem.get('stocks') or {}).values():
-        if isinstance(node, dict) and node.get('added_status') in BAND_ALERT_STATUSES:
+        if not isinstance(node, dict):
+            continue
+        if band_memory_is_manual(node):     # 自己加的票任何时候都不在"结束信号"清理档里
+            continue
+        if node.get('added_status') in BAND_ALERT_STATUSES:
             n += 1
     return n
+
+
+def band_memory_manual_stats(mem):
+    """统计「用户自己手动加进来的」条目数（任何清理模式都不动它们，界面要说清）。
+
+    与 `band_memory_alert_stats` 同一个理由单独成函数：不动 `purge_stats` 的签名
+    （那个 (junk, noted) 二元组已被多处解包）。
+    """
+    return sum(1 for node in (mem.get('stocks') or {}).values()
+               if band_memory_is_manual(node))
 
 # ============ 策略复盘：批次 / 结案 / 归因（P0，只统计不改参数）============
 # 读这一节之前先看上面 REVIEW_* 常量的三条原则。
@@ -6372,6 +6436,7 @@ def band_memory_ui():
     # 否则 460 条只能一只一只点删除。
     _junk, _noted = band_memory_purge_stats(mem)
     _n_alert = band_memory_alert_stats(mem)
+    _n_manual = band_memory_manual_stats(mem)
     with st.expander(f"🧹 清理记忆（{_junk} 只噪声 / {_n_alert} 只结束信号）", expanded=False):
         st.markdown(f"""
         2026-09-19 之前的版本允许用「跌破支撑 / 顶背离预警」**新建**记忆条目，
@@ -6380,6 +6445,9 @@ def band_memory_ui():
 
         - 噪声可清理：**{_junk}** 只（入选时不是「波段启动确认」，且你没写过备注）
         - 会保留：**{_noted}** 只（你写过备注，说明是主动关注的）
+        - **手动加入的：{_n_manual}** 只（你自己按下「➕ 加入记忆 / 手动记入」的 ——
+          **任何清理模式都不动它们**。原实现按「added_status 为空」认手动条目，那个假设不成立，
+          于是你手动加的票会被当成噪声/结束信号删掉；2026-09-23 已改为按来源判断。）
         - **结束信号条目：{_n_alert}** 只（入选时就是顶背离 / 跌破支撑 —— 旧规则自动灌进来的，
           你从没主动选过它们。这一档**连带备注一起删**。）
         - 正常入册的（启动确认）一律不动
