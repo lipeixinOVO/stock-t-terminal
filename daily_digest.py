@@ -380,6 +380,13 @@ def sec_notify(keys, err, budget=None, budget_err="", whitelist=None, wl_err="")
         f"- 自动推送白名单：**{len(_wl_items)} 只**"
         + (f"（{'、'.join(str(it.get('code')) for it in _wl_items[:12])}）"
            if _wl_items else "（空 —— 谁都不自动发）"))
+    # ★ 2026-09-22：门槛（最低推送置信度）也要写出来 —— 它就是「今天为什么没推」的答案。
+    #   缺字段时**不在这里补默认值**：默认值只在应用与巡检里有且只有一处，
+    #   日报再写死一份就成了第二个口径（口径漂移的代价见过一次了）。
+    _mc = str((whitelist or {}).get("min_conf") or "").strip()
+    lines.append("- 最低推送置信度："
+                 + (f"**{_mc}**" if _mc else "未设置（按代码默认）")
+                 + " —— 够不上的日内买卖点不发微信")
     tb = today_budget(budget)
     if tb is None:
         lines.append("- 今日推送：还没有账本记录（没推过，或账本日期还是旧的）")
