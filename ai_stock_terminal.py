@@ -4036,6 +4036,66 @@ def band_review_stats(mem):
         "min_sample": REVIEW_MIN_SAMPLE,
     }
 
+BAND_PIVOT_BACKFILL_MAX = 10   # 一次页面渲染最多补算几只（数据源故障时不许把整页拖住）
+
+
+def band_pivot_backfill(mem, codes=None, fetch=None):
+    """给**缺突破位**的记忆节点就地补算一次 → 返回 {code: pivot}（只含真补上的）。
+
+    为什么要它：`breakout_pivot` 是**刷新时**才写进节点的（见 `_band_memory_apply`），
+    所以「升级前入册、之后一直没刷新过」的节点它是 0 ⇒ 卡片上显示「—」，
+    看上去像这个位坏掉了（2026-09-22 用户反馈原话：「还有把这些突破位也标出来吧」）。
+    这里在渲染卡片**之前**把缺的一次补齐 —— 只挑缺值的、未归档的票，正常补一次就永久补完。
+
+    ★ 算式**不在这里重写**：直接调 `_calculate_band_metrics`（唯一来源）。
+      补出来的值**只有 >0 才落盘**：拿不到日线就保持「—」，既不写 0 覆盖，
+      也绝不用 platform_high 顶替 —— 含当天的 60 日高点在"今天创新高"时≈现价，
+      那正是 2026-09-21 被修掉的病（「目标为什么这么接近启动价格」）。
+
+    ★ 只补 `breakout_pivot`（外加同源、且不参与判定的 `platform_high`），**不碰 `ma20`**：
+      防守位必须与 `_band_status` 的「跌破支撑」用同一个数（见 `band_defense_price`）。
+      给旧节点塞一个刚算出来的 MA20，会造出「状态说没跌破、卡片说已到防守位」的自相矛盾。
+      旧节点的 MA20 交给真正的刷新（「🔄 刷新全部状态」）连状态一起更新。
+
+    fetch 可注入（单测用）；默认走 `_get_daily_history`（与选股/刷新同一个取数路径）。
+    """
+    stocks = (mem or {}).get('stocks') or {}
+    if not isinstance(stocks, dict):
+        return {}
+    want = [c for c, n in stocks.items()
+            if isinstance(n, dict) and not n.get('closed')
+            and band_breakout_pivot(n) <= 0]
+    if codes:
+        _keep = {str(c) for c in codes}
+        want = [c for c in want if str(c) in _keep]
+    want.sort()                       # 顺序稳定 → 每次补算的范围可复现
+    want = want[:BAND_PIVOT_BACKFILL_MAX]
+    _fetch = fetch if fetch is not None else _get_daily_history
+    filled = {}
+    for code in want:
+        try:
+            df = _fetch(code)
+            # 突破位要 lookback+1 根（60 日平台上沿**不含当天**）⇒ 少于 61 根算不出来
+            if df is None or len(df) < 61:
+                continue
+            m = _calculate_band_metrics(df)
+            p = _band_num(m.get('breakout_pivot')) if m else 0.0
+            if p <= 0:
+                continue
+            node = stocks[code]
+            node['breakout_pivot'] = p
+            if _band_num(node.get('platform_high')) <= 0:
+                node['platform_high'] = float(m.get('platform_high') or 0.0)
+            filled[str(code)] = p
+        except Exception as e:
+            # 一只票算不出来不能拖垮整页：如实记日志，保持「—」由展示层降级
+            _log(f"band_pivot_backfill/{code}", e)
+            continue
+    if filled:
+        save_band_memory(mem)
+    return filled
+
+
 def band_memory_refresh(mem, codes=None):
     """重新拉取记忆内股票的当前波段状态（并发）。返回 (mem, changes)。
 
@@ -6179,6 +6239,24 @@ def band_memory_ui():
 
     mem = load_band_memory()
 
+    # ---- 缺突破位的旧节点就地补算（2026-09-22）----
+    # 为什么必须放在这里（紧跟 load 之后）：下面的「📤 今日推送」候选与记忆卡片**都要**显示
+    # 突破位，补算得赶在它们渲染之前 —— 同一份 mem 就地改，后面两处都能看到。
+    # ★ 每只票一个会话只试一次：数据源故障时不该每次 rerun 都重试，把一个降级显示拖成整页变慢。
+    _tried = st.session_state.get('band_pivot_backfill_tried')
+    if not isinstance(_tried, list):
+        _tried = []
+    _need_pivot = [c for c, n in (mem.get('stocks') or {}).items()
+                   if isinstance(n, dict) and not n.get('closed')
+                   and band_breakout_pivot(n) <= 0 and c not in _tried]
+    if _need_pivot:
+        _filled = band_pivot_backfill(mem, _need_pivot)
+        _tried.extend(_need_pivot)
+        st.session_state.band_pivot_backfill_tried = _tried
+        if _filled:
+            st.caption(f"🧮 已为 {len(_filled)} 只补算突破位（最新日线的 60 日平台上沿、"
+                       "不含当天；之后每次刷新都会跟着滚动更新）。")
+
     # ---- 静默「保底」自动保存到云端 ----
     # 远端还没有 band_watch.json、或远端缺本地某些票时，自动补推一次；其余情况一律不提交
     # （见 band_memory_autosync 的注释：绝不能让网页端与云端巡检互相刷提交）。
@@ -6493,7 +6571,7 @@ def band_memory_ui():
                 _miss.append("入选价没有记录（容器重启后本地信息会丢，"
                              "点上面的「🔄 刷新全部状态」会按轨迹补算）")
             if _pivot <= 0:
-                _miss.append("突破位还没算过（点「🔄 刷新全部状态」会补上）")
+                _miss.append("突破位这次没算出来（日线没拉到；点「🔄 刷新全部状态」重试）")
             if _defense <= 0:
                 _miss.append("防守位暂缺（还没刷新过，拿不到 20 日线）")
             if _miss:
@@ -6502,6 +6580,8 @@ def band_memory_ui():
             if _ph > 0:
                 st.caption(f"当前平台高点（近 60 日最高价，**含当天**）{_fmt_price(_ph)}"
                            "　—— 创新高的票它会≈现价，这是入选机制决定的，不是数据错了。")
+            st.caption("突破位与防守位都是**滚动**算出来的 —— 每刷新一次就跟着最新日线走，"
+                       "所以它们会随时间变化，不是入选那天定死的。")
             st.caption("三个位都是按固定规则算出来的**参考位，不是预测**。")
             st.caption(
                 f"入选时间：{node.get('added_at') or '—'}"
