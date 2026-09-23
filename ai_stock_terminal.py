@@ -2548,23 +2548,178 @@ def _diff_to_list(diff):
     if isinstance(diff, list): return diff
     return []
 
-@st.cache_data(ttl=300)
+# ---- 全市场清单的兜底源（新浪 hs_a）----
+# 为什么需要：2026-09-23 实测线上 Streamlit Cloud 里**东财 6 个 host 一个都答不上来**
+#   （本机同样全 ProxyError），而这条清单是「全市场扫描 / 抽样选股 / 动态股票池」的
+#   唯一入口 —— 单点依赖等于整页瘫痪。新浪这份清单本机与云端都可达，字段也够用。
+SINA_LIST_HOST = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php"
+SINA_LIST_URL = SINA_LIST_HOST + "/Market_Center.getHQNodeData"
+SINA_COUNT_URL = SINA_LIST_HOST + "/Market_Center.getHQNodeStockCount"
+SINA_LIST_PAGE = 100         # ★ 实测：num 传 500/1000/2000 都只回 100 条，别白试
+SINA_LIST_MAX_PAGES = 60     # 60 × 100 = 6000：覆盖沪深 A 股 5500+ 并留余量
+SINA_LIST_WORKERS = 10       # 串行 56 页 ≈ 50s（会把页面拖爆），并发后约 6s
+SINA_LIST_TTL = 120          # 清单缓存秒数：下游一次扫描会连调 40~60 次，绝不能每次都打网络
+SINA_LIST_MAX_BAD = 2        # 允许失败的页数；超过就判本次清单不可用
+MARKET_EM_DEAD_SECONDS = 300  # 东财整体判死后的静默期：期内不再逐 host 重试（见 fetch_market_page）
+SINA_LIST_MIN_RATIO = 0.8    # 拿到的行数不足「应有」的 80% → 判清单残缺。
+                             # ★ 宁可报错也不拿半个市场去选股（口径同 sample_harvest 的清单守卫）
+_SINA_LIST_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+    "Referer": "https://finance.sina.com.cn",
+}
+_MARKET_LIST_CACHE = {}      # {"ts": 抓取时刻, "rows": 全量行, "err": 失败原因}
+MARKET_LIST_DIAG_KEY = "market_list_diag"   # st.session_state 里的 key（选股页据此显示来源/原因）
+
+
+def _sina_market_universe():
+    """新浪 hs_a 全市场清单 → 东财同款字段的行列表。返回 (rows, note)，rows 为空时 note 是原因。
+
+    ★ 刻意**不按板块预筛**：本函数是选股页与样本采集共用的入口，而采集要覆盖
+      科创/创业/北交所（见 sample_harvest 里 UNIV_* 那段说明）。预筛交给调用方自己做。
+      代价是行数 ~5100 条 → **调用方的分页窗口必须够宽**（选股页已放宽到 60 页）。
+    ★ 排序用**成交额降序**顶替东财的「主力资金流降序」：两者都是「今天资金最活跃的在前」，
+      而下游 `to_scan` 的采样正是「等距抽样 + 取最热的前 100 只」，靠的就是这个序。
+      新浪清单没有主力净流入字段，`f62` 只能给 0 —— 该字段目前**下游没有用到**
+      （`MainFlow` 只在候选 dict 里存着，选股判定与展示都不读它），所以不影响任何结果。
+    ★ 缓存是**进程内**的（模块级 dict）：一次扫描（同一次 rerun）会连调 40~60 次，
+      不缓存就是 40~60 轮网络。跨 rerun 会重置，这是可接受的 —— 每次扫描重抓一次 6 秒。
+    """
+    _now = _time_module.time()
+    _ts = float(_MARKET_LIST_CACHE.get("ts") or 0)
+    _rows = _MARKET_LIST_CACHE.get("rows")
+    if _rows and (_now - _ts) < SINA_LIST_TTL:
+        return _rows, ""
+    if (not _rows) and _MARKET_LIST_CACHE.get("err") and (_now - _ts) < SINA_LIST_TTL:
+        return [], str(_MARKET_LIST_CACHE.get("err"))       # 失败也缓存：否则一次扫描会把失败重演 40 遍
+
+    # ① 先问总数：既决定抓几页，也是后面判「清单有没有被截断」的基准
+    want = 0
+    try:
+        rc = requests.get(SINA_COUNT_URL, params={"node": "hs_a"},
+                          headers=_SINA_LIST_HEADERS, timeout=10)
+        if rc.status_code == 200:
+            want = int(str(rc.text or "").strip().strip('"') or 0)
+    except Exception as e:
+        _log("_sina_market_universe/count", e)
+    pages = min(SINA_LIST_MAX_PAGES, (want + SINA_LIST_PAGE - 1) // SINA_LIST_PAGE + 1) if want         else SINA_LIST_MAX_PAGES
+
+    # ② 并发分页抓取（单页失败只记账，不中断整轮）
+    def _one(pn):
+        try:
+            rr = requests.get(SINA_LIST_URL,
+                              params={"page": pn, "num": SINA_LIST_PAGE, "sort": "amount",
+                                      "asc": 0, "node": "hs_a", "symbol": "", "_s_r_a": "page"},
+                              headers=_SINA_LIST_HEADERS, timeout=10)
+            if rr.status_code != 200:
+                return pn, [], f"HTTP {rr.status_code}"
+            return pn, (rr.json() or []), ""
+        except Exception as e:
+            _log(f"_sina_market_universe@page{pn}", e)
+            return pn, [], f"{type(e).__name__}"
+
+    rows, seen, bad = [], set(), []
+    with ThreadPoolExecutor(max_workers=SINA_LIST_WORKERS) as ex:
+        for pn, page, err in ex.map(_one, range(1, pages + 1)):
+            if err:
+                bad.append(f"第 {pn} 页 {err}")
+                continue
+            for it in page:
+                try:
+                    code = str(it.get("code") or "").strip()
+                    if not (len(code) == 6 and code.isdigit()) or code in seen:
+                        continue
+                    seen.add(code)
+                    rows.append({"f12": code,
+                                 "f14": str(it.get("name") or ""),
+                                 "f2": _safe_float(it.get("trade")),
+                                 "f3": _safe_float(it.get("changepercent")),
+                                 "f20": _safe_float(it.get("mktcap")) * 1e4,   # 万元 → 元
+                                 "f6": _safe_float(it.get("amount")),
+                                 "f62": 0.0})
+                except Exception as e:
+                    _log("_sina_market_universe/row", e)
+
+    # ③ 残缺判定：失败页过多、或行数远低于应有数 → 整份作废（不做「半个市场」的选股）
+    note = ""
+    if bad and len(bad) > SINA_LIST_MAX_BAD:
+        note = f"{len(bad)} 页失败（{bad[0]}）"
+    if want and len(rows) < want * SINA_LIST_MIN_RATIO:
+        note = (note + "；" if note else "") + f"清单残缺（拿到 {len(rows)} / 应有 {want}）"
+    if note:
+        _MARKET_LIST_CACHE.update({"ts": _now, "rows": None, "err": note})
+        return [], note
+    rows.sort(key=lambda x: -x.get("f6", 0.0))
+    _MARKET_LIST_CACHE.update({"ts": _now, "rows": rows, "err": ""})
+    return rows, ""
+
+
+# ★ 这里**刻意不加** @st.cache_data：命中缓存时函数体根本不会执行，
+#   而「本次清单来自哪个源」正是写在函数体里的 —— 加缓存就等于「换源却不报」，
+#   那比报错更难查（用户看到的漏斗会像什么都没发生）。而真正贵的部分
+#   （兜底源那 5500 只全量清单）已经在 _MARKET_LIST_CACHE 里按次缓存了，
+#   一次扫描内连调 40~60 次不会重复打网络；扫描本身只在点按钮时发生，不在渲染路径上。
 def fetch_market_page(pn, pz=100):
-    """分页拉取沪深 A 股列表（按主力资金流降序），自动切换可用 host，单页失败只损失该页。"""
+    """分页拉取沪深 A 股列表（按主力资金流降序），自动切换可用 host，单页失败只损失该页。
+
+    ★ 2026-09-23：东财 6 个 host **全部失败**时自动切新浪 hs_a 兜底源。
+      兜底源的全量清单是一次抓取 + 进程内缓存的，所以下游连调 40~60 次不会重复打网络。
+      用了兜底就把来源写进 st.session_state[MARKET_LIST_DIAG_KEY]，
+      由选股页显示出来 —— **绝不静默换源**（换个源却不说，比报错更难查）。
+    ★ 东财**整体判死**后有静默期（MARKET_EM_DEAD_SECONDS）：期内不再逐 host 重试。
+      不这么做的话，下游 40~60 次分页调用 = 240~360 次白跑（本机每次约 0.6s，云端还吃超时）。
+    """
     params = {"pn": str(pn), "pz": str(pz), "po": "1", "np": "1", "fltt": "2", "invt": "2",
               "fid": "f62", "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
               "fields": "f12,f14,f2,f3,f8,f9,f10,f20,f62"}
-    for base_url in _EM_HOSTS:
-        try:
-            res = requests.get(f"{base_url}/api/qt/clist/get", params=params, timeout=8, headers=_REQUEST_HEADERS)
-            if res.status_code != 200:
+    _now = _time_module.time()
+    _errs = []
+    if float(_MARKET_LIST_CACHE.get("em_dead_until") or 0) > _now:
+        _errs = []                      # 静默期内：直接走兜底，连试都不试
+    else:
+        for base_url in _EM_HOSTS:
+            _host = base_url.split("//")[-1]
+            try:
+                res = requests.get(f"{base_url}/api/qt/clist/get", params=params, timeout=8, headers=_REQUEST_HEADERS)
+                if res.status_code != 200:
+                    _errs.append(f"{_host} HTTP {res.status_code}")
+                    continue
+                data = res.json()
+                if data.get("data") and data["data"].get("diff"):
+                    _MARKET_LIST_CACHE["em_dead_until"] = 0        # 东财活了 → 立刻解除判死
+                    try:
+                        st.session_state[MARKET_LIST_DIAG_KEY] = "东财"
+                    except Exception as e:
+                        _log("fetch_market_page/diag", e)
+                    return _diff_to_list(data["data"]["diff"])
+                _errs.append(f"{_host} 返回空清单")
+            except Exception as e:
+                _log(f"fetch_market_page@{base_url}", e)
+                _errs.append(f"{_host} {type(e).__name__}")
                 continue
-            data = res.json()
-            if data.get("data") and data["data"].get("diff"):
-                return _diff_to_list(data["data"]["diff"])
+        if _errs:
+            _MARKET_LIST_CACHE["em_dead_until"] = _now + MARKET_EM_DEAD_SECONDS
+            _MARKET_LIST_CACHE["em_err"] = f"{len(_errs)} 个 host 全失败（{_errs[0]}）"
+
+    # —— 东财全军覆没（或静默期内）→ 新浪兜底 ——
+    _rows, _note = _sina_market_universe()
+    if _rows:
+        try:
+            st.session_state[MARKET_LIST_DIAG_KEY] = "新浪兜底"
         except Exception as e:
-            _log(f"fetch_market_page@{base_url}", e)
-            continue
+            _log("fetch_market_page/diag", e)
+        _start = (pn - 1) * pz
+        return _rows[_start:_start + pz]
+
+    # 静默期内 _errs 是空的，所以失败摘要统一从缓存取（上一次真实探测记下的）
+    _em = str(_MARKET_LIST_CACHE.get("em_err") or "")
+    _msg = ("东财 " + _em) if _em else ("东财无任何响应" if not _errs
+                                       else f"东财 {len(_errs)} 个 host 全失败（{_errs[0]}）")
+    _msg += "；新浪兜底也失败：" + (_note or "未取到数据")
+    try:
+        st.session_state[MARKET_LIST_DIAG_KEY] = "❌ " + _msg
+    except Exception as e:
+        _log("fetch_market_page/diag", e)
     return []
 
 def _get_daily_history(symbol):
@@ -2869,6 +3024,12 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None, pri
     progress = st.progress(0, text="正在获取股票列表...")
     # 原始结果（list[dict]）留给「波段记忆」做自动入册；DataFrame 只用于展示
     st.session_state.band_last_raw = []
+    # 清单来源/失败原因：每次扫描开头必须清掉上次的，否则上一次的「新浪兜底」会被
+    # 显示到这一次（自定义代码模式根本不查清单，更不该继承上一次的来源说明）。
+    try:
+        st.session_state[MARKET_LIST_DIAG_KEY] = ""
+    except Exception as e:
+        _log("screen_band_stocks/diag-reset", e)
 
     candidates = []; all_stocks = []
     capped = 0                      # 被价格上限过滤掉的数量（必须写进漏斗，否则像 bug）
@@ -2902,17 +3063,26 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None, pri
         all_stocks = custom_codes or []
     else:
         # 全市场扫描
+        # ★ 窗口必须 ≥ 全市场规模：沪深 A 股 5500+ 只（已排除科创/创业/北交所后仍有 3200+），
+        #   原来只拉 40 页 = 4000 行，会把**深市主板 002/003 截掉一大截**。
+        #   sample_harvest 那边的清单上限一直是 60 页（UNIV_PAGE_MAX），选股页这里此前是隐患。
+        _mk_pages = 60
         all_stocks = []
-        for pn in range(1, 41):
+        for pn in range(1, _mk_pages + 1):
             page = fetch_market_page(pn)
             if not page:
                 break
             all_stocks.extend(page)
-            progress.progress(min(int(12 * pn // 40), 12), text=f"已拉取 {len(all_stocks)} 只（第 {pn} 页）...")
+            progress.progress(min(int(12 * pn // _mk_pages), 12),
+                              text=f"已拉取 {len(all_stocks)} 只（第 {pn} 页）...")
         if not all_stocks:
             progress.empty()
-            st.session_state.scan_stats = "❌ 全市场接口暂不可用（非交易时间/网络限制）"
-            st.error("获取全市场数据失败。可切换到上方「仅手动自选」或「指定板块」模式重试，交易时段全市场接口通常更稳定。")
+            # ★ 这里原来是写死的一句猜测（时间或网络），等于没报。
+            #   现在把 fetch_market_page 记录的**逐源原因**原样带出来。
+            _diag = str(st.session_state.get(MARKET_LIST_DIAG_KEY) or "原因未记录")
+            st.session_state.scan_stats = f"❌ 全市场接口暂不可用（{_diag}）"
+            st.error(f"获取全市场数据失败。\n\n- 逐源原因：{_diag}\n\n"
+                     "可切换到上方「仅手动自选」或「指定板块」模式重试（这两条路不依赖全市场清单）。")
             return pd.DataFrame()
         for s in all_stocks:
             code_ = str(s.get("f12") or "")
@@ -2931,6 +3101,14 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None, pri
                 continue
             candidates.append({'Code': code_, 'Name': name, 'Price': price, 'ChangePct': change_pct,
                                'TotalMv': total_mv, 'MainFlow': _safe_float(s.get("f62")) / 1e8})
+
+    # ★ 静默换源比报错更难查：清单来自兜底源时必须当面说清楚。
+    #   兜底源按成交额排序（东财是按主力资金流），且没有主力净流入字段。
+    _mk_src = str(st.session_state.get(MARKET_LIST_DIAG_KEY) or "")
+    _mk_fallback = (_mk_src == "新浪兜底")
+    if _mk_fallback:
+        st.warning("⚠️ 东财全市场清单接口不可用，本次清单来自**新浪兜底源**"
+                   "（按成交额降序排序；无主力净流入字段，该值恒为 0 —— 它不参与选股判定）。")
 
     # 价格上限的过滤结果必须写进漏斗 —— 否则用户看到"明明有票却扫不到"会以为是 bug
     _cap_txt = (f"（价格上限 ≤{price_cap:.2f} 元过滤掉 {capped} 只）"
@@ -3013,10 +3191,11 @@ def screen_band_stocks(max_results=20, max_deep_scan=600, custom_codes=None, pri
     _cap_note = f"，本页展示前 {_ENTRY_CAP}" if len(entries) > _ENTRY_CAP else ""
     scored_sorted = entries + others          # 全集：记忆层自动入册用，不受展示截断影响
     st.session_state.scan_alerts_hidden = len(alerts)     # 选股页据此写「已移出本页 N 只」
+    _mk_src_note = "　· 清单源：**新浪兜底**" if _mk_fallback else ""
     st.session_state.scan_stats = (f"拉取 {len(all_stocks)} 只 → 初筛 {total_cand} 只{_cap_txt} → "
                                    f"深度分析 {len(to_scan)} 只（K线失败 {no_data} 只）→ 有效 {len(scored)} 只"
                                    f"（启动确认 {len(entries)} 只{_cap_note}；"
-                                   f"结束信号 {len(alerts)} 只已移出本页）")
+                                   f"结束信号 {len(alerts)} 只已移出本页）{_mk_src_note}")
     df = pd.DataFrame(entries[:_ENTRY_CAP] + rest[:max_results]).reset_index(drop=True)
     df.index = df.index + 1
     st.session_state.band_last_raw = scored_sorted
