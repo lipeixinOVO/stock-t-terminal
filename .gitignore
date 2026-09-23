@@ -68,3 +68,12 @@ digest_state.json
 digest_state.json.tmp
 # 回填用的日线磁盘缓存（几千个小文件，纯中间产物）
 .sample_cache/
+
+# ===== 日内买卖点样本语料库（隐私，绝对禁止进仓库）=====
+# intraday_samples.jsonl.gz 是「盘后自动采的日内买卖点 + 事后成绩」的逐条明细。
+# 不进仓库的理由与 band_samples 同源：它是这套买卖点判据的完整成绩单，
+# public 仓库提交即等于把「我的买卖点准不准」公开。而且分时数据只有当天、
+# 没法历史回填，这份文件是**唯一的**历史，丢了就再也补不回来 —— 更不能让
+# 一次误提交把它变成永久公开。
+intraday_samples.jsonl.gz
+intraday_samples.jsonl.gz.tmp
