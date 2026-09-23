@@ -1121,6 +1121,22 @@ def check_band_memory(mem, log, today):
         node["name"] = node.get("name") or sym
         node["price"] = m['current']
         node["ma20"] = m['ma20']
+        # ★ 突破位 / 平台上沿也是**滚动值**，必须和 price/ma20 一样每轮更新（2026-09-23 补）。
+        #   漏了它们的后果很隐蔽：下面的 last_check 照常刷新，而合并规则是
+        #   「实时值**整组**跟着 last_check 走」（见 ai_stock_terminal.py 的
+        #   `_BAND_LIVE_FIELDS` / `band_memory_merge_digest`）⇒ 一份**带着最新检查时间**的
+        #   旧突破位会并回网页端，把网页端刚按最新日线算出来的值顶掉，卡片上还写着
+        #   「最近检查：刚刚」。突破位是判「回踩到这儿算不算破位」用的，
+        #   带着假新鲜度的旧值比显示「—」更糟。
+        #   取值口径与主应用 `_band_memory_apply` **逐字一致**：新值算不出来（0）时保留旧值，
+        #   绝不用 0 覆盖，也绝不用 platform_high 顶替（含当天的平台上沿在创新高时≈现价，
+        #   那正是 2026-09-21 修掉的"贴脸伪目标"）。
+        node["platform_high"] = float(m.get('platform_high') or node.get("platform_high") or 0.0)
+        node["breakout_pivot"] = float(m.get('breakout_pivot') or node.get("breakout_pivot") or 0.0)
+        # ⚠️ 这里**刻意不更新** `score` / `reasons`：本文件没有打分函数，硬补就得把
+        #   `_band_score` 复制一份过来 —— 口径漂移的风险大于收益（见 MEMORY-波段记忆.md
+        #   的「关键逻辑单一来源」）。两边值本来就同源（巡检读的就是网页端推上来的镜像），
+        #   所以不会因此对不上账；**别把这当成遗漏去"顺手补上"**。
         node["last_check"] = now_cn().strftime('%Y-%m-%d %H:%M:%S')
         # ★ 本轮启动起点（2026-09-22）：必须写在「状态没变就 continue」**之前** ——
         #   它是滚动回溯出来的，状态不变的日子里它照样会变（这一轮又走了一天）。
