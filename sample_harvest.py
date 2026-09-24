@@ -155,8 +155,52 @@ REVIEW_CONSTS = {
     "BAND_ALERT_STATUSES", "BAND_ENTRY_STATUSES",
 }
 
-WANT_FUNCS = NET_FUNCS | METRIC_FUNCS | SAMPLE_FUNCS | OUTCOME_FUNCS | CRYPTO_FUNCS
-WANT_CONSTS = NET_CONSTS | SAMPLE_CONSTS | REVIEW_CONSTS | METRIC_CONSTS
+# ---- 日内买卖点样本（intraday_harvest.py 用；与波段语料**完全独立**的一份语料）----
+# ★ 与波段那套的三点差别：① 分时级（不是日线级）；② 采集范围是「自选股 ∪ 波段记忆」
+#   而不是全市场；③ **不能历史回填** —— 分时接口只给最近一个交易日，只能一天天攒。
+# ★ 买卖点 / 置信度 / 动态偏离这三条算式**必须**从主应用抽出来执行（不许在这里重写），
+#   否则这一层验的就不是页面上那套逻辑了 —— 而它存在的全部意义就是验页面那套。
+INTRADAY_FUNCS = {
+    # 采集主入口与判定
+    "intraday_samples_harvest", "intraday_samples_from_df", "intraday_live_signals",
+    "intraday_sample_baseline", "_intraday_sample_judge", "_intraday_sample_target_pct",
+    # 语料读写与统计
+    "load_intraday_samples", "_load_intraday_samples_parsed", "save_intraday_samples",
+    "intraday_samples_merge", "intraday_samples_range", "intraday_sample_lift",
+    "_intraday_sample_key", "_intraday_sample_usable", "_intraday_sample_dims",
+    "_intraday_sample_lift_text",
+    # 特征（每一条都只用「该分钟及之前」的数据）
+    "_intraday_sample_pos_pct", "_intraday_sample_dev_mult", "_intraday_sample_time_slot",
+    "_intraday_sample_vol_ratio", "_intraday_sample_conf_bucket",
+    "_intraday_sample_mult_bucket", "_intraday_sample_pos_bucket",
+    "_intraday_sample_vol_bucket",
+    # 交易日与大盘（大盘必须是**逐分钟**的，不是收盘快照）
+    "_minute_session_date", "_intraday_market_change_map", "_index_prev_close",
+    "_fetch_minute_raw_dated", "_fetch_minute_raw", "get_minute_data", "get_market_status",
+    # 取数前把 6 位代码转成行情代码（漏了它 = 全部票取不到分时，且测试不会红）
+    "_intraday_fetch_code", "_get_code",
+    # 唯一来源：这三条算式只走主应用
+    "compute_intraday_signals", "dynamic_deviation", "intraday_point_confidence",
+    "_intraday_divergence",
+}
+INTRADAY_CONSTS = {
+    "INTRADAY_SAMPLE_FILE", "INTRADAY_SAMPLE_WINDOW", "INTRADAY_SAMPLE_MIN_BARS",
+    "INTRADAY_SAMPLE_TARGET_MIN_PCT", "INTRADAY_SAMPLE_TARGET_RANGE",
+    "INTRADAY_SAMPLE_MAX_ROWS", "INTRADAY_SAMPLE_SOURCES", "INTRADAY_SAMPLE_SOURCE_LABEL",
+    "INTRADAY_SAMPLE_KIND_LABEL", "INTRADAY_SAMPLE_DIMS",
+    "INTRADAY_BUY_WINDOW", "INTRADAY_SELL_WINDOW",
+    # ★ DEVIATION_MIN / DEVIATION_MAX 在主应用里是**元组赋值**（`A, B = 0.003, 0.015`），
+    #   只有加载器支持 ast.Tuple 才抽得到。漏了它不会报错，只会让 dynamic_deviation
+    #   静默用 0.008 —— 于是这层采到的买卖点和页面上显示的**不是同一批**，
+    #   而那正好是这份语料要回答的问题。测试里有一条断言直接盯着 DEVIATION_MAX。
+    "DEVIATION_COEF", "DEVIATION_MIN", "DEVIATION_MAX",
+    "NOTIFY_CONF_LEVELS",
+}
+
+WANT_FUNCS = (NET_FUNCS | METRIC_FUNCS | SAMPLE_FUNCS | OUTCOME_FUNCS | CRYPTO_FUNCS
+              | INTRADAY_FUNCS)
+WANT_CONSTS = (NET_CONSTS | SAMPLE_CONSTS | REVIEW_CONSTS | METRIC_CONSTS
+               | INTRADAY_CONSTS)
 
 # ---- 全市场清单分页的自我保护参数 ----
 # 与 ai_stock_terminal.py 里 band_samples_harvest_forward 的同名局部量保持一致。
@@ -223,13 +267,27 @@ def load_app_namespace(app_path=APP_PATH, base_dir=None):
         "now_cn_str": lambda fmt='%Y-%m-%d %H:%M:%S': _cn_now().strftime(fmt),
     }
     for node in tree.body:                                   # 规则 1
-        if isinstance(node, ast.Assign):
-            for t in node.targets:
-                if isinstance(t, ast.Name) and t.id in WANT_CONSTS:
-                    try:
-                        exec(compile(ast.Module([node], []), app_path, "exec"), ns)
-                    except Exception as e:
-                        sys.stderr.write(f"[harvest] 常量注入失败 {t.id}: {e}\n")
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            # ★ 一条语句可能给**多个**名字赋值，两种形态都必须认（2026-09-24 修）：
+            #   ① 元组赋值 `A, B = 0.003, 0.015`
+            #   ② 注解式赋值 `X: float = 1.0`
+            #   原来的实现只看 `ast.Assign` 的 `ast.Name` 目标，于是
+            #   `DEVIATION_MIN, DEVIATION_MAX = 0.003, 0.015` 被**整体漏掉**，
+            #   后果不是报错而是**静默回退**：dynamic_deviation 里的 except 把 NameError
+            #   吞掉、返回硬编码的 0.008，采集照跑、测试照绿，只是阈值和线上不是同一个。
+            #   （同一个 bug 在 _debug_probe/_loader.py 也犯过，那边的修法就是抄这里。）
+            if isinstance(node, ast.Assign):
+                names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                names += [e.id for t in node.targets if isinstance(t, ast.Tuple)
+                          for e in t.elts if isinstance(e, ast.Name)]
+            else:
+                names = [node.target.id] if isinstance(node.target, ast.Name) else []
+            hit = [n for n in names if n in WANT_CONSTS]
+            if hit:
+                try:
+                    exec(compile(ast.Module([node], []), app_path, "exec"), ns)
+                except Exception as e:
+                    sys.stderr.write(f"[harvest] 常量注入失败 {hit[0]}: {e}\n")
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in WANT_FUNCS:
             exec(compile(ast.Module([node], []), app_path, "exec"), ns)
@@ -241,14 +299,22 @@ def load_app_namespace(app_path=APP_PATH, base_dir=None):
 
 # ============================ 二、语料库读写（明文 / 加密）============================
 
+# 语料「档」的描述：(密文里的 kind 标识, 读函数名, 写函数名)
+# ★ 为什么要这一层：日内买卖点样本要**复用**同一套读写 + 加解密 + fail-closed，
+#   而不是在 intraday_harvest.py 里另抄一份 —— 抄一份就一定会漂移（本项目的老毛病）。
+#   两个语料库的读写函数签名是**刻意对齐**的（save_X(rows, path) / load_X(path)）。
+BAND_STORE = ("band_samples", "load_band_samples", "save_band_samples")
+INTRADAY_STORE = ("intraday_samples", "load_intraday_samples", "save_intraday_samples")
+
+
 class StoreError(RuntimeError):
     pass
 
 
-def _read_plain(ns, path):
+def _read_plain(ns, path, store=BAND_STORE):
     if not os.path.exists(path):
         return {}
-    return ns["load_band_samples"](path)
+    return ns[store[1]](path)
 
 
 def _unwrap_to_plain(ns, src, dst):
@@ -273,12 +339,15 @@ def _unwrap_to_plain(ns, src, dst):
     return dst
 
 
-def _wrap_plain(ns, src, dst):
-    """把明文 JSONL.gz 包成加密语料。未配 BAND_KEY 时**直接报错**（fail-closed）。"""
+def _wrap_plain(ns, src, dst, store=BAND_STORE):
+    """把明文 JSONL.gz 包成加密语料。未配 BAND_KEY 时**直接报错**（fail-closed）。
+
+    `store[0]` 只是密文里的 kind 标识（读回来时**不校验**它，两种语料共用同一个解包器）。
+    """
     if not ns["band_crypto_enabled"]():
         raise StoreError("要求加密存储，但本端没有 BAND_KEY —— 拒绝落盘为明文")
     blob = open(src, "rb").read()
-    env = ns["band_encrypt_obj"]({"v": 1, "kind": "band_samples",
+    env = ns["band_encrypt_obj"]({"v": 1, "kind": store[0],
                                   "gz_b64": base64.b64encode(blob).decode("ascii")})
     token = env.get(ns["_ENC_FIELD"]) if isinstance(env, dict) else None
     if not token:
@@ -290,7 +359,7 @@ def _wrap_plain(ns, src, dst):
     return dst
 
 
-def load_store(ns, path, enc=False):
+def load_store(ns, path, enc=False, store=BAND_STORE):
     """读语料库 → {key: row}。enc=True 表示 path 是密文。
 
     ★ 文件**不存在**＝首次运行，返回空库（合法状态，**不是**错误）；
@@ -302,20 +371,22 @@ def load_store(ns, path, enc=False):
     if not os.path.exists(path):
         return {}
     if enc:
-        tmp = os.path.join(CACHE_DIR, "_unwrap_work.jsonl.gz")
+        # ★ 临时文件名带上 store 标识：两种语料共用同一套读写，
+        #   同名临时文件在两个采集脚本同时跑时会互相踩（同机手动跑就会遇到）。
+        tmp = os.path.join(CACHE_DIR, "_%s_unwrap_work.jsonl.gz" % store[0])
         os.makedirs(CACHE_DIR, exist_ok=True)
         _unwrap_to_plain(ns, path, tmp)
         try:
-            return _read_plain(ns, tmp)
+            return _read_plain(ns, tmp, store)
         finally:
             try:
                 os.remove(tmp)
             except OSError:
                 pass
-    return _read_plain(ns, path)
+    return _read_plain(ns, path, store)
 
 
-def save_store(ns, rows, path, enc=False):
+def save_store(ns, rows, path, enc=False, store=BAND_STORE):
     """写语料库。返回写入行数。
 
     ★ 一律先写临时明文文件再搬过去：
@@ -324,18 +395,18 @@ def save_store(ns, rows, path, enc=False):
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     if enc:
-        work = os.path.join(CACHE_DIR, "_wrap_work.jsonl.gz")
+        work = os.path.join(CACHE_DIR, "_%s_wrap_work.jsonl.gz" % store[0])
         os.makedirs(CACHE_DIR, exist_ok=True)
-        n = ns["save_band_samples"](rows, work)
+        n = ns[store[2]](rows, work)
         if not n:
             raise StoreError("写临时语料失败，已中止（不会覆盖已有文件）")
-        _wrap_plain(ns, work, path)
+        _wrap_plain(ns, work, path, store)
         try:
             os.remove(work)
         except OSError:
             pass
         return n
-    return ns["save_band_samples"](rows, path)
+    return ns[store[2]](rows, path)
 
 
 # ============================ 三、全市场清单 ============================
