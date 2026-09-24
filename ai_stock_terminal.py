@@ -5076,6 +5076,14 @@ CORPUS_URL = (f"https://github.com/{GITHUB_REPO}/releases/download/"
               f"{CORPUS_RELEASE_TAG}/{CORPUS_ASSET_NAME}")
 CORPUS_FETCH_TIMEOUT = (4, 12)   # (连接, 读取) 秒；页面渲染路径上不能久等
 
+# ★ 日内买卖点样本的云端快照：**同一个 release，另一个资源文件**（2026-09-24）。
+#   由 sample-harvest.yml 的 `intraday` job 在盘后 15:40 自动发布。
+#   不另开 release：两者都是「每天盘后更新一次的加密快照」，共用 data-latest 更省事，
+#   而且网页端只需要认一个 tag。
+INTRADAY_CORPUS_ASSET_NAME = "intraday_samples.enc"
+INTRADAY_CORPUS_URL = (f"https://github.com/{GITHUB_REPO}/releases/download/"
+                       f"{CORPUS_RELEASE_TAG}/{INTRADAY_CORPUS_ASSET_NAME}")
+
 
 def _sample_key(code, date, source):
     return f"{str(code).zfill(6)}|{str(date)[:10]}|{source}"
@@ -6635,6 +6643,25 @@ def _minute_session_date(code="sh000001"):
         return ""
 
 
+def _intraday_fetch_code(code):
+    """把样本用的 6 位代码转成**行情代码**（带 sh/sz/bj 前缀）。
+
+    ★★ 为什么必须有这一步（2026-09-24 修，这是个真 bug）：
+      `get_minute_data` / `_fetch_minute_raw_dated` 收的是**行情代码**。
+      腾讯分时接口对裸代码（`...?code=600176`）直接返回 `api.code=-1`、**零条分时**；
+      只有带前缀的 `code=sh600176` 才给数据。应用里所有既有调用方都先走
+      `_get_code(sym)` 补前缀（见 `get_minute_data` 的两处调用点），
+      而本层（新加的样本采集）直接把 6 位代码丢给了 `fetch` ——
+      于是「采集」跑完报告里写着「取不到分时 = 全部」，样本库永远是空的，
+      而且**测试全用桩 fetch，一条都不会红**。端到端跑一次才暴露。
+    ★ 已经带前缀的原样返回：再套一次 `_get_code` 会得到 "szsh000001"（`_quote_prefix`
+      对非 6 位数字一律返回 sz）。
+    ★ 样本行里记的仍然是 6 位代码（去重键/面板都按 6 位），只有取数这一跳用行情代码。
+    """
+    s = str(code or "").strip()
+    return _get_code(s) if re.fullmatch(r"\d{6}", s) else s
+
+
 def intraday_samples_harvest(codes=None, date=None, fetch=None, limit=0,
                              progress_cb=None, market_index="sh000001",
                              recorded_at=None):
@@ -6694,7 +6721,8 @@ def intraday_samples_harvest(codes=None, date=None, fetch=None, limit=0,
     total = len(uni)
     for n, c in enumerate(uni, 1):
         try:
-            df = fetch(c)
+            # ★ 取数这一跳必须用**行情代码**（带前缀），见 _intraday_fetch_code
+            df = fetch(_intraday_fetch_code(c))
         except Exception as e:
             _log("intraday_samples_harvest/%s" % c, e)
             df = None
@@ -6784,6 +6812,63 @@ def save_intraday_samples(rows, path=None):
     except Exception as e:
         _log("save_intraday_samples", e)
         return 0
+
+
+def parse_intraday_samples_text(text):
+    """把云端快照的 JSONL 文本解析成行列表。
+
+    判据与本地那份**刻意保持一致**（`_load_intraday_samples_parsed`）：必须有 code 与 date。
+    坏行跳过并留痕 —— 云端快照是网络来的，宁可少几条也不能让一行脏数据把整份读废。
+    """
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception as e:
+            _log("parse_intraday_samples_text/line", e)
+            continue
+        if isinstance(row, dict) and row.get("code") and row.get("date"):
+            out.append(row)
+    return out
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fetch_cloud_intraday_samples(url=INTRADAY_CORPUS_URL):
+    """拉云端日内样本快照 → (rows, err)。**永不抛异常**：失败返回 ([], 原因字符串)。
+
+    ★ 复用 `_unwrap_corpus_text`：它只认密文信封里的 `gz_b64`、**不校验 kind**，
+      而两份语料的密文格式本来就一模一样（都由 sample_harvest 的 `_wrap_plain` 生成）
+      ⇒ 不需要为日内样本另写一套解包器（抄一份就一定会漂移）。
+    ★ 解不开一律抛异常、这里降级成"读不到"，**绝不把「解不开」当成「库里是空的」**。
+    ★ ttl 取 30 分钟（波段那份是 1 小时）：这份语料每天盘后只更新一次，但如果你正好在
+      「Actions 还在跑 / 快照还没发布」的那几分钟打开页面，1 小时的 TTL 会让你一小时内
+      再也拉不到、看起来像「自动采集没生效」。面板上另配一个「🔄 拉取云端样本」按钮
+      立刻清缓存重拉，专门对付这个窗口期。
+    """
+    try:
+        r = _http_session().get(url, timeout=CORPUS_FETCH_TIMEOUT,
+                                headers=_REQUEST_HEADERS, allow_redirects=True)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        return parse_intraday_samples_text(_unwrap_corpus_text(r.text)), ""
+    except Exception as e:
+        _log("_fetch_cloud_intraday_samples", e)
+        return [], f"{type(e).__name__}: {str(e)[:120]}"
+
+
+def load_intraday_samples_cloud():
+    """读云端日内样本快照 → (rows, 说明)。任何失败都只降级为「读不到」，本地那份照旧可用。"""
+    if not band_crypto_enabled():
+        return [], "本端没有 BAND_KEY，读不了云端快照（只有本机那份可用）"
+    rows, err = _fetch_cloud_intraday_samples()
+    if err:
+        return [], f"云端快照拉取失败：{err}"
+    if not rows:
+        return [], "云端快照里还没有样本（首次发布后就会出现）"
+    return rows, f"云端快照 {len(rows)} 条"
 
 
 def intraday_samples_merge(old, new):
@@ -6950,17 +7035,40 @@ def intraday_sample_ui():
                "它是「尺子」不是「买入依据」，而且基准率用同一把尺子，所以**差额不受影响**。")
 
     rows_map = load_intraday_samples()
+    _local_n = len(rows_map)
+    # ★ 云端那份（盘后 Actions 自动采的）合并进来 —— 这一步就是「不用手点」的全部。
+    #   复用 intraday_samples_merge：去重键与「只有已判定的新行才覆盖」规则完全同一套，
+    #   而样本键由（代码/日期/方向/分钟/位置）唯一决定 ⇒ 合并天然幂等，不会重复计数。
+    #   ★ 只用于**展示**，不落盘：本地那份是权威副本，云端快照只是同一套逻辑在别处
+    #     采出来的同一批样本，写回去没有意义；而且 Streamlit Cloud 的容器没有持久化
+    #     磁盘，写进去也会随容器重启丢掉（纯浪费）。
+    _cloud_rows, _cloud_msg = load_intraday_samples_cloud()
+    if _cloud_rows:
+        rows_map, _c_added, _c_updated, _c_trimmed = intraday_samples_merge(rows_map, _cloud_rows)
     rows = list(rows_map.values())
     rng = intraday_samples_range(rows)
 
-    _c1, _c2 = st.columns([1, 3])
+    _c1, _c2, _c3 = st.columns([1.15, 2.55, 0.95])
     with _c1:
         _do = long_button("🧲 采集今日分时样本", key="intraday_sample_harvest",
                           use_container_width=True)
+    with _c3:
+        # 云端快照每天盘后（15:40 那趟）只更新一次；万一你正好在它发布前打开页面，
+        # 缓存会把"还没有"的状态留住 —— 这个小按钮用来立刻清掉重拉，不用等 TTL。
+        if st.button("🔄 拉取云端样本", key="intraday_cloud_refresh",
+                     use_container_width=True, help="清掉本地缓存，立刻重拉一次盘后自动采集的快照"):
+            try:
+                _fetch_cloud_intraday_samples.clear()
+            except Exception as e:
+                _log("intraday_sample_ui/clear_cache", e)
+            st.rerun()
     with _c2:
-        st.caption("采集范围 = **自选股 ∪ 波段记忆**里的票。"
-                   "⚠️ **盘后**跑（当天分时还读得到时）才采得全：盘中跑只会采到观察窗口"
-                   "已走完的那部分点，收盘后再跑一次即可补全（重复采集是幂等的）。"
+        st.caption("**正常情况下你不用点任何东西** —— 周一至周五 15:40（北京时间）由 "
+                   "GitHub Actions 自动采集自选股 ∪ 波段记忆的票，采完发布加密快照，"
+                   "本页打开时自动拉取（上表「📥」那行会写明读到了多少条）。"
+                   "上面的按钮是**手动补采**：当天自动那趟没跑成、或想立刻再采一次时用。"
+                   "⚠️ 采全要**盘后**（当天分时还读得到时）：盘中跑只会采到观察窗口已走完的"
+                   "那部分点，收盘后再跑一次即可补全（重复采集是幂等的）。"
                    "分时数据只有当天，所以这份样本库**没法历史回填**，只能一天天攒。")
     if _do:
         _codes = _intraday_sample_codes()
@@ -6993,12 +7101,17 @@ def intraday_sample_ui():
 
     if not rows:
         st.info("样本库还是空的。**这是正常的** —— 分时数据只有当天，没法回填，"
-                "只能从今天开始一天天攒。点上面「🧲 采集今日分时样本」采今天这一批。")
+                "只能从今天开始一天天攒。两种来源：\n\n"
+                "1. **盘后自动采集**（推荐，正常什么都不用点）：周一至周五 15:40（北京时间）"
+                "由 GitHub Actions 采自选股 ∪ 波段记忆，采完发布加密快照，本页自动拉取；"
+                "刚上线的那天要等它跑过一趟才会有数据。\n"
+                "2. **手动补采**：点上面「🧲 采集今日分时样本」。"
+                f"（本次读取情况：本地 {_local_n} 条 ｜ {_cloud_msg}）")
         return
 
-    st.caption("📥 库内 %d 条样本｜覆盖 **%d 个交易日**（%s → %s）"
-               "　·　样本库文件 `intraday_samples.jsonl.gz`（本地，不提交）"
-               % (len(rows), rng['n'], rng['min'], rng['max']))
+    st.caption("📥 库内 %d 条样本（本地明文 %d 条 ｜ %s）｜覆盖 **%d 个交易日**（%s → %s）"
+               "　·　云端那份由**盘后自动采集**每天更新，不需要你手点"
+               % (len(rows), _local_n, _cloud_msg, rng['n'], rng['min'], rng['max']))
 
     st_ = intraday_sample_lift(rows)
     m1, m2, m3, m4, m5 = st.columns(5)
