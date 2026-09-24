@@ -1,9 +1,16 @@
-name: 全市场样本自动采集（逻辑验证语料）
+name: 样本自动采集（波段语料 + 日内买卖点样本）
 
 # 这个 workflow 的定位：让「样本语料」在**没人打开网页、也没开电脑**的情况下继续长。
-# 采集口径与网页端「🧪 逻辑有效性验证 → 采集今日全市场样本」完全同一份代码
-# （都走 sample_harvest.py → AST 抽取 ai_stock_terminal.py 里的真实函数），
-# 所以云端采的样本和你本机采的样本逐字段同构。
+# 采集口径与网页端那两处手动按钮**完全同一份代码**（都靠 AST 抽取
+# ai_stock_terminal.py 里的真实函数），所以云端采的样本和你本机采的样本逐字段同构。
+#
+# ★ 两个 job、同一个 cron、**并行**（2026-09-24 起）：
+#   · harvest  —— 全市场**日线级**波段样本（band_samples.enc，几十万条量级）
+#   · intraday —— 自选股∪波段记忆的**分时级**日内买卖点样本（intraday_samples.enc）
+#   刻意做成两个 job 而不是一个 job 的两步：它们互相没有任何依赖，串行只会让
+#   慢的那个（全市场，几十分钟）把快的那个拖到傍晚；而且任一个失败/超时都不该
+#   影响另一个今天还采不采。两个 job 各自缓存、各自发布自己的 release 资源。
+#   （日内样本连 BAND_KEY 缺失的判断都独立 —— 没密钥时它自己跳过，不拖累波段那边。）
 #
 # ★ 语料怎么回到网页（2026-09-19 改造）：
 #   原来采完只落在 actions/cache 和 Artifact 里 —— 网页端读的是本地文件，
@@ -31,7 +38,7 @@ on:
         default: "450"
         type: string
       limit:
-        description: "冒烟测试用：只处理前 N 只（留空=全市场，正式采集必须留空）"
+        description: "冒烟测试用：只处理前 N 只（两个 job 都认；留空=正式采集，必须留空）"
         required: false
         default: ""
         type: string
@@ -167,3 +174,103 @@ jobs:
           path: band_samples.enc
           if-no-files-found: ignore
           retention-days: 30
+
+  # ==========================================================================
+  # 日内买卖点样本（分时级）—— 网页端「📈 日内买卖点有效性验证」的数据源。
+  #
+  # 它验的是「做T的**买卖点准不准**」，与上面那个 job 验的「波段**入场条件**值不值得买」
+  # 是两件事，所以语料、缓存、发布资源全部独立。
+  #
+  # 采集范围 = 自选股(WATCHLIST) ∪ 波段记忆(band_watch.json 里未结案的) —— 与
+  # watcher.py 巡检**逐字同口径**。这不是洁癖：这份语料要回答的是「**推给你的**
+  # 那个买卖点准不准」，采样范围一旦宽于或窄于推送范围，统计出来的成绩就不对应
+  # 你实际看到的东西。
+  #
+  # ★ 为什么必须盘后跑：分时接口只给当天数据，而「该点之后 15 分钟走得怎么样」
+  #   要等窗口走完才判得出。盘中跑只会采到一部分（窗口没走完的点直接不采，不是记 0）。
+  #   分时只有当天 ⇒ 本语料**没法历史回填**，只能一天天攒（网页端已如实写明）。
+  # ★ 节假日跑是安全的：分时接口返回的是「最近一个交易日」，于是重复采同一批样本，
+  #   而样本键由（代码/日期/方向/分钟/位置）唯一决定、重采结果逐字相同 —— 天然幂等。
+  # ==========================================================================
+  intraday:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install requests pandas numpy cryptography
+
+      - name: 计算缓存键（北京日期）
+        id: ckey
+        run: echo "key=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      - name: 恢复语料缓存（承接上一次采集的结果）
+        uses: actions/cache/restore@v4
+        with:
+          path: intraday_samples.enc
+          key: intraday-samples-${{ steps.ckey.outputs.key }}-${{ github.run_id }}
+          restore-keys: |
+            intraday-samples-
+
+      - name: 采集今日日内买卖点样本
+        env:
+          BAND_KEY: ${{ secrets.BAND_KEY }}
+          # 采集范围的两个环境来源（第三个是仓库里的 band_watch.json，脚本自己读并解密）
+          WATCHLIST: ${{ secrets.WATCHLIST }}
+          BAND_WATCHLIST: ${{ secrets.BAND_WATCHLIST }}
+        run: |
+          if [ -z "$BAND_KEY" ]; then
+            echo "::warning::未配置 BAND_KEY：已跳过日内样本采集。"
+            echo "::warning::这份语料是「我的买卖点准不准」的完整成绩单，绝不允许以明文"
+            echo "::warning::落进 public 仓库的缓存 —— 所以这里 fail-closed 而不是退回明文。"
+            echo "::warning::配置路径：Settings → Secrets and variables → Actions → New secret，"
+            echo "::warning::名称 BAND_KEY，值与 Streamlit Secrets 里的 BAND_KEY 完全一致。"
+            exit 0
+          fi
+          python intraday_harvest.py --store enc --file intraday_samples.enc \
+            ${{ github.event.inputs.limit && format('--limit {0}', github.event.inputs.limit) || '' }}
+
+      - name: 确认产物存在
+        if: always()
+        run: |
+          if [ -f intraday_samples.enc ]; then
+            echo "---- 加密语料 ----"
+            ls -la intraday_samples.enc
+          else
+            echo "(没有 intraday_samples.enc：首次运行或本次跳过时属正常)"
+          fi
+
+      - name: 保存语料缓存（供下一次运行承接）
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: intraday_samples.enc
+          key: intraday-samples-${{ steps.ckey.outputs.key }}-${{ github.run_id }}
+
+      - name: 发布快照到 data-latest（网页端自动读取这一份）
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f intraday_samples.enc ]; then
+            echo "(没有语料文件，跳过发布 —— 首次运行或本次跳过时属正常)"
+            exit 0
+          fi
+          ls -la intraday_samples.enc
+          # ★ 与 harvest job 并发：data-latest 可能正被对方创建/更新。
+          #   `|| true` 是必需的 —— 否则两边同时启动时，创建 release 那一步会红，
+          #   而其实只是对方抢先建好了（资源是不同的两个文件，上传互不影响）。
+          gh release view data-latest >/dev/null 2>&1 || \
+            gh release create data-latest \
+              --title "样本语料（滚动更新）" \
+              --notes "由 sample-harvest 工作流每日自动发布。文件为 BAND_KEY 加密产物，非明文。" \
+            || true
+          gh release upload data-latest intraday_samples.enc --clobber
+          echo "✅ 已发布日内样本快照到 data-latest"
