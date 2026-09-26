@@ -196,12 +196,16 @@ def _save_json(path, data):
         _log("_save_json", e)   # 磁盘只读 / 写满时不再完全无声
 
 def load_watchlist():
+    raw = ""
     try:
         raw = st.secrets.get("WATCHLIST", "")
-        if raw and isinstance(raw, str):
-            codes = [c.strip() for c in raw.split(",") if c.strip()]
-            if codes: return codes
-    except Exception: pass          # 本地无 secrets.toml 属预期情况，不刷日志
+    except (FileNotFoundError, KeyError, AttributeError):
+        pass                        # 本地无 secrets.toml / Streamlit 未初始化，属预期
+    except Exception as e:
+        _log("load_watchlist/secrets", e)   # 不该吞的异常要留痕
+    if raw and isinstance(raw, str):
+        codes = [c.strip() for c in raw.split(",") if c.strip()]
+        if codes: return codes
     return _load_json(WATCHLIST_FILE, [DEFAULT_STOCK, '515880', '159915'])
 
 def save_watchlist(lst):
@@ -209,14 +213,15 @@ def save_watchlist(lst):
 
 def load_config():
     cfg = _load_json(CONFIG_FILE, {})
-    try:
-        ak = st.secrets.get("DEEPSEEK_API_KEY", "")
-        if ak and isinstance(ak, str): cfg['api_key'] = ak
-    except Exception: pass          # 同上：本地无 secrets.toml 属预期情况
-    try:
-        sk = st.secrets.get("SERVERCHAN_KEY", "")
-        if sk and isinstance(sk, str): cfg['send_key'] = sk
-    except Exception: pass
+    for key, target in [("DEEPSEEK_API_KEY", "api_key"), ("SERVERCHAN_KEY", "send_key")]:
+        try:
+            v = st.secrets.get(key, "")
+        except (FileNotFoundError, KeyError, AttributeError):
+            continue                # 无 secrets 属预期
+        except Exception as e:
+            _log(f"load_config/{key}", e)
+            continue
+        if v and isinstance(v, str): cfg[target] = v
     return cfg
 
 def save_config(cfg):
@@ -1594,7 +1599,7 @@ def _render_feed_diag(code, diag):
 
 
 # ================= 4. 辅助函数 =================
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_stock_name(symbol):
     prefix = _quote_prefix(symbol)
     ok, text, _err = _http_get_text(f"https://qt.gtimg.cn/q={prefix}{symbol}", encoding='gbk', timeout=(5, 10), retries=2)
@@ -1604,7 +1609,7 @@ def get_stock_name(symbol):
             return parts[1].strip('"')
     return symbol
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_market_status():
     ok, text, _err = _http_get_text("https://qt.gtimg.cn/q=sh000001", encoding='gbk', timeout=(5, 10), retries=2)
     if ok and "~" in text:
@@ -2696,8 +2701,13 @@ def _is_st_or_risk(name):
 def _diff_to_list(diff):
     """东财接口有时返回列表、有时返回字典，统一转成列表。"""
     if isinstance(diff, dict):
-        try: return list(diff.values())
-        except Exception: return []
+        try:
+            return list(diff.values())
+        except (TypeError, ValueError, AttributeError):
+            return []
+        except Exception as e:
+            _log("_diff_to_list/dict", e)
+            return []
     if isinstance(diff, list): return diff
     return []
 
@@ -6712,7 +6722,7 @@ def intraday_samples_harvest(codes=None, date=None, fetch=None, limit=0,
         _log("intraday_samples_harvest/index", e)
     if mc_map is None:
         try:
-            mc_fallback = float(get_market_status() or 0.0)
+            mc_fallback = float(get_market_status())
         except Exception as e:
             _log("intraday_samples_harvest/market_status", e)
             mc_fallback = 0.0
@@ -8190,7 +8200,7 @@ def ai_band_picker_ui():
         _log("ai_band_picker_ui/quick_stats", e)
 
 # ================= 11. 动态股票池系统 =================
-@st.cache_data(ttl=180)
+@st.cache_data(ttl=180, show_spinner=False)
 def get_market_sentiment():
     sentiment = {'score': 50, 'label': '中性', 'up_count': 0, 'down_count': 0, 'north_flow': 0.0, 'details': []}
     try:
@@ -8230,7 +8240,7 @@ def get_market_sentiment():
         _log("get_market_sentiment", e)
     return sentiment
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def get_industry_prosperity():
     """获取行业板块景气度，带多 host 容错。"""
     industries = {}
@@ -8254,7 +8264,7 @@ def get_industry_prosperity():
             continue
     return industries
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_hot_money_stocks(pages=3):
     """获取主力资金热度榜（按主力净流入降序），返回 {code: {'main_flow': 亿元}}。
     复用 fetch_market_page 的多 host 容错能力，避免单点接口失败。"""
@@ -8273,7 +8283,7 @@ def get_hot_money_stocks(pages=3):
         _log("get_hot_money_stocks", e)
     return hot
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=900, show_spinner=False)
 def get_stock_full_data(symbol):
     """获取个股完整数据，带多 host 容错。"""
     try:
@@ -8302,7 +8312,7 @@ def get_stock_full_data(symbol):
         _log("get_stock_full_data/outer", e)
         return None
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_stock_historical_metrics(symbol):
     """动态池评分用的历史位置指标（250 日分位、是否站上 20/60 日线）。
 
@@ -8463,9 +8473,8 @@ def dynamic_pool_ui():
             st.success("✅ 动态池刷新完成！"); st.rerun()
     with col_clean:
         if st.button("🧹 清理低分股", use_container_width=True, key="clean_pool"):
-            pool = load_dynamic_pool(); cleaned = {k: v for k, v in pool.items() if v.get('score', 0) >= 50}
+            cleaned = {k: v for k, v in pool.items() if v.get('score', 0) >= 50}
             save_dynamic_pool(cleaned); st.success(f"已清理 {len(pool) - len(cleaned)} 只低分股"); st.rerun()
-    pool = load_dynamic_pool()
     if pool:
         sorted_pool = sorted(pool.items(), key=lambda x: x[1].get('score', 0), reverse=True)
         st.markdown("### 📋 池内股票（按综合评分排序）")
