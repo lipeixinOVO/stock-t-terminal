@@ -35,10 +35,15 @@ def _log(where, err):
 
     GitHub Actions 会把 stderr 收进运行日志，所以留痕 = 可排查。
     凡是要吞异常，必须先经过这里留痕，禁止裸 `except: pass`。"""
+    msg = f"[watcher][{where}] {type(err).__name__}: {str(err)[:200]}"
     try:
-        print(f"[watcher][{where}] {type(err).__name__}: {str(err)[:200]}", file=sys.stderr)
+        print(msg, file=sys.stderr)
     except Exception:
-        pass
+        # stderr 不可用（极罕见）时至少别完全静默，回退 stdout
+        try:
+            print(msg, file=sys.stdout)
+        except Exception:
+            pass
 
 SEND_KEY = os.environ.get("SERVERCHAN_KEY", "").strip()
 WATCHLIST = [c.strip() for c in os.environ.get("WATCHLIST", "").replace("，", ",").split(",") if c.strip()]
