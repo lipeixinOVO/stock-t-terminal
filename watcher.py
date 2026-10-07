@@ -747,6 +747,7 @@ def _get_daily_history(symbol):
 
 
 BAND_RUN_MAX_LOOKBACK = 120   # 一轮「启动」最多往回找多少根 K 线（与主应用同值）
+BAND_ENTRY_MAX_DAYS = 5      # 「波段启动确认」只认启动头 N 个交易日（与主应用同值，2026-10-07）
 
 def _band_run_start(df):
     """本轮「波段启动」连续区间从哪根 K 线开始？→ {'days','date','price','idx'}。
@@ -881,7 +882,12 @@ def _band_status(m):
     if m['below_support']:
         return '跌破支撑'
     if m['breakout'] and m['volume_expansion']:
-        return '波段启动确认'
+        # ★ 2026-10-07 与主应用同语义：按 run_days 新鲜度分层，只把启动头
+        #   BAND_ENTRY_MAX_DAYS 个交易日内的判为「波段启动确认」，更久则降级「波段进行中」。
+        _rd = m.get('run_days')
+        if not isinstance(_rd, (int, float)) or _rd <= BAND_ENTRY_MAX_DAYS:
+            return '波段启动确认'
+        return '波段进行中'
     if m['current'] > m['ma20']:
         return '波段进行中'
     return '波段未形成'
