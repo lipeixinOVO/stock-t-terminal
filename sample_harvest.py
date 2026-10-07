@@ -117,7 +117,9 @@ METRIC_FUNCS = {"_calculate_band_metrics", "_band_score", "_band_status", "_band
 #   漏了 → NameError（这里没 try 兜底，会直接炸，属于"幸运的"失败方式）。
 METRIC_CONSTS = {"BAND_DIVERGENCE_MACD_MIN_PCT",
                  # 启动起点回溯上限 与 前景分拥挤度起扣线（2026-09-22）
-                 "BAND_RUN_MAX_LOOKBACK", "BAND_RUN_CROWD_FREE_PCT"}
+                 "BAND_RUN_MAX_LOOKBACK", "BAND_RUN_CROWD_FREE_PCT",
+                 # 启动确认的新鲜度上限（2026-10-07）：_band_status 用它分层，漏抽→NameError
+                 "BAND_ENTRY_MAX_DAYS"}
 
 SAMPLE_FUNCS = {
     "_sample_key", "_sample_hash_hit", "_sample_tier", "_sample_prefilter", "_sample_tradable",
