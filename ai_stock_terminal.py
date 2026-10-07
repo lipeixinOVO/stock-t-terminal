@@ -3117,6 +3117,9 @@ def _get_daily_history(symbol):
 
 BAND_RUN_MAX_LOOKBACK = 120   # 一轮「启动」最多往回找多少根 K 线，防止极端行情下算到一年前
 BAND_RUN_CROWD_FREE_PCT = 15.0  # 离启动点涨幅在多少以内不扣分（超过部分才按拥挤度扣）
+BAND_ENTRY_MAX_DAYS = 5      # 「波段启动确认」只认启动头 N 个交易日：超过就降级为「波段进行中」，
+                             # 让选股页「刚启动」主区/自动入册/推送只命中真正刚开始的票，
+                             # 不再混入已涨一段、接近前高的老票（2026-10-07 用户反馈）
 
 def _band_run_start(df):
     """本轮「波段启动」连续区间是从哪根 K 线开始的？→ {'days','date','price','idx'}。
@@ -3281,7 +3284,15 @@ def _band_status(metrics):
     if metrics['below_support']:
         return '跌破支撑', '#ff3333'
     if metrics['breakout'] and metrics['volume_expansion']:
-        return '波段启动确认', '#00cc66'
+        # ★ 2026-10-07 按新鲜度分层：只有启动头 BAND_ENTRY_MAX_DAYS 个交易日内才算
+        #   「波段启动确认」；已经走了一段、接近前高的，降级为「波段进行中」。
+        #   run_days=0 是合法值（历史/外部构造的 metrics 没有该字段），用 .get 降级 ——
+        #   取不到 run_days 时仍按旧口径（只判突破+放量），不把老票误伤成「未形成」。
+        _rd = metrics.get('run_days')
+        if not isinstance(_rd, (int, float)) or _rd <= BAND_ENTRY_MAX_DAYS:
+            return '波段启动确认', '#00cc66'
+        # 超过新鲜度阈值 → 归入「进行中」，让「刚启动」的语义名副其实
+        return '波段进行中', '#f9e2af'
     if metrics['current'] > metrics['ma20']:
         return '波段进行中', '#f9e2af'
     return '波段未形成', '#888'
