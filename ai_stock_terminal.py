@@ -8648,20 +8648,31 @@ def refresh_dynamic_pool(max_candidates=30):
     progress.progress(20, text="正在获取主力资金热度榜..."); hot_money = get_hot_money_stocks()
     
     # ✅ 修复：候选来源多元化（自选股 + 资金热度榜前50 + 全市场均匀抽样），不再只剩自选股
+    _cand_stats = {}   # 候选构成统计：写进 dynamic_pool_diag，刷新后长期可见（见 dynamic_pool_ui）
     def _collect_candidates(limit):
         out, seen = [], set()
         def add(c):
             if c and c not in seen and not c.startswith(EXCLUDE_PREFIXES):
                 seen.add(c); out.append(c)
         for s in st.session_state.stock_list: add(s)          # 自选股优先
+        _cand_stats['own'] = len(out)
         for c in list(hot_money.keys())[:50]: add(c)          # 资金热度榜
+        _cand_stats['hot'] = len(out) - _cand_stats['own']
         try:
             market_codes = []
-            for pn in range(1, 6):                            # 全市场抽样池
+            _pages_ok = 0
+            for pn in range(1, 7):                            # 全市场抽样池（6 页覆盖 600 只）
                 pg = fetch_market_page(pn)
-                if not pg: break
+                if not pg:
+                    pg = fetch_market_page(pn)                # 单页空返回重试 1 次：瞬时故障别放大成整面丢失
+                if not pg:
+                    continue                                  # 这一页真没了：跳过。绝不能 break ——
+                                                              # 首页抖动就放弃 = 静默只剩自选股（09-22 同款坑）
                 market_codes.extend([str(x.get("f12") or "") for x in pg])
+                _pages_ok += 1
             market_codes = [c for c in market_codes if c and not c.startswith(EXCLUDE_PREFIXES)]
+            _cand_stats['market_pages_ok'] = _pages_ok
+            _cand_stats['market_codes_raw'] = len(market_codes)
             need = limit - len(out)
             if need > 0 and market_codes:
                 if len(market_codes) > need:
@@ -8670,7 +8681,11 @@ def refresh_dynamic_pool(max_candidates=30):
                         add(market_codes[min(int(i * step), len(market_codes) - 1)])
                 else:
                     for c in market_codes: add(c)
+            elif need > 0 and not market_codes:
+                _cand_stats['market_unavailable'] = str(
+                    st.session_state.get(MARKET_LIST_DIAG_KEY) or "6 页清单全部为空")
         except Exception as e:
+            _cand_stats['market_error'] = f"{type(e).__name__}: {e}"
             _log("refresh_dynamic_pool/_collect_candidates", e)
         return out[:limit]
 
@@ -8712,23 +8727,64 @@ def refresh_dynamic_pool(max_candidates=30):
             old_score = pool[code_].get('score', 0); new_score = int(old_score * 0.4 + result['score'] * 0.6)
             pool[code_].update({'score': new_score, 'reasons': result['reasons'], 'tags': result['tags'], 'last_update': now_str})
     pool = {k: v for k, v in pool.items() if v.get('score', 0) >= 40 or k in st.session_state.stock_list}
-    # ---- 收尾播报：候选面/换源情况必须让用户看见（绝不静默）----
+    # ---- 收尾播报：写进 session_state，由 dynamic_pool_ui 在 rerun 之后持续渲染 ----
+    # ★ 原先在这里直接 st.warning/st.info 会被按钮流程末尾的 st.rerun() 整个擦掉，
+    #   用户永远看不到（2026-10-07 22:58 刷新实测）。同时补上「市场候选存在但全被
+    #   40 分线过滤」这个原先漏报的场景。
     _own = set(st.session_state.stock_list or [])
     _market_n = sum(1 for _c in candidates if _c not in _own)
     _fb_n = sum(1 for _cd in candidates
                 if isinstance(results.get(_cd, (None, None))[0], dict)
                 and results.get(_cd, (None, None))[0].get('_source') == '腾讯兜底')
+    _survivors_market = sum(1 for _k in pool if _k not in _own)
     _diag = str(st.session_state.get(MARKET_LIST_DIAG_KEY) or "")
+    _msgs = []
     if candidates and _market_n == 0:
-        st.warning(f"⚠️ 本轮候选只有自选股（{len(candidates)} 只）：资金热度榜与全市场抽样均未取到。"
-                   f"清单来源状态：{_diag or '未知'}。动态池可能长期停留在自选股圈子里。")
-    elif _fb_n > 0:
-        st.info(f"ℹ️ {_fb_n}/{len(candidates)} 只候选的基本面来自腾讯兜底（东财不可用），"
-                "ROE/盈利项缺失，评分偏低属预期。")
+        _msgs.append(('warn', f"⚠️ 本轮候选只有自选股（{len(candidates)} 只）：资金热度榜与全市场抽样均未取到。"
+                              f"清单来源状态：{_diag or '未知'}。动态池会停留在自选股圈子里。"))
+    else:
+        if _market_n > 0 and _survivors_market == 0:
+            _msgs.append(('warn', f"⚠️ 市场候选 {_market_n} 只全部被 40 分淘汰线过滤，无一入池。"
+                                  "东财不可用时的腾讯兜底缺 ROE/盈利/行业，评分系统性偏低是常见主因。"))
+        if _fb_n > 0:
+            _msgs.append(('info', f"ℹ️ {_fb_n}/{len(candidates)} 只候选的基本面来自腾讯兜底（东财不可用），"
+                                  "ROE/盈利项缺失，评分偏低属预期。"))
+    st.session_state['dynamic_pool_diag'] = {
+        'ts': now_str, 'stamp': POOL_ENGINE_STAMP,
+        'total': len(candidates),
+        'own': _cand_stats.get('own', 0), 'hot': _cand_stats.get('hot', 0),
+        'market_n': _market_n,
+        'market_pages_ok': _cand_stats.get('market_pages_ok', 0),
+        'market_codes_raw': _cand_stats.get('market_codes_raw', 0),
+        'survivors_market': _survivors_market, 'fb_n': _fb_n,
+        'pool_size': len(pool), 'list_src': _diag,
+        'market_unavailable': _cand_stats.get('market_unavailable', ''),
+        'market_error': _cand_stats.get('market_error', ''),
+        'msgs': _msgs,
+    }
     progress.progress(100, text="✅ 完成"); progress.empty(); save_dynamic_pool(pool); return pool
+
+POOL_ENGINE_STAMP = "2026-10-07c"   # 池引擎版本戳：显示在动态池页，用于确认线上跑的是哪版代码
 
 def dynamic_pool_ui():
     st.markdown("---"); st.header("🌊 动态股票池")
+    st.caption(f"⚙️ 池引擎版本 **{POOL_ENGINE_STAMP}** —— 启动分层5日 · 腾讯兜底 · 刷新诊断。"
+               "若你看到的页面没有这行版本号，说明线上还没部署到新版。")
+    _pdiag = st.session_state.get('dynamic_pool_diag')
+    if _pdiag:
+        _line = (f"🔄 上次刷新 {_pdiag.get('ts', '—')} · 候选 {_pdiag.get('total', 0)} 只"
+                 f"（自选 {_pdiag.get('own', 0)} · 热度榜 {_pdiag.get('hot', 0)} ·"
+                 f" 全市场抽样 {_pdiag.get('market_n', 0)}，清单 {_pdiag.get('market_pages_ok', 0)} 页"
+                 f"/{_pdiag.get('market_codes_raw', 0)} 只）"
+                 f" → 入池 {_pdiag.get('pool_size', 0)} 只（市场股 {_pdiag.get('survivors_market', 0)}）")
+        if _pdiag.get('fb_n'):
+            _line += f" · 腾讯兜底 {_pdiag.get('fb_n', 0)} 只"
+        st.caption(_line)
+        if _pdiag.get('market_unavailable') or _pdiag.get('market_error'):
+            st.caption(f"ℹ️ 全市场抽样未取到：{_pdiag.get('market_unavailable') or ''}"
+                       f"{_pdiag.get('market_error') or ''}")
+        for _lv, _msg in (_pdiag.get('msgs') or []):
+            (st.warning if _lv == 'warn' else st.info)(_msg)
     col_sent, col_pool_info = st.columns([1, 1])
     with col_sent:
         sentiment = get_market_sentiment(); s_score = sentiment['score']
@@ -8997,6 +9053,8 @@ try:
             st.plotly_chart(plot_daily_chart(df_daily.tail(120), symbol, latest, st.session_state.chart_reset_key), use_container_width=True, config=PLOTLY_CONFIG_DAILY)
             st.caption("💡 **放大**：在图上按住左键拖出矩形框，松开即放大该区域（主图与成交量**同步缩放**，在哪个子图上拖都可以）；"
                        "右上角工具栏有缩放 / 平移 / 自动缩放 / 重置按钮；双击图表或点「🔄 复位」回到初始视图。")
+            st.caption("📈 **威科夫标注**：图上出现淡蓝虚线框 + SC/AR/ST/Spring/SOS/LPS 标签 = 识别到吸筹区间"
+                       "（Spring/LPS 处会标买点三角）；**无标注 = 该股最近没有吸筹区间结构，属正常**，不是功能没上线。")
 
     with _tab_pick:
         # 扫描（今天扫到什么，按状态分组）→ 跟踪清单（我记住的票，唯一一处）→ 动态池
