@@ -258,6 +258,23 @@ BAND_BOARD_MAP = {
     "通信": ["600941", "600498", "000063", "600487", "601728", "600522", "002281", "300308"],
 }
 
+# 东财行业名(f127) ↔ BAND_BOARD_MAP 板块名 的别名对齐（2026-10-08）：
+# 东财行业接口挂、但个股基本面接口还活着时，full_data['industry'] 是东财的行业分类名，
+# 与腾讯兜底的 BAND_BOARD_MAP 键名不一致，靠这张表把两者对上，行业景气兜底才能命中。
+_INDUSTRY_ALIAS = {
+    "半导体": "半导体", "芯片": "半导体", "集成电路": "半导体",
+    "酿酒": "白酒", "白酒": "白酒", "饮料": "白酒",
+    "银行": "银行", "证券": "券商", "券商": "券商",
+    "医药": "医药", "医疗": "医药", "生物制品": "医药",
+    "汽车": "汽车", "汽车零部件": "汽车",
+    "光伏": "光伏", "新能源": "新能源", "电池": "新能源", "锂电": "新能源",
+    "房地产": "地产", "地产": "地产",
+    "电力": "电力", "有色": "有色", "有色金属": "有色",
+    "通信": "通信", "计算机": "人工智能", "软件": "人工智能",
+    "消费电子": "消费电子", "电子": "消费电子",
+    "军工": "军工", "国防": "军工",
+}
+
 # ================= 3. 通知去重机制 =================
 def _load_notify_log(): return _load_json(NOTIFY_LOG_FILE, {})
 def _save_notify_log(log): _save_json(NOTIFY_LOG_FILE, log)
@@ -1915,9 +1932,12 @@ def calculate_daily_indicators(df):
         # SOS 突破日刻意不给买点（图三原话：当天盲目追入是散户最易犯的错误）。
         wyck_buy = df['WyckBuy'].fillna(False).astype(bool)
         df.loc[wyck_buy & (df['Signal'].shift(1) != 1), 'Signal'] = 1
+        # 派发破位(D_BRK)确认日 = 威科夫卖点，与原卖出条件 OR 并入；UTAD 当日只警示不追空。
+        wyck_sell = df['WyckSell'].fillna(False).astype(bool)
+        df.loc[wyck_sell & (df['Signal'].shift(1) != -1), 'Signal'] = -1
     except Exception as e:
         _log("calculate_daily_indicators/wyckoff", e)
-        for _c in ('WyckEvent', 'WyckBuy', 'WyckZoneLow', 'WyckZoneHigh'):
+        for _c in ('WyckEvent', 'WyckBuy', 'WyckSell', 'WyckZoneLow', 'WyckZoneHigh'):
             if _c not in df.columns:
                 df[_c] = '' if _c == 'WyckEvent' else False
     return df
@@ -1929,6 +1949,10 @@ def calculate_daily_indicators(df):
 #   1-2 根 K 线内收回、收盘回区间内；量比 SC 缩 30%~40%）→ SOS 强势信号（放量收上轨之上）
 #   → LPS 最后支撑（突破后缩量回踩上轨不破，最安全的加仓点）。
 #   买点口径（按图三原文）：Spring=第一试探性买点，LPS=最安全加仓点；SOS 当日不追。
+#   派发区间（distribution，2026-10-08 新增，与吸筹对称）：BC 买入高潮（高位放巨量滞涨/长上影）
+#   → AR 自动反应（低点定区间下轨）→ ST 二次测试（缩量反弹不破 BC 高点，上轨确认）
+#   → UT/UTAD 上冲回落（放量冲上轨却收回到轨内，派发标志）→ 破位（连续收于下轨之下，
+#   缩量跌破 = 真派发确认，卖出点）。卖出口径：破位确认日 = 威科夫卖点；UTAD 当日只警示不追空。
 # 实现纪律：
 #   * 唯一来源：全仓库只此一份，主图/选股共用，不再复制第二份（分时买卖点的历史教训）。
 #   * 防未来函数：状态机逐根推进，每个事件的判定与标注都只使用截至当日的数据；
@@ -1941,12 +1965,13 @@ def calculate_daily_indicators(df):
 # 抽取本模块常量注入采集环境，这里新增的模块级常量不会被注入，局部量随函数体走，最稳。
 def detect_wyckoff(df):
     n = len(df)
-    ev = [''] * n                 # 事件标注列
+    ev = [''] * n                 # 事件标注列（吸筹+派发共用，派发事件前缀 D_）
     buy = [False] * n             # 威科夫买点（Spring/LPS 确认日）
-    zlow = [np.nan] * n           # 当日有效的吸筹区间下轨
-    zhigh = [np.nan] * n          # 当日有效的吸筹区间上轨
+    sell = [False] * n            # 威科夫卖点（派发破位确认日）
+    zlow = [np.nan] * n           # 当日有效的区间下轨（吸筹下轨 / 派发下轨）
+    zhigh = [np.nan] * n          # 当日有效的区间上轨（吸筹上轨 / 派发上轨）
     if n < 45:                    # 60日量峰+30日回撤窗口都凑不齐，直接不判
-        df['WyckEvent'] = ''; df['WyckBuy'] = False
+        df['WyckEvent'] = ''; df['WyckBuy'] = False; df['WyckSell'] = False
         df['WyckZoneLow'] = np.nan; df['WyckZoneHigh'] = np.nan
         return df
     o = df['Open'].to_numpy(dtype=float); c = df['Close'].to_numpy(dtype=float)
@@ -1969,6 +1994,14 @@ def detect_wyckoff(df):
     LPS_MAX = 10           # SOS 后 ≤10 根内出现缩量回踩（LPS 加仓点）
     LPS_PCT = 1.03         # LPS 回踩深度：Low ≤ 上轨×1.03 且不破下轨
     FAIL_BRK = 2           # 连续 2 根收于下轨之下 = 放量真跌破 → 吸筹失败复位
+    # ---- 派发（distribution）阈值：与吸筹镜像 ----
+    RISE_MIN = 0.30        # BC 前：从近 60 日低点涨幅 ≥30%（“长时间拉高”的量化）
+    BC_VOL_WIN = 60        # BC：成交量为其滚动 60 日最大（高位放巨量）
+    D_AR_MAX = 5           # BC 后 ≤5 根内出现回落低点（AR 定下轨）
+    D_ST_MAX = 25          # AR 后 ≤25 根内出现缩量二次测试（上轨确认）
+    D_ST_VOL_R = 0.7       # ST/UT 量 ≤ BC 量的 70%（比买入高潮缩量）
+    UTAD_MAX = 2           # 冲上轨后 ≤2 根内收回（上冲回落确认）
+    D_BRK = 2              # 连续 2 根收于下轨之下 = 缩量真跌破 → 派发确认，卖点
 
     # IDLE 找 SC → WAIT_AR 找反弹定上轨 → WAIT_ST 找缩量回踩定下轨
     # → IN_ZONE 找 Spring/SOS → WAIT_LPS 找回踩加仓点
@@ -2092,8 +2125,109 @@ def detect_wyckoff(df):
                 state = 'IDLE'               # 进入拉升后复位，等下一轮循环再识别
                 zone_from = -1               # 区间成功走完：轨道列保留到 LPS 日供绘图
 
+    # ================= 派发（distribution）状态机：与吸筹镜像，输出威科夫卖点 =================
+    # 序列：BC 买入高潮 → AR 自动反应（低点定下轨）→ ST 二次测试（缩量反弹不破 BC 高点，
+    # 上轨确认）→ UT/UTAD 上冲回落（放量冲上轨却收回到轨内，派发标志）→ 破位（连续
+    # 收于下轨之下，缩量跌破 = 真派发确认 → 卖点）。事件名加 D_ 前缀，与吸筹事件区分。
+    # 复用 zlow/zhigh/ev 三列：一只票同一时段要么底部吸筹、要么顶部派发，二者互斥。
+    d_state = 'IDLE'
+    d_bc_i = -1; d_bc_vol = 0.0
+    d_zone_low = d_zone_high = np.nan
+    d_ar_i = -1; d_utad_pend = -1; d_brk_cnt = 0; d_zone_from = -1
+    for i in range(20, n):
+        if d_state == 'IDLE':
+            if v[i] <= 0 or np.isnan(v[i]):
+                continue
+            lo60 = np.nanmin(l[max(0, i - 60):i]) if i >= 1 else l[i]
+            rise_from_low = (c[i] - lo60) / lo60 if lo60 > 0 else 0.0
+            _dm10 = np.nanmean(v[max(0, i - 10):i]) if i >= 1 else 0.0
+            _dvol_surge = (not np.isnan(_dm10)) and _dm10 > 0 and v[i] >= 1.5 * _dm10
+            # BC：高位放巨量 + 滞涨（收在当日振幅下 1/3 = 长上影/阴线，买盘被卖盘消化）
+            _rng = h[i] - l[i]
+            _stall = _rng > 0 and c[i] <= l[i] + _rng / 3
+            is_bc = (v[i] >= np.nanmax(v[max(0, i - BC_VOL_WIN + 1):i + 1])
+                     and rise_from_low >= RISE_MIN and _stall and _dvol_surge)
+            if is_bc:
+                d_bc_i, d_bc_vol = i, v[i]
+                d_zone_high = h[i]
+                d_zone_low = np.nan
+                ev[i] = 'D_BC'; zhigh[i] = d_zone_high; d_zone_from = i
+                d_state, d_ar_i, d_utad_pend, d_brk_cnt = 'D_WAIT_AR', -1, -1, 0
+        elif d_state == 'D_WAIT_AR':
+            if c[i] > d_zone_high * 1.03:      # 没有像样回落、继续创新高 → 剧本不成立
+                d_state = 'IDLE'
+                for _k in range(max(0, d_zone_from), i + 1):
+                    zlow[_k] = np.nan; zhigh[_k] = np.nan
+                    if ev[_k].startswith('D_'): ev[_k] = ''
+                continue
+            if i - d_bc_i > D_AR_MAX:
+                d_state = 'IDLE'
+                for _k in range(max(0, d_zone_from), i + 1):
+                    zlow[_k] = np.nan; zhigh[_k] = np.nan
+                    if ev[_k].startswith('D_'): ev[_k] = ''
+                continue
+            if np.isnan(d_zone_low) or l[i] < d_zone_low:
+                d_zone_low = l[i]; d_ar_i = i
+            if i == d_bc_i + D_AR_MAX or (i > d_bc_i and c[i] < c[d_bc_i]):
+                ev[d_ar_i] = 'D_AR'
+                for k in range(d_bc_i, d_ar_i + 1):
+                    zlow[k] = d_zone_low; zhigh[k] = d_zone_high
+                d_state = 'D_WAIT_ST'
+        elif d_state == 'D_WAIT_ST':
+            if c[i] > d_zone_high * 1.03:
+                d_state = 'IDLE'
+                for _k in range(max(0, d_zone_from), i + 1):
+                    zlow[_k] = np.nan; zhigh[_k] = np.nan
+                    if ev[_k].startswith('D_'): ev[_k] = ''
+                continue
+            if i - d_ar_i > D_ST_MAX:
+                d_state = 'IDLE'
+                for _k in range(max(0, d_zone_from), i + 1):
+                    zlow[_k] = np.nan; zhigh[_k] = np.nan
+                    if ev[_k].startswith('D_'): ev[_k] = ''
+                continue
+            if (h[i] <= d_zone_high * 1.005 and v[i] <= d_bc_vol * D_ST_VOL_R
+                    and l[i] > d_zone_low):
+                ev[i] = 'D_ST'
+                d_zone_from = d_bc_i
+                for k in range(d_zone_from, i + 1):
+                    zlow[k] = d_zone_low; zhigh[k] = d_zone_high
+                d_state = 'D_IN_ZONE'
+        elif d_state == 'D_IN_ZONE':
+            zlow[i] = d_zone_low; zhigh[i] = d_zone_high
+            if d_utad_pend >= 0:
+                # 冲上轨后等待收回：收回日才确认 UTAD（防未来函数）
+                if c[i] <= d_zone_high:
+                    ev[d_utad_pend] = 'D_UT'; ev[i] = 'D_UTAD'
+                    d_utad_pend = -1
+                elif i - d_utad_pend >= UTAD_MAX:
+                    d_state = 'IDLE'; d_utad_pend = -1
+                    for _k in range(max(0, d_zone_from), i + 1):
+                        zlow[_k] = np.nan; zhigh[_k] = np.nan
+                        if ev[_k].startswith('D_'): ev[_k] = ''
+                    d_zone_from = -1
+                continue
+            if h[i] > d_zone_high:
+                # 放量冲上轨（试探出货）→ 等 1-2 根内收回
+                if v[i] >= d_bc_vol * D_ST_VOL_R:
+                    d_utad_pend = i
+                    if c[i] <= d_zone_high:      # 当日盘中冲、收盘已收回：直接确认 UTAD
+                        ev[i] = 'D_UTAD'; d_utad_pend = -1
+            elif c[i] < d_zone_low:
+                # 收于下轨之下：缩量跌破 = 派发确认，计数 2 根确认卖点
+                if v[i] <= d_bc_vol * D_ST_VOL_R:
+                    d_brk_cnt += 1
+                    if d_brk_cnt >= D_BRK:
+                        ev[i] = 'D_BRK'; sell[i] = True
+                        d_state = 'IDLE'
+                        d_zone_from = -1
+                else:
+                    d_brk_cnt = 0
+            else:
+                d_brk_cnt = 0
+
     # 只保留最近一个区间的轨道/事件标注：从尾部回找最后一个非 nan 轨道日，
-    # 把它之前所有区间的轨道与事件清掉（WyckBuy 买点不清——历史买点是事实）。
+    # 把它之前所有区间的轨道与事件清掉（WyckBuy/WyckSell 不清——历史信号是事实）。
     last = -1
     for i in range(n - 1, -1, -1):
         if not np.isnan(zlow[i]):
@@ -2104,11 +2238,13 @@ def detect_wyckoff(df):
             first -= 1
         for i in range(0, first):
             zlow[i] = np.nan; zhigh[i] = np.nan
-            if ev[i] in ('SC', 'AR', 'ST', 'Spring', 'Spring收', 'SOS', 'LPS'):
+            if ev[i] in ('SC', 'AR', 'ST', 'Spring', 'Spring收', 'SOS', 'LPS',
+                         'D_BC', 'D_AR', 'D_ST', 'D_UT', 'D_UTAD', 'D_BRK'):
                 ev[i] = ''
 
     df['WyckEvent'] = ev
     df['WyckBuy'] = buy
+    df['WyckSell'] = sell
     df['WyckZoneLow'] = zlow
     df['WyckZoneHigh'] = zhigh
     return df
@@ -8458,7 +8594,14 @@ def get_market_sentiment():
 
 @st.cache_data(ttl=600, show_spinner=False)
 def get_industry_prosperity():
-    """获取行业板块景气度，带多 host 容错。"""
+    """获取行业板块景气度，带多 host 容错。
+
+    ★ 2026-10-08：东财 6 host 全挂时原先直接返回空 dict → 动态池行业景气项整段失效，
+      评分只剩情绪+历史位置（系统性偏低）。新增【腾讯兜底】：用预定义板块(BAND_BOARD_MAP)
+      的龙头成分股，经腾讯批量报价(qt.gtimg.cn，项目已验证最稳源)算各板块平均涨跌幅，
+      映射成同构的 {板块名: {score, change_pct, main_flow}} —— 零额外脆弱依赖。
+      main_flow 腾讯不提供 → 0（该字段下游只在 >5 时加分，兜底期不加，不塌方）。
+    """
     industries = {}
     params = {"pn": "1", "pz": "100", "po": "1", "np": "1", "fltt": "2", "invt": "2", "fid": "f62", "fs": "m:90+t:2", "fields": "f12,f14,f2,f3,f62"}
     for base_url in _EM_HOSTS:
@@ -8478,7 +8621,56 @@ def get_industry_prosperity():
         except Exception as e:
             _log("get_industry_prosperity", e)
             continue
-    return industries
+    if industries:
+        return industries
+    # ---- 东财全军覆没 → 腾讯兜底：预定义板块成分股算平均涨跌幅 ----
+    return _industry_prosperity_tencent_fallback()
+
+def _industry_prosperity_tencent_fallback():
+    """腾讯兜底行业景气：BAND_BOARD_MAP 各板块龙头成分股批量报价 → 平均涨跌幅 → 景气度。
+
+    涨跌幅按 ±5% 线性映射到 [0,100]（0 分=全板块跌停，100 分=全板块涨停，中性 50 分）。
+    返回 key 用 BAND_BOARD_MAP 的板块名（与东财行业名通过 _INDUSTRY_ALIAS 对齐，见下）。
+    """
+    out = {}
+    try:
+        # 一次批量报价所有成分股（去重），腾讯单次可带多只
+        all_codes = sorted({c for codes in BAND_BOARD_MAP.values() for c in codes})
+        # 分批（每批 ≤ 60 只，防 URL 过长）
+        quote = {}
+        for start in range(0, len(all_codes), 60):
+            batch = all_codes[start:start + 60]
+            q = ",".join(_quote_prefix(c) + c for c in batch)
+            ok, text, err = _http_get_text(f"https://qt.gtimg.cn/q={q}",
+                                           encoding='gbk', timeout=(5, 10), retries=2)
+            if not ok or not text:
+                _log("_industry_prosperity_tencent_fallback/batch", err or "空响应")
+                continue
+            for line in text.strip().split(';'):
+                if '~' not in line:
+                    continue
+                p = line.split('~')
+                if len(p) <= 32:
+                    continue
+                # 腾讯报价字段：p[0]=v_sh600584="51(状态)，p[1]=名称，p[2]=纯代码，
+                # p[32]=涨跌幅%。代码直接取 p[2]，比从 p[0] 里抠前缀更稳。
+                code = str(p[2]).strip()
+                if len(code) == 6 and code.isdigit():
+                    try:
+                        quote[code] = _safe_float_or_none(p[32])   # 字段32=涨跌幅%
+                    except (ValueError, IndexError):
+                        quote[code] = None
+        for board, codes in BAND_BOARD_MAP.items():
+            pcts = [quote[c] for c in codes if c in quote and quote[c] is not None]
+            if not pcts:
+                continue
+            avg_pct = sum(pcts) / len(pcts)
+            # ±5% 线性映射到 [0,100]，中性 50
+            score = round(min(100, max(0, 50 + avg_pct * 10)), 1)
+            out[board] = {'score': score, 'change_pct': round(avg_pct, 2), 'main_flow': 0.0}
+    except Exception as e:
+        _log("_industry_prosperity_tencent_fallback", e)
+    return out
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_hot_money_stocks(pages=3):
@@ -8717,8 +8909,15 @@ def refresh_dynamic_pool(max_candidates=30):
             ind_name = full_data['industry']
             if ind_name in industry_all: industry_data = industry_all[ind_name]
             else:
-                for k, v in industry_all.items():
-                    if k and (k in ind_name or ind_name in k): industry_data = v; break
+                # ① 东财行业名 ↔ 兜底板块名 的别名对齐（东财挂行业接口、个股基本面还活着时）
+                for alias, board in _INDUSTRY_ALIAS.items():
+                    if alias and (alias in ind_name or ind_name in alias):
+                        if board in industry_all:
+                            industry_data = industry_all[board]; break
+                # ② 兜底：子串双向模糊匹配（原逻辑）
+                if industry_data is None:
+                    for k, v in industry_all.items():
+                        if k and (k in ind_name or ind_name in k): industry_data = v; break
         hm = hot_money.get(code_)
         result = calculate_dynamic_score(code_, full_data, industry_data, sentiment, hm, hist)
         if code_ not in pool:
@@ -8764,11 +8963,11 @@ def refresh_dynamic_pool(max_candidates=30):
     }
     progress.progress(100, text="✅ 完成"); progress.empty(); save_dynamic_pool(pool); return pool
 
-POOL_ENGINE_STAMP = "2026-10-07c"   # 池引擎版本戳：显示在动态池页，用于确认线上跑的是哪版代码
+POOL_ENGINE_STAMP = "2026-10-09a"   # 池引擎版本戳：显示在动态池页，用于确认线上跑的是哪版代码
 
 def dynamic_pool_ui():
     st.markdown("---"); st.header("🌊 动态股票池")
-    st.caption(f"⚙️ 池引擎版本 **{POOL_ENGINE_STAMP}** —— 启动分层5日 · 腾讯兜底 · 刷新诊断。"
+    st.caption(f"⚙️ 池引擎版本 **{POOL_ENGINE_STAMP}** —— 启动分层5日 · 腾讯兜底(个股/行业景气) · 刷新诊断。"
                "若你看到的页面没有这行版本号，说明线上还没部署到新版。")
     _pdiag = st.session_state.get('dynamic_pool_diag')
     if _pdiag:
@@ -8832,13 +9031,17 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
     fig.add_trace(go.Scatter(x=df['Date'], y=df['MA30'], mode='lines', name='MA30', line=dict(color='#00ff00', width=1.2)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['Date'], y=df['MA250'], mode='lines', name='年线', line=dict(color='#00ccff', width=1.2, dash='dash')), row=1, col=1)
     buy_s = df[df['Signal'] == 1]; sell_s = df[df['Signal'] == -1]
-    # ★ 威科夫买点特别标注（2026-10-08）：Spring/LPS 确认日从普通买点里单独拆出，
-    #   用更大的橙色三角独立标出，hover 写明「威科夫买点」，与普通买点（红三角）一眼区分。
+    # ★ 威科夫买卖点特别标注（2026-10-08）：买点(Spring/LPS)与卖点(派发破位)从普通信号里
+    #   单独拆出，统一用【蓝色箭头】标出 —— 买入=向上蓝色三角、卖出=向下蓝色三角，
+    #   hover 写明「威科夫买点/卖点」，与普通买点(红)/卖点(绿)一眼区分。
     _wyck_buy = df[df['WyckBuy'].fillna(False).astype(bool)] if 'WyckBuy' in df.columns else df.iloc[0:0]
+    _wyck_sell = df[df['WyckSell'].fillna(False).astype(bool)] if 'WyckSell' in df.columns else df.iloc[0:0]
     _regular_buy = buy_s[~buy_s.index.isin(_wyck_buy.index)] if not _wyck_buy.empty else buy_s
+    _regular_sell = sell_s[~sell_s.index.isin(_wyck_sell.index)] if not _wyck_sell.empty else sell_s
     if not _regular_buy.empty: fig.add_trace(go.Scatter(x=_regular_buy['Date'], y=_regular_buy['Low'] * 0.97, mode='markers', name='买点', marker=dict(symbol='triangle-up', size=18, color='#ff3333', line=dict(width=2, color='#ffffff')), hovertemplate='买点<br>日期:%{x}<br>价格:%{customdata:.3f}<extra></extra>', customdata=_regular_buy['Close']), row=1, col=1)
-    if not _wyck_buy.empty: fig.add_trace(go.Scatter(x=_wyck_buy['Date'], y=_wyck_buy['Low'] * 0.95, mode='markers', name='威科夫买点', marker=dict(symbol='triangle-up', size=22, color='#ffaa00', line=dict(width=2, color='#ffffff')), hovertemplate='<b>威科夫买点</b>（Spring 试探 / LPS 加仓）<br>日期:%{x}<br>价格:%{customdata:.3f}<extra></extra>', customdata=_wyck_buy['Close']), row=1, col=1)
-    if not sell_s.empty: fig.add_trace(go.Scatter(x=sell_s['Date'], y=sell_s['High'] * 1.03, mode='markers', name='卖点', marker=dict(symbol='triangle-down', size=18, color='#00cc66', line=dict(width=2, color='#ffffff')), hovertemplate='卖点<br>日期:%{x}<br>价格:%{customdata:.3f}<extra></extra>', customdata=sell_s['Close']), row=1, col=1)
+    if not _wyck_buy.empty: fig.add_trace(go.Scatter(x=_wyck_buy['Date'], y=_wyck_buy['Low'] * 0.95, mode='markers', name='威科夫买点', marker=dict(symbol='triangle-up', size=22, color='#3d9bff', line=dict(width=2, color='#ffffff')), hovertemplate='<b>威科夫买点</b>（Spring 试探 / LPS 加仓）<br>日期:%{x}<br>价格:%{customdata:.3f}<extra></extra>', customdata=_wyck_buy['Close']), row=1, col=1)
+    if not _regular_sell.empty: fig.add_trace(go.Scatter(x=_regular_sell['Date'], y=_regular_sell['High'] * 1.03, mode='markers', name='卖点', marker=dict(symbol='triangle-down', size=18, color='#00cc66', line=dict(width=2, color='#ffffff')), hovertemplate='卖点<br>日期:%{x}<br>价格:%{customdata:.3f}<extra></extra>', customdata=_regular_sell['Close']), row=1, col=1)
+    if not _wyck_sell.empty: fig.add_trace(go.Scatter(x=_wyck_sell['Date'], y=_wyck_sell['High'] * 1.05, mode='markers', name='威科夫卖点', marker=dict(symbol='triangle-down', size=22, color='#3d9bff', line=dict(width=2, color='#ffffff')), hovertemplate='<b>威科夫卖点</b>（派发破位）<br>日期:%{x}<br>价格:%{customdata:.3f}<extra></extra>', customdata=_wyck_sell['Close']), row=1, col=1)
     # ---- 威科夫吸筹区间可视化（detect_wyckoff 输出，只画最近一个区间）----
     if 'WyckZoneLow' in df.columns:
         _zi = df.index[df['WyckZoneLow'].notna()]
@@ -8850,9 +9053,12 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
                           line=dict(color='#89b4fa', width=1, dash='dash'),
                           fillcolor='rgba(137,180,250,0.06)', layer='below')
             _ev_map = {'SC': ('SC 卖出高潮', '#89b4fa', 1.06), 'AR': ('AR 自动反弹', '#89b4fa', 1.03),
-                       'ST': ('ST 二次测试', '#89b4fa', 0.985), 'Spring': ('Spring 弹簧·试探买点', '#ffaa00', 0.95),
-                       'Spring收': ('Spring 确认', '#ffaa00', 0.95), 'SOS': ('SOS 强势信号', '#ffaa00', 1.06),
-                       'LPS': ('LPS 最后支撑·加仓点', '#ffaa00', 1.03)}
+                       'ST': ('ST 二次测试', '#89b4fa', 0.985), 'Spring': ('Spring 弹簧·试探买点', '#3d9bff', 0.95),
+                       'Spring收': ('Spring 确认', '#3d9bff', 0.95), 'SOS': ('SOS 强势信号', '#3d9bff', 1.06),
+                       'LPS': ('LPS 最后支撑·加仓点', '#3d9bff', 1.03),
+                       'D_BC': ('BC 买入高潮', '#f38ba8', 1.06), 'D_AR': ('D_AR 自动反应', '#f38ba8', 0.97),
+                       'D_ST': ('D_ST 二次测试', '#f38ba8', 1.01), 'D_UT': ('D_UT 上冲', '#f38ba8', 1.06),
+                       'D_UTAD': ('UTAD 上冲回落', '#f38ba8', 1.04), 'D_BRK': ('派发破位·卖出', '#3d9bff', 0.94)}
             for _i in _zi:
                 _e = df['WyckEvent'].iloc[_i]
                 if not _e or _e not in _ev_map:
@@ -8869,8 +9075,13 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
     if not _wyck_buy.empty:
         fig.add_trace(go.Scatter(x=_wyck_buy['Date'], y=df.loc[_wyck_buy.index, 'Volume'] * 1.08,
                                   mode='markers', name='威科夫买点(量)',
-                                  marker=dict(symbol='triangle-up', size=11, color='#ffaa00', line=dict(width=1, color='#ffffff')),
+                                  marker=dict(symbol='triangle-up', size=11, color='#3d9bff', line=dict(width=1, color='#ffffff')),
                                   hovertemplate='威科夫买点对应成交量<br>%{y:.0f}<extra></extra>'), row=2, col=1)
+    if not _wyck_sell.empty:
+        fig.add_trace(go.Scatter(x=_wyck_sell['Date'], y=df.loc[_wyck_sell.index, 'Volume'] * 1.08,
+                                  mode='markers', name='威科夫卖点(量)',
+                                  marker=dict(symbol='triangle-down', size=11, color='#3d9bff', line=dict(width=1, color='#ffffff')),
+                                  hovertemplate='威科夫卖点对应成交量<br>%{y:.0f}<extra></extra>'), row=2, col=1)
     if 'VOL_MA5' in df.columns: fig.add_trace(go.Scatter(x=df['Date'], y=df['VOL_MA5'], mode='lines', name='VOL_MA5', line=dict(color='#ffffff', width=1.5), showlegend=False), row=2, col=1)
     if 'VOL_MA10' in df.columns: fig.add_trace(go.Scatter(x=df['Date'], y=df['VOL_MA10'], mode='lines', name='VOL_MA10', line=dict(color='#ffaa00', width=1.5), showlegend=False), row=2, col=1)
     cur_vol = latest['Volume']; vol_ma5 = latest['VOL_MA5'] if not pd.isna(latest.get('VOL_MA5', np.nan)) else 0; vol_ma10 = latest['VOL_MA10'] if not pd.isna(latest.get('VOL_MA10', np.nan)) else 0
