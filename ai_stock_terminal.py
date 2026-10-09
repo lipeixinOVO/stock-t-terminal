@@ -7927,6 +7927,61 @@ def band_memory_ui():
             if node.get('reasons'):
                 st.caption(f"📋 最近依据：{node['reasons']}")
 
+            # ★ 2026-10-09（用户要求）：每只票一张**默认收起**的日K图，虚线标「启动点/目标位」。
+            #   懒加载：点开才拉日线 + 算指标 + 画图 —— 几十只票一次全拉会把页面拖垮。
+            #   ★ 2026-10-09 晚补（用户反馈「目标价不是自动刷新的」）：点开时顺手把
+            #     突破位/平台低点/启动点按**最新日线**重算并就地更新节点 —— 目标价不用等
+            #     「刷新全部状态」，打开图就自动跟上行情。阈值与 _calculate_band_metrics
+            #     逐字同尺：突破位 = 不含当天的 60 日最高（len>60 才算），平台低点 = 含当天 60 日低。
+            with st.expander("📊 日K图 · 启动点 / 目标位（点开自动重算）", expanded=False):
+                try:
+                    _dk = _get_daily_history(code)
+                    if _dk is None or len(_dk) < 60:
+                        st.caption("日线暂未拉到（数据源可能繁忙），稍后再点开试一次。")
+                    else:
+                        _dk = calculate_daily_indicators(_dk)
+                        _dirty = False
+                        # -- 突破位 / 平台低点：与 _calculate_band_metrics 同尺重算 --
+                        _lp = (float(_dk['High'].tail(61).iloc[:-1].max()) if len(_dk) > 60 else 0.0)
+                        _ll = float(_dk['Low'].tail(60).min())
+                        if _lp > 0 and abs(_lp - float(node.get('breakout_pivot') or 0)) > 1e-6:
+                            node['breakout_pivot'] = _lp; _dirty = True
+                        if _ll > 0 and abs(_ll - float(node.get('platform_low') or 0)) > 1e-6:
+                            node['platform_low'] = _ll; _dirty = True
+                        # -- 启动点：按最新日线重算（算不出 days=0，保持旧值不动）--
+                        _rs = _band_run_start(_dk)
+                        if _rs.get('days', 0) > 0:
+                            _cur_c = float(_dk['Close'].iloc[-1])
+                            _gain = ((_cur_c / _rs['price']) - 1.0) * 100.0 \
+                                if _rs['price'] > 0 and _cur_c > 0 else 0.0
+                            _live = {'run_days': int(_rs['days']),
+                                     'run_start_date': str(_rs.get('date') or '')[:10],
+                                     'run_start_price': float(_rs.get('price') or 0.0),
+                                     'run_gain_pct': float(_gain)}
+                            for _k, _v in _live.items():
+                                try:
+                                    _old = node.get(_k)
+                                    _changed = (str(_old) != str(_v)) if _k == 'run_start_date' \
+                                        else abs(float(_old or 0) - float(_v)) > 1e-6
+                                except Exception:
+                                    _changed = True
+                                if _changed:
+                                    node[_k] = _v
+                                    _dirty = True
+                        if _dirty:
+                            save_band_memory(mem)
+                        st.plotly_chart(
+                            plot_band_entry_chart(_dk, node, st.session_state.get('chart_reset_key', 0)),
+                            use_container_width=True, config=PLOTLY_CONFIG_DAILY)
+                        st.caption("🔵 竖虚线 = 本轮启动点（日期/起点价/至今涨幅）　🟡 横虚线 = 目标位"
+                                   "（测量移动法，参考位非预测）。"
+                                   + ("　✅ 打开时已按最新日线自动重算突破位/平台低点/启动点，"
+                                      "上方卡片数值在下次页面刷新时同步。" if _dirty
+                                      else "　数值已是最新，无需重算。"))
+                except Exception as _e:
+                    _log("band_memory_ui/daily_chart", _e)
+                    st.caption("日K图绘制失败（已拦截，不影响记忆清单其他功能）。")
+
             # 轨迹：一眼看清「什么时候变成什么的」
             hist = node.get('history') or []
             if hist:
@@ -7938,26 +7993,6 @@ def band_memory_ui():
                         f"　价格 {_fmt_price(h.get('price'))}"
                         f"　<span style='color:{_hc};font-size:12px;'>{h.get('event', '')}</span>",
                         unsafe_allow_html=True)
-
-            # ★ 2026-10-09（用户要求）：每只票加一张**默认收起**的日K图，图里用虚线
-            #   标出「启动点」与「目标位置」，并标注「启动观点」（启动日期/起点价/至今涨幅）。
-            #   懒加载：只有点开这个 expander 才拉日线 + 算指标 + 画图 —— 记忆清单可能
-            #   几十只票，若一次性全拉日线会把页面拖到超时，必须折叠时才取数。
-            with st.expander(f"📊 日K图 · 启动点 / 目标位（点开）", expanded=False):
-                try:
-                    _dk = _get_daily_history(code)
-                    if _dk is None or len(_dk) < 60:
-                        st.caption("日线暂未拉到（数据源可能繁忙），点「🔄 刷新全部状态」后再试。")
-                    else:
-                        _dk = calculate_daily_indicators(_dk)
-                        st.plotly_chart(
-                            plot_band_entry_chart(_dk, node, st.session_state.get('chart_reset_key', 0)),
-                            use_container_width=True, config=PLOTLY_CONFIG_DAILY)
-                        st.caption("🔵 竖虚线 = 本轮启动点（启动日期 + 起点价 + 至今涨幅）；"
-                                   "🟡 横虚线 = 目标位（测量移动法，参考位非预测）。")
-                except Exception as _e:
-                    _log("band_memory_ui/daily_chart", _e)
-                    st.caption("日K图绘制失败（已拦截，不影响记忆清单其他功能）。")
 
     # ---- 操作区 ----
     b1, b2, b3, b4 = st.columns(4)
