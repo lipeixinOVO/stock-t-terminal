@@ -9103,17 +9103,18 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
     fig.add_trace(go.Scatter(x=df['Date'], y=df['MA30'], mode='lines', name='MA30', line=dict(color='#00ff00', width=1.2)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['Date'], y=df['MA250'], mode='lines', name='年线', line=dict(color='#00ccff', width=1.2, dash='dash')), row=1, col=1)
     buy_s = df[df['Signal'] == 1]; sell_s = df[df['Signal'] == -1]
-    # ★ 威科夫买卖点特别标注（2026-10-08）：买点(Spring/LPS)与卖点(派发破位)从普通信号里
-    #   单独拆出，统一用【蓝色箭头】标出 —— 买入=向上蓝色三角、卖出=向下蓝色三角，
-    #   hover 写明「威科夫买点/卖点」，与普通买点(红)/卖点(绿)一眼区分。
+    # ★ 威科夫买卖点特别标注（2026-10-08 引入，2026-10-09 改样式）：买点(Spring/LPS)与
+    #   卖点(派发破位)从普通信号里单独拆出，统一用【蓝色「买」/「卖」文字】标出（原先蓝三角，
+    #   用户嫌不够直白，改为直接写「买」「卖」），hover 写明「威科夫买点/卖点」，
+    #   与普通买点(红三角)/卖点(绿三角)一眼区分。
     _wyck_buy = df[df['WyckBuy'].fillna(False).astype(bool)] if 'WyckBuy' in df.columns else df.iloc[0:0]
     _wyck_sell = df[df['WyckSell'].fillna(False).astype(bool)] if 'WyckSell' in df.columns else df.iloc[0:0]
     _regular_buy = buy_s[~buy_s.index.isin(_wyck_buy.index)] if not _wyck_buy.empty else buy_s
     _regular_sell = sell_s[~sell_s.index.isin(_wyck_sell.index)] if not _wyck_sell.empty else sell_s
     if not _regular_buy.empty: fig.add_trace(go.Scatter(x=_regular_buy['Date'], y=_regular_buy['Low'] * 0.97, mode='markers', name='买点', marker=dict(symbol='triangle-up', size=18, color='#ff3333', line=dict(width=2, color='#ffffff')), hovertemplate='买点<br>日期:%{x}<br>价格:%{customdata:.3f}<extra></extra>', customdata=_regular_buy['Close']), row=1, col=1)
-    if not _wyck_buy.empty: fig.add_trace(go.Scatter(x=_wyck_buy['Date'], y=_wyck_buy['Low'] * 0.95, mode='markers', name='威科夫买点', marker=dict(symbol='triangle-up', size=22, color='#3d9bff', line=dict(width=2, color='#ffffff')), hovertemplate='<b>威科夫买点</b>（Spring 试探 / LPS 加仓）<br>日期:%{x}<br>价格:%{customdata:.3f}<extra></extra>', customdata=_wyck_buy['Close']), row=1, col=1)
+    if not _wyck_buy.empty: fig.add_trace(go.Scatter(x=_wyck_buy['Date'], y=_wyck_buy['Low'] * 0.95, mode='text', name='威科夫买点', text=['买'] * len(_wyck_buy), textfont=dict(color='#3d9bff', size=14, family='Microsoft YaHei'), hovertemplate='<b>威科夫买点</b>（Spring 试探 / LPS 加仓）<br>日期:%{x}<br>价格:%{customdata:.3f}<extra></extra>', customdata=_wyck_buy['Close']), row=1, col=1)
     if not _regular_sell.empty: fig.add_trace(go.Scatter(x=_regular_sell['Date'], y=_regular_sell['High'] * 1.03, mode='markers', name='卖点', marker=dict(symbol='triangle-down', size=18, color='#00cc66', line=dict(width=2, color='#ffffff')), hovertemplate='卖点<br>日期:%{x}<br>价格:%{customdata:.3f}<extra></extra>', customdata=_regular_sell['Close']), row=1, col=1)
-    if not _wyck_sell.empty: fig.add_trace(go.Scatter(x=_wyck_sell['Date'], y=_wyck_sell['High'] * 1.05, mode='markers', name='威科夫卖点', marker=dict(symbol='triangle-down', size=22, color='#3d9bff', line=dict(width=2, color='#ffffff')), hovertemplate='<b>威科夫卖点</b>（派发破位）<br>日期:%{x}<br>价格:%{customdata:.3f}<extra></extra>', customdata=_wyck_sell['Close']), row=1, col=1)
+    if not _wyck_sell.empty: fig.add_trace(go.Scatter(x=_wyck_sell['Date'], y=_wyck_sell['High'] * 1.05, mode='text', name='威科夫卖点', text=['卖'] * len(_wyck_sell), textfont=dict(color='#3d9bff', size=14, family='Microsoft YaHei'), hovertemplate='<b>威科夫卖点</b>（派发破位）<br>日期:%{x}<br>价格:%{customdata:.3f}<extra></extra>', customdata=_wyck_sell['Close']), row=1, col=1)
     # ---- 威科夫吸筹区间可视化（detect_wyckoff 输出，只画最近一个区间）----
     if 'WyckZoneLow' in df.columns:
         # ★ 必须用**位置**（flatnonzero），不能用 df.index[mask] 的**标签**：
@@ -9150,13 +9151,13 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
     fig.add_trace(go.Bar(x=df['Date'], y=df['Volume'], name='成交量', marker_color=vol_colors, showlegend=False), row=2, col=1)
     if not _wyck_buy.empty:
         fig.add_trace(go.Scatter(x=_wyck_buy['Date'], y=df.loc[_wyck_buy.index, 'Volume'] * 1.08,
-                                  mode='markers', name='威科夫买点(量)',
-                                  marker=dict(symbol='triangle-up', size=11, color='#3d9bff', line=dict(width=1, color='#ffffff')),
+                                  mode='text', name='威科夫买点(量)', text=['买'] * len(_wyck_buy),
+                                  textfont=dict(color='#3d9bff', size=11, family='Microsoft YaHei'),
                                   hovertemplate='威科夫买点对应成交量<br>%{y:.0f}<extra></extra>'), row=2, col=1)
     if not _wyck_sell.empty:
         fig.add_trace(go.Scatter(x=_wyck_sell['Date'], y=df.loc[_wyck_sell.index, 'Volume'] * 1.08,
-                                  mode='markers', name='威科夫卖点(量)',
-                                  marker=dict(symbol='triangle-down', size=11, color='#3d9bff', line=dict(width=1, color='#ffffff')),
+                                  mode='text', name='威科夫卖点(量)', text=['卖'] * len(_wyck_sell),
+                                  textfont=dict(color='#3d9bff', size=11, family='Microsoft YaHei'),
                                   hovertemplate='威科夫卖点对应成交量<br>%{y:.0f}<extra></extra>'), row=2, col=1)
     if 'VOL_MA5' in df.columns: fig.add_trace(go.Scatter(x=df['Date'], y=df['VOL_MA5'], mode='lines', name='VOL_MA5', line=dict(color='#ffffff', width=1.5), showlegend=False), row=2, col=1)
     if 'VOL_MA10' in df.columns: fig.add_trace(go.Scatter(x=df['Date'], y=df['VOL_MA10'], mode='lines', name='VOL_MA10', line=dict(color='#ffaa00', width=1.5), showlegend=False), row=2, col=1)
