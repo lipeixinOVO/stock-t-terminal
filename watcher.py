@@ -872,7 +872,44 @@ def _band_metrics(df):
         'run_start_price': _run['price'],
         'run_gain_pct': (((current / _run['price']) - 1.0) * 100.0
                          if _run['price'] > 0 else 0.0),
+        'target_price': _calc_band_target(close, current, breakout_pivot),
     }
+
+
+def _calc_band_target(close, current, pivot):
+    """多重测算目标价 —— 与 ai_stock_terminal.py 的 `_calc_band_target` **逐字同公式**。
+
+    旧测量移动法（突破位 + 突破位 − 60日最低）把「一段下跌的深度」误当「平台高度」，
+    目标价离谱偏大（600176 曾算 92 元、现价 38）。重写为三重测算取中位数封顶 +25%，
+    现价跌破突破位 5% 以上则失效返回 0。见主应用同名函数的完整注释。
+    """
+    try:
+        if pivot <= 0 or current <= 0:
+            return 0.0
+        if current < pivot * 0.95:
+            return 0.0
+        if len(close) < 21:
+            return 0.0
+        cands = []
+        box_low = float(close.tail(21).iloc[:-1].min())
+        if box_low > 0 and pivot > box_low:
+            cands.append(pivot + (pivot - box_low))
+        swing_low = float(close.tail(60).min())
+        if swing_low > 0 and pivot > swing_low:
+            cands.append(swing_low + (pivot - swing_low) * 1.618)
+        prev_high = float(close.iloc[:-1].tail(120).max())
+        if prev_high > pivot:
+            cands.append(prev_high)
+        else:
+            cands.append(pivot * 1.08)
+        cands = [t for t in cands if t > current]
+        if not cands:
+            return 0.0
+        cands.sort()
+        return min(cands[len(cands) // 2], current * 1.25)
+    except Exception as e:
+        _log("_calc_band_target", e)
+        return 0.0
 
 
 def _band_status(m):
@@ -1148,6 +1185,10 @@ def check_band_memory(mem, log, today):
         #   同一个理由：滚动窗口前移它就会变，必须写在「状态没变就 continue」之前，
         #   否则巡检之后目标价停在旧值，与网页端「刷新后目标跟着动」对不上账。
         node["platform_low"] = float(m.get('platform_low') or node.get("platform_low") or 0.0)
+        # ★ 目标价（2026-10-09 重写为多重测算）—— 与 platform_low 同一批理由：滚动重算，
+        #   必须写在「状态没变就 continue」之前。用「键在不在」判（0 = 目标失效是合法值）。
+        if 'target_price' in m:
+            node["target_price"] = float(m.get('target_price') or 0.0)
         # ⚠️ 这里**刻意不更新** `score` / `reasons`：本文件没有打分函数，硬补就得把
         #   `_band_score` 复制一份过来 —— 口径漂移的风险大于收益（见 MEMORY-波段记忆.md
         #   的「关键逻辑单一来源」）。两边值本来就同源（巡检读的就是网页端推上来的镜像），
