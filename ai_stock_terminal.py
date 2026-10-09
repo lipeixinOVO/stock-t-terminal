@@ -3839,6 +3839,10 @@ def _band_memory_apply(node, r, event):
     #   窗口前移它就会变；停在上一次刷新的值会让"回踩位"越来越失真。
     node['breakout_pivot'] = float(r.get('BreakoutPivot')
                                    or node.get('breakout_pivot') or 0.0)
+    # ★ 平台低点（2026-10-09，供动态目标价）—— 与 breakout_pivot 同一个理由：
+    #   滚动窗口前移它就会变，必须写在「状态没变就直接 return」之前，否则目标价失联。
+    node['platform_low'] = float(r.get('PlatformLow')
+                                 or node.get('platform_low') or 0.0)
     # ★ 本轮启动起点（2026-09-22）：与 breakout_pivot 同一个理由 —— 它是**滚动回溯**出来的，
     #   停在上一次刷新的值会让「已启动 N 日」越算越错（尤其这一轮中途断过几天、
     #   或者早就跌破 20 日线时，旧值会让界面继续显示一个不存在的"启动中"）。
@@ -3911,6 +3915,10 @@ def _band_memory_new_node(r, source, batch_id=None, bench_above=None):
         # breakout_pivot：突破位（突破前的 60 日平台上沿，不含当天）。
         #   取不到就是 0 → 展示层显示「—」；旧节点没有这个字段，刷新一次会补上。
         "breakout_pivot": float(r.get('BreakoutPivot') or 0.0),
+        # platform_low：近 60 日平台低点（2026-10-09 新增，供「动态目标价」测量移动法用）。
+        #   目标价 = 突破位 + (突破位 − 平台低点) = 平台高度等距向上投射，
+        #   完全滚动动态、创新高的票也能算，与旧的「platform_high 当目标贴脸」是两码事。
+        "platform_low": float(r.get('PlatformLow') or 0.0),
         # run_*：入册那一刻，这一轮「启动」是从哪天开始的（2026-09-22）。
         #   卡片/记忆清单/推送候选据此写「已启动 N 个交易日 · 起点 X · 至今 +Y%」——
         #   因为「波段启动确认」是个可以持续很多天的状态，标签本身不带时间，
@@ -4760,7 +4768,7 @@ def _band_memory_digest(mem):
 #   · 并集字段 history / alerts（走并集，不走整组替换）；
 #   · 复盘结果 outcome。
 _BAND_LIVE_FIELDS = ("price", "ma20", "score", "reasons",
-                     "platform_high", "breakout_pivot",
+                     "platform_high", "breakout_pivot", "platform_low",
                      "run_days", "run_start_date", "run_start_price", "run_gain_pct")
 
 
@@ -5110,6 +5118,27 @@ def band_defense_price(node):
     return _band_num(node.get("ma20"))
 
 
+def band_target_price(node):
+    """动态目标价（2026-10-09 按用户要求重新加回，但算法与旧版彻底不同）。
+
+    旧版把「含当天的 60 日最高价」当目标价，创新高时必然≈现价（贴脸），
+    2026-09-21 因此被废掉（见 band_breakout_pivot 的注释）。
+
+    新算法 = 测量移动法（measured move）：目标价 = 突破位 + (突破位 − 平台低点)。
+      即「平台高度」等距向上投射 —— 突破一个平台后，等幅目标 = 平台高度翻倍。
+      · 完全动态：突破位 / 平台低点都是滚动窗口重算的，刷新一次目标跟着动；
+      · 创新高的票也能算（用的是平台自身高度，不依赖上方历史阻力）；
+      · 有明确含义，不是拍脑袋 —— 突破 + 放量之后，等幅投射是波段最常用的合理目标。
+
+    ★ 取不到突破位或平台低点任一就返回 0（展示层显示「—」），绝不用 platform_high 兜底。
+    """
+    pivot = band_breakout_pivot(node)
+    plow = _band_num(node.get("platform_low"))
+    if pivot <= 0 or plow <= 0 or pivot <= plow:
+        return 0.0
+    return pivot + (pivot - plow)
+
+
 # ---------- 本轮启动信息的展示（2026-09-22）----------
 BAND_RUN_FAR_PCT = 25.0   # 离启动点涨幅达到它 → 标「追高区」，卡片换警示色
 
@@ -5195,7 +5224,7 @@ def band_alert_need_expand(node):
 
 
 def band_levels_text(node):
-    """清单标题行用的紧凑串：「入选价 · 突破位 · 防守位」（不展开也能看到）。
+    """清单标题行用的紧凑串：「入选价 · 突破位 · 目标价 · 防守位」（不展开也能看到）。
 
     缺哪一段就**不拼那一段**（不塞「—」占位）—— 标题行已经很长，
     缺什么在展开区里说明原因。三个都没数时返回空串。
@@ -5207,6 +5236,9 @@ def band_levels_text(node):
     pivot = band_breakout_pivot(node)
     if pivot > 0:
         parts.append(f"突破位 {_fmt_price(pivot)}")
+    target = band_target_price(node)
+    if target > 0:
+        parts.append(f"目标 {_fmt_price(target)}")
     defense = band_defense_price(node)
     if defense > 0:
         parts.append(f"防守 {_fmt_price(defense)}")
@@ -7729,14 +7761,183 @@ def band_memory_ui():
                 f"- **{c['name']}（{c['code']}）**：{c['from']} → **{c['to']}**"
                 f"　现价 {c['price']:.2f}" for c in others))
 
-    # ★ 今日推送（手动）：额度 + 候选。放在清单**之前** ——
-    #   用户打开这一页通常就是想看"今天要推什么"，不该让他先滚完长名单。
-    notify_center_ui(mem)
-    # 日报回看紧跟今日推送：两块说的都是「通知」，微信没收到时来这一页找（2026-09-22）
-    digest_last_ui()
+    # ★ 2026-10-09 换序（用户要求）：「📤 今日推送」+「📰 18:00 日报」整块下沉到
+    #   **页面最底部**并默认折叠 —— 用户打开这一页先要看的是记忆清单（要盯的票），
+    #   推送是"发完之后回头看"的东西，不该占着最显眼的位置。
+    #   这两块已移到函数末尾的 `st.expander("📤 今日推送 / 📰 18:00 日报", expanded=False)`。
+    # ★ 记忆清单也已上提到「操作区按钮 / 清理 / 恢复」之前（用户要「提到最前列」）。
+    #   但**不能**在这里用 `if not mem['stocks']: return` 早退 —— 那会把下面的
+    #   「手动记入」入口一起挡掉，新用户空记忆时就没法加第一只票了。
+    #   空记忆时让 `for node in order` 自然空转（下面有 caption 提示），继续渲染操作区。
 
+    # ---- 记忆清单 ----
+    st.markdown("#### 📋 记忆清单")
     if not mem['stocks']:
-        st.caption("（还没有记录。点上方按钮扫描一次，或在这里手动记入。）")
+        st.caption("（还没有记录。用下方的「📤 从备份恢复 / 手动记入代码」加第一只，"
+                   "或点「🔄 刷新全部状态」扫描一次。）")
+    # ★ 2026-09-22 换序（用户要求）：「顺序排列要按它们的前景来排列，越靠前的越有前景」。
+    #   旧口径是「状态层级 → 入册时间」，于是刚启动、上方空间大的票会被压在若干只预警票下面。
+    #   新口径：归档的沉底，其余**一律按前景分降序**（同分再比入册时间，保证顺序稳定可复现）。
+    #   ★ 预警票不会因为排在后面就漏看 —— 「只展开新出现的预警」（band_alert_need_expand）
+    #     与红框仍然生效。**提醒靠的是标记，不是位置。**
+    order = band_memory_order(mem['stocks'].values())
+    # 批量多选处理（归档 / 删除）—— 不用再一只只展开去找删除按钮
+    _band_bulk_manage_ui(mem, order)
+
+    for node in order:
+        code = node.get('code') or '?'
+        cur = node.get('status') or '未知'
+        col, icon = _band_status_badge(cur)
+        add_col, add_icon = _band_status_badge(node.get('added_status'))
+        changed = bool(node.get('added_status')) and node.get('added_status') != cur
+        stage_txt = band_levels_text(node)
+        # 本轮启动标注（2026-09-22）：让「启动确认」这个能持续很多天的标签带上时间 ——
+        # 一眼看出它**早就启动**了、还是今天刚启动（见 band_run_text 的说明）。
+        _run_txt = band_run_text(node)
+        title = (f"{icon} {node.get('name')}（{code}）　{cur}"
+                 + ("　⚠️ 状态已变化" if changed else "")
+                 + ("　🗄️ 已归档" if node.get('closed') else "")
+                 + (f"　·　{stage_txt}" if stage_txt else "")
+                 + (f"　·　{_run_txt}" if _run_txt else ""))
+        # ★ 「只展开新出现的预警」—— 判定抽在 band_alert_need_expand 里（可单测），
+        #   这里只负责接线。别把条件再内联回来：AppTest 断言不了展开状态。
+        need_show = band_alert_need_expand(node)
+        with st.expander(title, expanded=need_show):
+            # ★ 2026-09-21 重写：旧版是「启动价 → 目标价 + 阶段进度」。用户反馈
+            #   「目标为什么这么接近启动价格…启动价格都是现价」，根因见 band_breakout_pivot。
+            #   现在三个位各自说清是什么，而且**不再出现「目标价」**——
+            #   创新高的票上方没有历史阻力，编一个目标出来就是让人去挂单。
+            _start = band_start_price(node)
+            _pivot = band_breakout_pivot(node)
+            _defense = band_defense_price(node)
+            _target = band_target_price(node)
+            _cur = _band_num(node.get('price'))
+            # 入选价是不是"推算"来的：容器重启后本地不存 added_price，只能从入册轨迹近似。
+            # ★ 只有**真的推出了值**才敢叫「推算」：added_price 和轨迹都没有时（例如复盘用的
+            #   历史样本、或数据被清过），入选价是 0、界面显示「—」，这时再标「推算」就是骗人。
+            _start_guess = (_band_num(node.get('added_price')) <= 0 and _start > 0)
+            _start_help = ("容器重启后本地不保存入选价，这里用**入册那条轨迹的价格**近似；"
+                           "误差通常极小，但它不是原始记录。" if _start_guess else
+                           "入册那天的现价。**自动入册的票它必然≈现价** —— 因为「波段启动确认」"
+                           "就是在当天创新高时命中的，这不是记录错误，是入选机制决定的。")
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
+            m1.metric("当前状态", cur)
+            m2.metric("现价", _fmt_price(_cur))
+            m3.metric("入选价" + ("（推算）" if _start_guess else ""),
+                      _fmt_price(_start), help=_start_help,
+                      delta=(f"{(_cur / _start - 1) * 100:+.1f}% 自入选"
+                             if (_start > 0 and _cur > 0) else None),
+                      delta_color="inverse")
+            m4.metric("突破位", _fmt_price(_pivot),
+                      delta=(f"现价 {(_cur / _pivot - 1) * 100:+.1f}%"
+                             if (_pivot > 0 and _cur > 0) else None),
+                      delta_color="off",
+                      help="**突破前**的 60 日平台上沿（**不含当天**）。现价在它上方是正常突破；"
+                           "回踩到它附近且不破，才算这次突破有效。")
+            m5.metric("防守位（20 日线）", _fmt_price(_defense),
+                      delta=(f"现价 {(_cur / _defense - 1) * 100:+.1f}%"
+                             if (_defense > 0 and _cur > 0) else None),
+                      delta_color="off",
+                      help="与状态判定的「跌破支撑」用的是同一个数：现价跌到它下方就转「跌破支撑」。")
+            # ★ 动态目标价（2026-10-09）：测量移动法 = 突破位 + (突破位 − 平台低点)。
+            #   完全滚动动态、创新高也能算，与旧版「平台高点当目标贴脸」是两码事。
+            m6.metric("目标价", _fmt_price(_target),
+                      delta=(f"距现价 {(_target / _cur - 1) * 100:+.1f}%"
+                             if (_target > 0 and _cur > 0) else None),
+                      delta_color="off",
+                      help="测量移动法：突破位 + (突破位 − 平台低点)，即「平台高度」等幅向上投射。"
+                           "随最新日线滚动重算，刷新一次目标跟着动；创新高的票也能算（不依赖上方历史阻力）。"
+                           "这是参考目标，不是预测，更不是让你无脑挂单。")
+            _miss = []
+            if _start <= 0:
+                _miss.append("入选价没有记录（容器重启后本地信息会丢，"
+                             "点上面的「🔄 刷新全部状态」会按轨迹补算）")
+            if _pivot <= 0:
+                _miss.append("突破位这次没算出来（日线没拉到；点「🔄 刷新全部状态」重试）")
+            if _defense <= 0:
+                _miss.append("防守位暂缺（还没刷新过，拿不到 20 日线）")
+            if _target <= 0:
+                _miss.append("目标价暂缺（需要突破位 + 平台低点，刷新一次会补上）")
+            if _miss:
+                st.caption("暂缺：" + "；".join(_miss) + "。")
+            _ph = _band_num(node.get('platform_high'))
+            if _ph > 0:
+                st.caption(f"当前平台高点（近 60 日最高价，**含当天**）{_fmt_price(_ph)}"
+                           "　—— 创新高的票它会≈现价，这是入选机制决定的，不是数据错了。")
+            st.caption("突破位与防守位都是**滚动**算出来的 —— 每刷新一次就跟着最新日线走，"
+                       "所以它们会随时间变化，不是入选那天定死的。")
+            st.caption("三个位都是按固定规则算出来的**参考位，不是预测**。")
+            st.caption(
+                f"入选时间：{node.get('added_at') or '—'}"
+                f"　|　入选时：{add_icon} {node.get('added_status') or '—'}"
+                f"　|　来源：{node.get('added_source') or '—'}"
+                f"　|　最近检查：{node.get('last_check') or '未检查'}"
+                f"　|　20日线：{_fmt_price(node.get('ma20'))}")
+
+            # ★ 2026-09-21：操作行（备注 / 归档 / 删除）**上提到卡片顶部**。
+            #   原来它在卡片最底部，上面还压着最多 10 行「状态轨迹」—— 想删一只票要先展开、
+            #   再往下滚一屏才找得到删除按钮，用户反馈「这个页面我想删除怎么这么难」即源于此。
+            note_key = f"bandmem_note_{code}"
+            note = st.text_input("备注（买入价 / 仓位 / 想法，本地与云端都会保存）",
+                                 value=node.get('note') or '', key=note_key)
+            n1, n2, n3 = st.columns([1, 1, 2])
+            if n1.button("💾 保存备注", use_container_width=True, key=f"bandmem_savenote_{code}"):
+                node['note'] = note
+                save_band_memory(mem)
+                band_memory_push_github(mem)
+                st.session_state.band_memory_sync_msg = f"{node.get('name')} 备注已保存"
+                st.rerun()
+            if n2.button("🗄️ 归档" if not node.get('closed') else "♻️ 取消归档",
+                         use_container_width=True, key=f"bandmem_close_{code}",
+                         help="归档后不再参与状态刷新和云端推送，但记录保留"):
+                node['closed'] = not node.get('closed')
+                save_band_memory(mem)
+                band_memory_push_github(mem)
+                st.rerun()
+            if n3.button("🗑️ 从记忆中删除", use_container_width=True, key=f"bandmem_del_{code}",
+                         help="从本地和云端清单里一起移除，之后不再监控这只票"):
+                # ★★ 这里必须是 merge_remote=False（同「🧹 清理记忆」那处）。
+                #   默认 True 会先拉云端那份再合并，而 band_memory_merge_digest 对
+                #   「云端有、本地没有」的条目是**整节点照抄** → 刚删掉的票立刻被复活，
+                #   还顺手 _save_json 写回本地 → 用户看到的就是「点了删除没反应」（2026-09-20 实测）。
+                _del_name = node.get('name') or code
+                mem['stocks'].pop(code, None)
+                save_band_memory(mem)
+                _del_ok, _del_msg = band_memory_push_github(mem, merge_remote=False)
+                if _del_ok:
+                    st.session_state.band_memory_sync_msg = f"已删除 {_del_name}（{code}）"
+                else:
+                    # ★ 同步失败就别报「已删除」：云端那份还在，下次合并会把它拉回来。
+                    st.session_state.band_memory_sync_msg = (
+                        f"⚠️ 已在本地删除 {_del_name}（{code}），但云端同步失败（{_del_msg}）——"
+                        "下次同步时它可能被云端那份合并回来，请检查 GITHUB_TOKEN")
+                st.rerun()
+
+            if need_show:
+                if st.button("👁️ 我已看过这条预警（以后不再自动展开）",
+                             key=f"bandmem_ack_{code}"):
+                    # ★ 2026-09-20 起 alert_ack 也随完整镜像同步，容器重启后不会再重复展开。
+                    #   这里仍然**不主动推送**：点「我已看过」不是状态变化，
+                    #   没必要为它单独提交一次。
+                    node['alert_ack'] = str(node.get('status_ts') or '')
+                    save_band_memory(mem)
+                    st.session_state.band_memory_sync_msg = (
+                        f"{node.get('name')}：已标记看过，之后折叠；状态再变化会重新展开提醒")
+                    st.rerun()
+            if node.get('reasons'):
+                st.caption(f"📋 最近依据：{node['reasons']}")
+
+            # 轨迹：一眼看清「什么时候变成什么的」
+            hist = node.get('history') or []
+            if hist:
+                st.markdown("**状态轨迹**（新→旧）")
+                for h in reversed(hist[-10:]):
+                    _hc, _hi = _band_status_badge(h.get('status'))
+                    st.markdown(
+                        f"- `{h.get('ts', '')}`　{_hi} **{h.get('status')}**"
+                        f"　价格 {_fmt_price(h.get('price'))}"
+                        f"　<span style='color:{_hc};font-size:12px;'>{h.get('event', '')}</span>",
+                        unsafe_allow_html=True)
 
     # ---- 操作区 ----
     b1, b2, b3, b4 = st.columns(4)
@@ -7914,163 +8115,6 @@ def band_memory_ui():
                         band_memory_push_github(mem)
                         st.rerun()
 
-    if not mem['stocks']:
-        return
-
-    # ---- 记忆清单 ----
-    st.markdown("#### 📋 记忆清单")
-    # ★ 2026-09-22 换序（用户要求）：「顺序排列要按它们的前景来排列，越靠前的越有前景」。
-    #   旧口径是「状态层级 → 入册时间」，于是刚启动、上方空间大的票会被压在若干只预警票下面。
-    #   新口径：归档的沉底，其余**一律按前景分降序**（同分再比入册时间，保证顺序稳定可复现）。
-    #   ★ 预警票不会因为排在后面就漏看 —— 「只展开新出现的预警」（band_alert_need_expand）
-    #     与红框仍然生效。**提醒靠的是标记，不是位置。**
-    order = band_memory_order(mem['stocks'].values())
-    # 批量多选处理（归档 / 删除）—— 不用再一只只展开去找删除按钮
-    _band_bulk_manage_ui(mem, order)
-
-    for node in order:
-        code = node.get('code') or '?'
-        cur = node.get('status') or '未知'
-        col, icon = _band_status_badge(cur)
-        add_col, add_icon = _band_status_badge(node.get('added_status'))
-        changed = bool(node.get('added_status')) and node.get('added_status') != cur
-        stage_txt = band_levels_text(node)
-        # 本轮启动标注（2026-09-22）：让「启动确认」这个能持续很多天的标签带上时间 ——
-        # 一眼看出它**早就启动**了、还是今天刚启动（见 band_run_text 的说明）。
-        _run_txt = band_run_text(node)
-        title = (f"{icon} {node.get('name')}（{code}）　{cur}"
-                 + ("　⚠️ 状态已变化" if changed else "")
-                 + ("　🗄️ 已归档" if node.get('closed') else "")
-                 + (f"　·　{stage_txt}" if stage_txt else "")
-                 + (f"　·　{_run_txt}" if _run_txt else ""))
-        # ★ 「只展开新出现的预警」—— 判定抽在 band_alert_need_expand 里（可单测），
-        #   这里只负责接线。别把条件再内联回来：AppTest 断言不了展开状态。
-        need_show = band_alert_need_expand(node)
-        with st.expander(title, expanded=need_show):
-            # ★ 2026-09-21 重写：旧版是「启动价 → 目标价 + 阶段进度」。用户反馈
-            #   「目标为什么这么接近启动价格…启动价格都是现价」，根因见 band_breakout_pivot。
-            #   现在三个位各自说清是什么，而且**不再出现「目标价」**——
-            #   创新高的票上方没有历史阻力，编一个目标出来就是让人去挂单。
-            _start = band_start_price(node)
-            _pivot = band_breakout_pivot(node)
-            _defense = band_defense_price(node)
-            _cur = _band_num(node.get('price'))
-            # 入选价是不是"推算"来的：容器重启后本地不存 added_price，只能从入册轨迹近似。
-            # ★ 只有**真的推出了值**才敢叫「推算」：added_price 和轨迹都没有时（例如复盘用的
-            #   历史样本、或数据被清过），入选价是 0、界面显示「—」，这时再标「推算」就是骗人。
-            _start_guess = (_band_num(node.get('added_price')) <= 0 and _start > 0)
-            _start_help = ("容器重启后本地不保存入选价，这里用**入册那条轨迹的价格**近似；"
-                           "误差通常极小，但它不是原始记录。" if _start_guess else
-                           "入册那天的现价。**自动入册的票它必然≈现价** —— 因为「波段启动确认」"
-                           "就是在当天创新高时命中的，这不是记录错误，是入选机制决定的。")
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("当前状态", cur)
-            m2.metric("现价", _fmt_price(_cur))
-            m3.metric("入选价" + ("（推算）" if _start_guess else ""),
-                      _fmt_price(_start), help=_start_help,
-                      delta=(f"{(_cur / _start - 1) * 100:+.1f}% 自入选"
-                             if (_start > 0 and _cur > 0) else None),
-                      delta_color="inverse")
-            m4.metric("突破位", _fmt_price(_pivot),
-                      delta=(f"现价 {(_cur / _pivot - 1) * 100:+.1f}%"
-                             if (_pivot > 0 and _cur > 0) else None),
-                      delta_color="off",
-                      help="**突破前**的 60 日平台上沿（**不含当天**）。现价在它上方是正常突破；"
-                           "回踩到它附近且不破，才算这次突破有效。")
-            m5.metric("防守位（20 日线）", _fmt_price(_defense),
-                      delta=(f"现价 {(_cur / _defense - 1) * 100:+.1f}%"
-                             if (_defense > 0 and _cur > 0) else None),
-                      delta_color="off",
-                      help="与状态判定的「跌破支撑」用的是同一个数：现价跌到它下方就转「跌破支撑」。")
-            _miss = []
-            if _start <= 0:
-                _miss.append("入选价没有记录（容器重启后本地信息会丢，"
-                             "点上面的「🔄 刷新全部状态」会按轨迹补算）")
-            if _pivot <= 0:
-                _miss.append("突破位这次没算出来（日线没拉到；点「🔄 刷新全部状态」重试）")
-            if _defense <= 0:
-                _miss.append("防守位暂缺（还没刷新过，拿不到 20 日线）")
-            if _miss:
-                st.caption("暂缺：" + "；".join(_miss) + "。")
-            _ph = _band_num(node.get('platform_high'))
-            if _ph > 0:
-                st.caption(f"当前平台高点（近 60 日最高价，**含当天**）{_fmt_price(_ph)}"
-                           "　—— 创新高的票它会≈现价，这是入选机制决定的，不是数据错了。")
-            st.caption("突破位与防守位都是**滚动**算出来的 —— 每刷新一次就跟着最新日线走，"
-                       "所以它们会随时间变化，不是入选那天定死的。")
-            st.caption("三个位都是按固定规则算出来的**参考位，不是预测**。")
-            st.caption(
-                f"入选时间：{node.get('added_at') or '—'}"
-                f"　|　入选时：{add_icon} {node.get('added_status') or '—'}"
-                f"　|　来源：{node.get('added_source') or '—'}"
-                f"　|　最近检查：{node.get('last_check') or '未检查'}"
-                f"　|　20日线：{_fmt_price(node.get('ma20'))}")
-
-            # ★ 2026-09-21：操作行（备注 / 归档 / 删除）**上提到卡片顶部**。
-            #   原来它在卡片最底部，上面还压着最多 10 行「状态轨迹」—— 想删一只票要先展开、
-            #   再往下滚一屏才找得到删除按钮，用户反馈「这个页面我想删除怎么这么难」即源于此。
-            note_key = f"bandmem_note_{code}"
-            note = st.text_input("备注（买入价 / 仓位 / 想法，本地与云端都会保存）",
-                                 value=node.get('note') or '', key=note_key)
-            n1, n2, n3 = st.columns([1, 1, 2])
-            if n1.button("💾 保存备注", use_container_width=True, key=f"bandmem_savenote_{code}"):
-                node['note'] = note
-                save_band_memory(mem)
-                band_memory_push_github(mem)
-                st.session_state.band_memory_sync_msg = f"{node.get('name')} 备注已保存"
-                st.rerun()
-            if n2.button("🗄️ 归档" if not node.get('closed') else "♻️ 取消归档",
-                         use_container_width=True, key=f"bandmem_close_{code}",
-                         help="归档后不再参与状态刷新和云端推送，但记录保留"):
-                node['closed'] = not node.get('closed')
-                save_band_memory(mem)
-                band_memory_push_github(mem)
-                st.rerun()
-            if n3.button("🗑️ 从记忆中删除", use_container_width=True, key=f"bandmem_del_{code}",
-                         help="从本地和云端清单里一起移除，之后不再监控这只票"):
-                # ★★ 这里必须是 merge_remote=False（同「🧹 清理记忆」那处）。
-                #   默认 True 会先拉云端那份再合并，而 band_memory_merge_digest 对
-                #   「云端有、本地没有」的条目是**整节点照抄** → 刚删掉的票立刻被复活，
-                #   还顺手 _save_json 写回本地 → 用户看到的就是「点了删除没反应」（2026-09-20 实测）。
-                _del_name = node.get('name') or code
-                mem['stocks'].pop(code, None)
-                save_band_memory(mem)
-                _del_ok, _del_msg = band_memory_push_github(mem, merge_remote=False)
-                if _del_ok:
-                    st.session_state.band_memory_sync_msg = f"已删除 {_del_name}（{code}）"
-                else:
-                    # ★ 同步失败就别报「已删除」：云端那份还在，下次合并会把它拉回来。
-                    st.session_state.band_memory_sync_msg = (
-                        f"⚠️ 已在本地删除 {_del_name}（{code}），但云端同步失败（{_del_msg}）——"
-                        "下次同步时它可能被云端那份合并回来，请检查 GITHUB_TOKEN")
-                st.rerun()
-
-            if need_show:
-                if st.button("👁️ 我已看过这条预警（以后不再自动展开）",
-                             key=f"bandmem_ack_{code}"):
-                    # ★ 2026-09-20 起 alert_ack 也随完整镜像同步，容器重启后不会再重复展开。
-                    #   这里仍然**不主动推送**：点「我已看过」不是状态变化，
-                    #   没必要为它单独提交一次。
-                    node['alert_ack'] = str(node.get('status_ts') or '')
-                    save_band_memory(mem)
-                    st.session_state.band_memory_sync_msg = (
-                        f"{node.get('name')}：已标记看过，之后折叠；状态再变化会重新展开提醒")
-                    st.rerun()
-            if node.get('reasons'):
-                st.caption(f"📋 最近依据：{node['reasons']}")
-
-            # 轨迹：一眼看清「什么时候变成什么的」
-            hist = node.get('history') or []
-            if hist:
-                st.markdown("**状态轨迹**（新→旧）")
-                for h in reversed(hist[-10:]):
-                    _hc, _hi = _band_status_badge(h.get('status'))
-                    st.markdown(
-                        f"- `{h.get('ts', '')}`　{_hi} **{h.get('status')}**"
-                        f"　价格 {_fmt_price(h.get('price'))}"
-                        f"　<span style='color:{_hc};font-size:12px;'>{h.get('event', '')}</span>",
-                        unsafe_allow_html=True)
-
     with st.expander("☁️ 云端推送（微信）怎么配", expanded=False):
         st.markdown("""
         记忆里「代码 + 当前状态」的摘要会被提交到仓库，GitHub Actions 上的巡检脚本
@@ -8140,6 +8184,14 @@ def band_memory_ui():
         if st.session_state.get("band_key_new"):
             st.code(st.session_state["band_key_new"], language="text")
             st.caption("把上面这串原样复制到两处 Secrets（Streamlit 与 GitHub Actions），一字都不能差。")
+
+    # ---- 📤 今日推送 / 📰 18:00 日报（2026-10-09 下沉到底部 + 默认折叠）----
+    # 用户要求：这两块（说的都是「通知」）放到页面**最下面**并收起来，
+    # 打开这一页先看的是记忆清单（要盯的票），推送是发完之后回头看的东西。
+    st.markdown("---")
+    with st.expander("📤 今日推送 / 📰 18:00 日报（点开）", expanded=False):
+        notify_center_ui(mem)
+        digest_last_ui()
 
 
 def _add_band_to_memory(r, source="手动加入"):
