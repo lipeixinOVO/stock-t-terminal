@@ -3399,7 +3399,63 @@ def _calculate_band_metrics(df):
         # 起点价缺失（days=0）时给 0，绝不用现价顶替 —— 否则"至今 +0.0%"看着像刚启动
         'run_gain_pct': (((current / _run['price']) - 1.0) * 100.0
                          if _run['price'] > 0 else 0.0),
+        # ★ 目标价（2026-10-09 重写）：多重测算，见 _calc_band_target。
+        'target_price': _calc_band_target(close, current, breakout_pivot),
     }
+
+
+def _calc_band_target(close, current, pivot):
+    """多重测算目标价（2026-10-09 重写；旧「测量移动法」见 git 历史，有硬伤）。
+
+    旧版 = 突破位 + (突破位 − 60 日最低)。它把「60 日里一整段下跌的深度」误当成
+    「平台高度」—— 只要这 60 日里出现过一段大跌，目标价就会离谱偏大
+    （600176 曾算出 92 元、现价才 38；515880 曾算出 1.11、现价才 0.59）。用户反馈
+    「目标价怎么都这么大、不合理」即此。
+
+    新口径 = 参考威科夫 P&F 水平计数 + 斐波那契扩展的官方思路（目标源于
+    「交易区间 / 波段」的高度，而非任意窗口的全振幅），三重独立测算取中位数，
+    再按「距现价 ≤ +25%」封顶，逼近合理目标：
+
+      ① 测量移动（交易区间 TR 投影）：突破位 + (突破位 − 突破前 20 日收盘箱体下沿)
+      ② 斐波那契 1.618 扩展：波段低点 + (突破位 − 波段低点) × 1.618
+      ③ 前期阻力：突破位之上最近 120 日收盘高点；创新高无更高点则用突破位 ×1.08 的惯性保守值
+
+    取中位数（稳健，不被单个极端值带偏），再封顶距现价 +25%（A 股波段合理上限）。
+
+    返回 0.0 = 「目标价失效」：现价已明显跌破突破位（回踩超 5%），平台已破，
+    向上目标失去意义 —— 展示层显示「—」，绝不硬给一个误导性的数字。
+    """
+    try:
+        if pivot <= 0 or current <= 0:
+            return 0.0
+        if current < pivot * 0.95:          # 现价跌破突破位 5% 以上 → 目标失效
+            return 0.0
+        if len(close) < 21:
+            return 0.0
+        cands = []
+        # ① 测量移动：突破前 20 日收盘箱体下沿（不含当天）
+        box_low = float(close.tail(21).iloc[:-1].min())
+        if box_low > 0 and pivot > box_low:
+            cands.append(pivot + (pivot - box_low))
+        # ② 斐波那契 1.618 扩展：波段低点 → 突破位
+        swing_low = float(close.tail(60).min())
+        if swing_low > 0 and pivot > swing_low:
+            cands.append(swing_low + (pivot - swing_low) * 1.618)
+        # ③ 前期阻力：突破位之上最近 120 日收盘高点（不含当天）
+        prev_high = float(close.iloc[:-1].tail(120).max())
+        if prev_high > pivot:
+            cands.append(prev_high)
+        else:
+            cands.append(pivot * 1.08)
+        cands = [t for t in cands if t > current]
+        if not cands:
+            return 0.0
+        cands.sort()
+        return min(cands[len(cands) // 2], current * 1.25)   # 中位数 + 封顶
+    except Exception as e:
+        _log("_calc_band_target", e)
+        return 0.0
+
 
 def _band_status(metrics):
     """根据指标返回波段状态和对应颜色。
@@ -3504,7 +3560,7 @@ def _band_evaluate(code, name='', price=0.0, change_pct=0.0):
         'Score': max(0, score), 'Status': status, 'StatusColor': color,
         'MA20': m['ma20'], 'MA60': m['ma60'],
         'PlatformHigh': m['platform_high'], 'PlatformLow': m['platform_low'],
-        'BreakoutPivot': m['breakout_pivot'],
+        'BreakoutPivot': m['breakout_pivot'], 'TargetPrice': m['target_price'],
         'VolRatio': m['vol_ratio'], 'Position250': round(m['position_pct'], 1),
         'Reasons': ' | '.join(reasons), 'LastClose': m['current'],
         'Breakout': bool(m['breakout']), 'VolumeExpansion': bool(m['volume_expansion']),
@@ -3843,6 +3899,13 @@ def _band_memory_apply(node, r, event):
     #   滚动窗口前移它就会变，必须写在「状态没变就直接 return」之前，否则目标价失联。
     node['platform_low'] = float(r.get('PlatformLow')
                                  or node.get('platform_low') or 0.0)
+    # ★ 目标价（2026-10-09 重写为多重测算）：由 _calculate_band_metrics 算好落盘，
+    #   这里照抄即可。同样必须写在「状态没变就直接 return」之前 —— 目标价跟着最新
+    #   日线滚动重算，停在上一次会让「目标」失联（跟 platform_low 同一批顺序坑）。
+    #   用 `is not None` 判存在：TargetPrice=0 是**合法值**（= 目标失效，显示「—」），
+    #   用 `or` 会退回过期旧值，让已跌破平台的票继续显示一个过期的向上目标。
+    if r.get('TargetPrice') is not None:
+        node['target_price'] = float(r.get('TargetPrice') or 0.0)
     # ★ 本轮启动起点（2026-09-22）：与 breakout_pivot 同一个理由 —— 它是**滚动回溯**出来的，
     #   停在上一次刷新的值会让「已启动 N 日」越算越错（尤其这一轮中途断过几天、
     #   或者早就跌破 20 日线时，旧值会让界面继续显示一个不存在的"启动中"）。
@@ -3919,6 +3982,9 @@ def _band_memory_new_node(r, source, batch_id=None, bench_above=None):
         #   目标价 = 突破位 + (突破位 − 平台低点) = 平台高度等距向上投射，
         #   完全滚动动态、创新高的票也能算，与旧的「platform_high 当目标贴脸」是两码事。
         "platform_low": float(r.get('PlatformLow') or 0.0),
+        # target_price：目标价（2026-10-09 重写为多重测算，见 _calc_band_target）。
+        #   入册时由 _calculate_band_metrics 算好落盘；0 = 目标失效（现价已跌破突破位）。
+        "target_price": float(r.get('TargetPrice') or 0.0),
         # run_*：入册那一刻，这一轮「启动」是从哪天开始的（2026-09-22）。
         #   卡片/记忆清单/推送候选据此写「已启动 N 个交易日 · 起点 X · 至今 +Y%」——
         #   因为「波段启动确认」是个可以持续很多天的状态，标签本身不带时间，
@@ -4768,7 +4834,7 @@ def _band_memory_digest(mem):
 #   · 并集字段 history / alerts（走并集，不走整组替换）；
 #   · 复盘结果 outcome。
 _BAND_LIVE_FIELDS = ("price", "ma20", "score", "reasons",
-                     "platform_high", "breakout_pivot", "platform_low",
+                     "platform_high", "breakout_pivot", "platform_low", "target_price",
                      "run_days", "run_start_date", "run_start_price", "run_gain_pct")
 
 
@@ -5119,24 +5185,17 @@ def band_defense_price(node):
 
 
 def band_target_price(node):
-    """动态目标价（2026-10-09 按用户要求重新加回，但算法与旧版彻底不同）。
+    """目标价：读已落盘的 `target_price`（由 `_calc_band_target` 多重测算）。
 
-    旧版把「含当天的 60 日最高价」当目标价，创新高时必然≈现价（贴脸），
-    2026-09-21 因此被废掉（见 band_breakout_pivot 的注释）。
+    ★ 2026-10-09 重写：不再在这里现算 —— 目标价必须是**基于日线序列的多重测算**
+      （测量移动 + 斐波那契 1.618 + 前期阻力，取中位数封顶），只有 `_calculate_band_metrics`
+      拿着完整 df 才够料算，纯 node 字段算不出合理值。所以算法收口到唯一来源
+      `_calc_band_target`，这里只负责读落盘结果。
 
-    新算法 = 测量移动法（measured move）：目标价 = 突破位 + (突破位 − 平台低点)。
-      即「平台高度」等距向上投射 —— 突破一个平台后，等幅目标 = 平台高度翻倍。
-      · 完全动态：突破位 / 平台低点都是滚动窗口重算的，刷新一次目标跟着动；
-      · 创新高的票也能算（用的是平台自身高度，不依赖上方历史阻力）；
-      · 有明确含义，不是拍脑袋 —— 突破 + 放量之后，等幅投射是波段最常用的合理目标。
-
-    ★ 取不到突破位或平台低点任一就返回 0（展示层显示「—」），绝不用 platform_high 兜底。
+    ★ 老节点没有 `target_price` 字段 → 返回 0（展示层显示「—」），刷新一次会补上；
+      `target_price == 0` 也是合法值（= 目标失效：现价已跌破突破位 5% 以上）。
     """
-    pivot = band_breakout_pivot(node)
-    plow = _band_num(node.get("platform_low"))
-    if pivot <= 0 or plow <= 0 or pivot <= plow:
-        return 0.0
-    return pivot + (pivot - plow)
+    return _band_num(node.get("target_price"))
 
 
 # ---------- 本轮启动信息的展示（2026-09-22）----------
@@ -7839,15 +7898,16 @@ def band_memory_ui():
                              if (_defense > 0 and _cur > 0) else None),
                       delta_color="off",
                       help="与状态判定的「跌破支撑」用的是同一个数：现价跌到它下方就转「跌破支撑」。")
-            # ★ 动态目标价（2026-10-09）：测量移动法 = 突破位 + (突破位 − 平台低点)。
-            #   完全滚动动态、创新高也能算，与旧版「平台高点当目标贴脸」是两码事。
+            # ★ 动态目标价（2026-10-09 重写为多重测算）：测量移动 + 斐波那契 1.618 + 前期阻力，
+            #   取中位数封顶 +25%。现价跌破突破位 5% 以上则目标失效（显示「—」）。
             m6.metric("目标价", _fmt_price(_target),
                       delta=(f"距现价 {(_target / _cur - 1) * 100:+.1f}%"
                              if (_target > 0 and _cur > 0) else None),
                       delta_color="off",
-                      help="测量移动法：突破位 + (突破位 − 平台低点)，即「平台高度」等幅向上投射。"
-                           "随最新日线滚动重算，刷新一次目标跟着动；创新高的票也能算（不依赖上方历史阻力）。"
-                           "这是参考目标，不是预测，更不是让你无脑挂单。")
+                      help="多重测算（参考威科夫 + 斐波那契）：①测量移动（突破位+平台高度）"
+                           "②斐波那契 1.618 扩展 ③前期阻力，三者取中位数、距现价封顶 +25%。"
+                           "随最新日线滚动重算。现价跌破突破位 5% 以上时目标失效显示「—」"
+                           "（平台已破，向上目标无意义）。这是参考目标，不是预测，更不是让你无脑挂单。")
             _miss = []
             if _start <= 0:
                 _miss.append("入选价没有记录（容器重启后本地信息会丢，"
@@ -7857,7 +7917,8 @@ def band_memory_ui():
             if _defense <= 0:
                 _miss.append("防守位暂缺（还没刷新过，拿不到 20 日线）")
             if _target <= 0:
-                _miss.append("目标价暂缺（需要突破位 + 平台低点，刷新一次会补上）")
+                # 目标价 = 0 有两种情况：①老节点没落盘 target_price（刷新补上）；②现价已跌破突破位（目标失效）。
+                _miss.append("目标价暂无（要么还没刷新落盘，要么现价已跌破突破位 5% 以上、向上目标失效）")
             if _miss:
                 st.caption("暂缺：" + "；".join(_miss) + "。")
             _ph = _band_num(node.get('platform_high'))
@@ -7948,6 +8009,10 @@ def band_memory_ui():
                             node['breakout_pivot'] = _lp; _dirty = True
                         if _ll > 0 and abs(_ll - float(node.get('platform_low') or 0)) > 1e-6:
                             node['platform_low'] = _ll; _dirty = True
+                        # -- 目标价：多重测算（与 _calculate_band_metrics 同一把尺 _calc_band_target）--
+                        _tp = _calc_band_target(_dk['Close'], float(_dk['Close'].iloc[-1]), _lp)
+                        if abs(_tp - float(node.get('target_price') or 0)) > 1e-6:
+                            node['target_price'] = _tp; _dirty = True
                         # -- 启动点：按最新日线重算（算不出 days=0，保持旧值不动）--
                         _rs = _band_run_start(_dk)
                         if _rs.get('days', 0) > 0:
@@ -7974,8 +8039,8 @@ def band_memory_ui():
                             plot_band_entry_chart(_dk, node, st.session_state.get('chart_reset_key', 0)),
                             use_container_width=True, config=PLOTLY_CONFIG_DAILY)
                         st.caption("🔵 竖虚线 = 本轮启动点（日期/起点价/至今涨幅）　🟡 横虚线 = 目标位"
-                                   "（测量移动法，参考位非预测）。"
-                                   + ("　✅ 打开时已按最新日线自动重算突破位/平台低点/启动点，"
+                                   "（多重测算，参考位非预测；现价跌破突破位 5% 则不画目标）。"
+                                   + ("　✅ 打开时已按最新日线自动重算突破位/目标价/启动点，"
                                       "上方卡片数值在下次页面刷新时同步。" if _dirty
                                       else "　数值已是最新，无需重算。"))
                 except Exception as _e:
@@ -9229,11 +9294,11 @@ def plot_band_entry_chart(df, node, uirevision_key=0):
     输入：
       df   已经过 calculate_daily_indicators 的日线（含 MA5/MA10/MA20、Date、Close 等）；
            只取最后 120 根画，避免老票画满整段历史。
-      node 记忆节点（含 run_start_date/run_start_price/run_gain_pct/breakout_pivot/platform_low/price）。
+      node 记忆节点（含 run_start_date/run_start_price/run_gain_pct/breakout_pivot/target_price/price）。
 
     虚线语义：
       · 启动点 = 本轮启动那根 K 线（竖虚线 + 起点标记 + 文字「启动 YYYY-MM-DD @ X.XX」）；
-      · 目标位 = band_target_price 测量移动法目标价（横虚线 + 文字）。
+      · 目标位 = band_target_price 多重测算目标价（横虚线 + 文字）；0 = 目标失效不画。
       · 「启动观点」= 图上文字标注（启动日期 / 起点价 / 至今涨幅），不额外造数据。
     """
     df = df.tail(120).reset_index(drop=True)
