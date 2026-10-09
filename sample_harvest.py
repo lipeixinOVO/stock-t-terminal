@@ -112,7 +112,9 @@ NET_CONSTS = {"_REQUEST_HEADERS", "_EM_HOSTS", "_HTTP_HEADERS", "_QQ_APP_HOSTS",
 METRIC_FUNCS = {"_calculate_band_metrics", "_band_score", "_band_status", "_band_evaluate",
                 # 2026-09-22：`_calculate_band_metrics` 用它算「本轮启动起点」，
                 # 漏抽会被内部 try 吞掉 → days 恒为 0，日报/回测里「已启动」整块静默消失。
-                "_band_run_start"}
+                "_band_run_start",
+                # 2026-10-09：`_calculate_band_metrics` 用它算多重测算目标价 target_price。
+                "_calc_band_target"}
 # ★ 指标层自己的常量：`_calculate_band_metrics` 现在要用顶背离的 MACD 门槛。
 #   漏了 → NameError（这里没 try 兜底，会直接炸，属于"幸运的"失败方式）。
 METRIC_CONSTS = {"BAND_DIVERGENCE_MACD_MIN_PCT",
