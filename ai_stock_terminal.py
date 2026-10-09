@@ -7939,6 +7939,26 @@ def band_memory_ui():
                         f"　<span style='color:{_hc};font-size:12px;'>{h.get('event', '')}</span>",
                         unsafe_allow_html=True)
 
+            # ★ 2026-10-09（用户要求）：每只票加一张**默认收起**的日K图，图里用虚线
+            #   标出「启动点」与「目标位置」，并标注「启动观点」（启动日期/起点价/至今涨幅）。
+            #   懒加载：只有点开这个 expander 才拉日线 + 算指标 + 画图 —— 记忆清单可能
+            #   几十只票，若一次性全拉日线会把页面拖到超时，必须折叠时才取数。
+            with st.expander(f"📊 日K图 · 启动点 / 目标位（点开）", expanded=False):
+                try:
+                    _dk = _get_daily_history(code)
+                    if _dk is None or len(_dk) < 60:
+                        st.caption("日线暂未拉到（数据源可能繁忙），点「🔄 刷新全部状态」后再试。")
+                    else:
+                        _dk = calculate_daily_indicators(_dk)
+                        st.plotly_chart(
+                            plot_band_entry_chart(_dk, node, st.session_state.get('chart_reset_key', 0)),
+                            use_container_width=True, config=PLOTLY_CONFIG_DAILY)
+                        st.caption("🔵 竖虚线 = 本轮启动点（启动日期 + 起点价 + 至今涨幅）；"
+                                   "🟡 横虚线 = 目标位（测量移动法，参考位非预测）。")
+                except Exception as _e:
+                    _log("band_memory_ui/daily_chart", _e)
+                    st.caption("日K图绘制失败（已拦截，不影响记忆清单其他功能）。")
+
     # ---- 操作区 ----
     b1, b2, b3, b4 = st.columns(4)
     if long_button("🔄 刷新全部状态", key="bandmem_refresh", container=b1,
@@ -9158,6 +9178,81 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], fixedrange=False)
     fig.update_yaxes(fixedrange=False, row=1, col=1)
     fig.update_yaxes(fixedrange=True, row=2, col=1)
+    return fig
+
+
+def plot_band_entry_chart(df, node, uirevision_key=0):
+    """记忆清单卡片内的**轻量日K图**（2026-10-09 用户要求）：
+    只画 K 线 + MA5/MA10/MA20 + 启动点虚线 + 目标位虚线 + 启动观点文字标注。
+
+    ★ 为什么单独写一个，而不是复用 plot_daily_chart：
+      plot_daily_chart 是为「单只票详情页」做的重型图（威科夫区间/买卖点/成交量副图/
+      缩放联动那一整套），记忆清单里**每只票**都要一张、且默认收起、展开才画 ——
+      把那一大套塞进每张卡片既拖慢页面又视觉冗余。这里只保留做T看启动/目标最需要的三样。
+
+    输入：
+      df   已经过 calculate_daily_indicators 的日线（含 MA5/MA10/MA20、Date、Close 等）；
+           只取最后 120 根画，避免老票画满整段历史。
+      node 记忆节点（含 run_start_date/run_start_price/run_gain_pct/breakout_pivot/platform_low/price）。
+
+    虚线语义：
+      · 启动点 = 本轮启动那根 K 线（竖虚线 + 起点标记 + 文字「启动 YYYY-MM-DD @ X.XX」）；
+      · 目标位 = band_target_price 测量移动法目标价（横虚线 + 文字）。
+      · 「启动观点」= 图上文字标注（启动日期 / 起点价 / 至今涨幅），不额外造数据。
+    """
+    df = df.tail(120).reset_index(drop=True)
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=df['Date'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
+        name='日K', increasing_line_color='#ff3333', decreasing_line_color='#00cc66',
+        line=dict(width=1)))
+    for _ma, _col, _name in (('MA5', '#ffffff', 'MA5'), ('MA10', '#ffff00', 'MA10'),
+                             ('MA20', '#ff00ff', 'MA20')):
+        if _ma in df.columns:
+            fig.add_trace(go.Scatter(x=df['Date'], y=df[_ma], mode='lines', name=_name,
+                                     line=dict(color=_col, width=1.1)))
+
+    _run = band_run_info(node)
+    # ---- 启动点：竖虚线 + 起点标记 + 文字（位置用日期匹配，不用标签/行号，避免越界）----
+    if _run.get('date') and _run.get('price') and _run['price'] > 0:
+        _d = _run['date']
+        _pos = np.flatnonzero(df['Date'].astype(str).str[:10].to_numpy() == _d)
+        if len(_pos) > 0:
+            _i = int(_pos[-1])
+            _x = df['Date'].iloc[_i]
+            fig.add_vline(x=_x, line=dict(color='#3d9bff', width=1.5, dash='dash'),
+                          annotation_text='启动', annotation_position='top left',
+                          annotation_font=dict(color='#3d9bff', size=11))
+            fig.add_trace(go.Scatter(x=[_x], y=[_run['price']], mode='markers',
+                                     marker=dict(symbol='circle', size=9, color='#3d9bff',
+                                                 line=dict(width=1.5, color='#ffffff')),
+                                     name='启动点', hovertemplate='启动点 %{x}<br>起点价 %{y:.2f}<extra></extra>'))
+            # 「启动观点」：启动日期 / 起点价 / 至今涨幅（gain 落盘在 run_gain_pct）
+            _gain_txt = f"　至今 {_run['gain']:+.1f}%" if _run.get('gain') else ""
+            fig.add_annotation(x=_x, y=float(df['High'].iloc[_i]), xref='x', yref='y',
+                               text=f"<b>启动 {_d}</b><br>起点 {_run['price']:.2f}{_gain_txt}",
+                               showarrow=True, arrowhead=2, arrowsize=0.8, arrowcolor='#3d9bff',
+                               ax=0, ay=-30, font=dict(color='#3d9bff', size=10),
+                               bgcolor='rgba(30,30,46,0.85)', bordercolor='#3d9bff',
+                               borderwidth=1, borderpad=2)
+    # ---- 目标位：横虚线 + 文字 ----
+    _target = band_target_price(node)
+    if _target > 0:
+        _cur = _band_num(node.get('price'))
+        _t_delta = f"　距现价 {(_target / _cur - 1) * 100:+.1f}%" if _cur > 0 else ""
+        fig.add_hline(y=_target, line=dict(color='#ffaa00', width=1.5, dash='dash'),
+                      annotation_text=f'目标 {_target:.2f}{_t_delta}', annotation_position='right',
+                      annotation_font=dict(color='#ffaa00', size=11))
+
+    fig.update_layout(template="plotly_dark", height=420,
+                      xaxis_rangeslider_visible=False, hovermode="x unified", dragmode='zoom',
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
+                                  font=dict(size=10), bgcolor='rgba(0,0,0,0)',
+                                  bordercolor='rgba(0,0,0,0)'),
+                      margin=dict(t=40, l=10, r=10, b=10), uirevision=uirevision_key,
+                      hoverlabel=dict(bgcolor="#1e1e2e", bordercolor="#89b4fa",
+                                      font=dict(color="#f0f2f6", size=12)))
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     return fig
 
 def plot_minute_chart_ths(df, buy_points, sell_points, symbol_name, prev_close, uirevision_key=0):
