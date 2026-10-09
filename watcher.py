@@ -1144,6 +1144,10 @@ def check_band_memory(mem, log, today):
         #   那正是 2026-09-21 修掉的"贴脸伪目标"）。
         node["platform_high"] = float(m.get('platform_high') or node.get("platform_high") or 0.0)
         node["breakout_pivot"] = float(m.get('breakout_pivot') or node.get("breakout_pivot") or 0.0)
+        # ★ 平台低点（2026-10-09，供网页端「动态目标价」测量移动法用）—— 与 breakout_pivot
+        #   同一个理由：滚动窗口前移它就会变，必须写在「状态没变就 continue」之前，
+        #   否则巡检之后目标价停在旧值，与网页端「刷新后目标跟着动」对不上账。
+        node["platform_low"] = float(m.get('platform_low') or node.get("platform_low") or 0.0)
         # ⚠️ 这里**刻意不更新** `score` / `reasons`：本文件没有打分函数，硬补就得把
         #   `_band_score` 复制一份过来 —— 口径漂移的风险大于收益（见 MEMORY-波段记忆.md
         #   的「关键逻辑单一来源」）。两边值本来就同源（巡检读的就是网页端推上来的镜像），
