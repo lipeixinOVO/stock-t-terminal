@@ -9305,8 +9305,9 @@ try:
         col_g, col_p = st.columns(2)
         with col_g: st.markdown(f'<div class="guide-box">🎯 <b>今日做T指引</b><br>{_intraday_rich_text(t_guide)}</div>', unsafe_allow_html=True)
         with col_p: st.markdown(f'<div class="predict-box">📊 <b>日内波动区间</b><br>{_intraday_rich_text(predict_text)}</div>', unsafe_allow_html=True)
-        # ★ 分时图放最前：盘中真正盯着看的是它；日线图 120 根是「确认大势」用的，
-        #   收进展开项，少占一屏。
+        # ★ 分时图放最前：盘中真正盯着看的是它；日线图 120 根紧跟其后。
+        #   ★ 2026-10-09（用户要求）：日线 expander 改成**默认展开** —— 与分时图一致，
+        #   打开页面直接能看，不想看再手动收起（原先默认折叠，用户每点开一次都要多点一下）。
         col_title2, col_btn2 = st.columns([9, 1])
         with col_title2: st.subheader(f"⏱️ {current_name} ({symbol}) 分时级别走势（同花顺风格）")
         with col_btn2:
@@ -9316,9 +9317,9 @@ try:
             st.caption("操作说明：分时图只显示 09:30-15:00 交易时段，锁定缩放。")
         else:
             st.warning("暂无分时数据")
-        with st.expander(f"📈 {current_name}（{symbol}）日线级别走势（120 根）", expanded=False):
+        with st.expander(f"📈 {current_name}（{symbol}）日线级别走势（120 根）", expanded=True):
             col_title1, col_btn1 = st.columns([9, 1])
-            with col_title1: st.caption("点开即用；不放首页是因为盘中主要看分时。")
+            with col_title1: st.caption("默认展开；不想看可点标题收起，不占地方。")
             with col_btn1:
                 if st.button("🔄 复位", use_container_width=True, key="reset_daily_chart"): st.session_state.chart_reset_key += 1; st.rerun()
             ma_html = f"""<div class="ma-bar"><span style="color:#ffffff">M5: {latest['MA5']:.3f}</span><span style="color:#ffff00">M10: {latest['MA10']:.3f}</span><span style="color:#ff00ff">M20: {latest['MA20']:.3f}</span><span style="color:#00ff00">M30: {latest['MA30']:.3f}</span><span style="color:#00ccff">年线: {latest['MA250']:.3f}</span></div>"""
