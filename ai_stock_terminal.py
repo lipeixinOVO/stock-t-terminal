@@ -9096,7 +9096,11 @@ def plot_daily_chart(df, symbol_name, latest, uirevision_key=0):
     if not _wyck_sell.empty: fig.add_trace(go.Scatter(x=_wyck_sell['Date'], y=_wyck_sell['High'] * 1.05, mode='markers', name='威科夫卖点', marker=dict(symbol='triangle-down', size=22, color='#3d9bff', line=dict(width=2, color='#ffffff')), hovertemplate='<b>威科夫卖点</b>（派发破位）<br>日期:%{x}<br>价格:%{customdata:.3f}<extra></extra>', customdata=_wyck_sell['Close']), row=1, col=1)
     # ---- 威科夫吸筹区间可视化（detect_wyckoff 输出，只画最近一个区间）----
     if 'WyckZoneLow' in df.columns:
-        _zi = df.index[df['WyckZoneLow'].notna()]
+        # ★ 必须用**位置**（flatnonzero），不能用 df.index[mask] 的**标签**：
+        #   调用方传 df.tail(120) 时若 df 带非 0 起始的索引（某条数据路径的原样行号），
+        #   标签会大于行数，.iloc[标签] 直接 IndexError —— 2026-10-09 线上事故根因。
+        #   本地测试全是 RangeIndex（标签==位置）所以测不出来，这种偶不失真最难抓。
+        _zi = np.flatnonzero(df['WyckZoneLow'].notna().to_numpy())
         if len(_zi) >= 2:
             _z0, _z1 = _zi[0], _zi[-1]
             _zl = float(df['WyckZoneLow'].iloc[_z1]); _zh = float(df['WyckZoneHigh'].iloc[_z1])
