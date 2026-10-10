@@ -5304,13 +5304,47 @@ def band_levels_text(node):
     return " · ".join(parts)
 
 
+# ---- 综合打分（2026-10-10 用户要求「记忆内股票综合打分并自动排序」）----
+# 综合分 = 前景分（技术面）+ 状态修正 + 目标空间分，三段都可解释，不是黑盒。
+#   · 前景分：复用 _band_score 算好落盘的 node['score']（0~100，形态/量能/拥挤度）；
+#   · 状态修正：启动确认 +10 / 进行中 +5 / 顶背离 −15 / 跌破支撑 −20
+#     （预警是「最该处理」的减分项，不是加分项 —— 处理完它们自然沉到该在的位置）；
+#   · 目标空间分：距目标价涨幅 0~25% 线性映射 0~10 分（有空间才值得拿着）。
+_BAND_SCORE_STATUS_ADJ = {
+    "波段启动确认": 10.0, "波段进行中": 5.0,
+    "顶背离预警": -15.0, "跌破支撑": -20.0,
+}
+_BAND_SCORE_UPSIDE_CAP_PCT = 25.0   # 距目标涨幅封顶：超过 25% 也只按 25% 计（追高的不算空间）
+_BAND_SCORE_UPSIDE_MAX = 10.0       # 空间分满分
+
+
+def band_memory_score(node):
+    """记忆清单的**综合分**（0~100）＝前景分 + 状态修正 + 目标空间分。
+
+    ★ 为什么要综合而不只用前景分：前景分只回答「形态好不好」，不管「现在是什么状态、
+      还有多少空间」。一只前景分 92 但已顶背离的票，和一只前景分 85 还在启动初期的票，
+      谁该排前面？只看前景分看不出 —— 综合分把「状态 + 空间」也折进来，排序才完整。
+
+    ★ 缺料一律降级、绝不抛异常：score 缺 → 0；状态未知 → 0 修正；目标/现价缺 → 空间 0。
+      结果 clamp 到 [0, 100]（前景分可能 102+ 或负数，clamp 后保证分值可读可比）。
+    """
+    base = _band_num(node.get("score"))
+    adj = _BAND_SCORE_STATUS_ADJ.get(node.get("status") or "", 0.0)
+    cur = _band_num(node.get("price"))
+    tgt = band_target_price(node)
+    space = 0.0
+    if tgt > 0 and cur > 0:
+        upside = min(max((tgt / cur - 1.0) * 100.0, 0.0), _BAND_SCORE_UPSIDE_CAP_PCT)
+        space = upside / _BAND_SCORE_UPSIDE_CAP_PCT * _BAND_SCORE_UPSIDE_MAX
+    return max(0.0, min(100.0, base + adj + space))
+
+
 def band_memory_order(nodes):
     """记忆清单的展示顺序 → 排好序的列表。
 
-    ★ 规则（用户 2026-09-22 原话「顺序排列要按它们的前景来排列，越靠前的越有前景」）：
+    ★ 规则（用户 2026-09-22「越靠前越有前景」→ 2026-10-10 升级为**综合分**排序）：
       ① **归档的沉底**（它已经结束，不该占着最上面）；
-      ② 其余**一律按前景分降序** —— 不再按「状态层级」排。旧口径把刚启动、上方空间大的票
-         压在若干只预警票下面，和"越靠前越有前景"正好相反；
+      ② 其余按 `band_memory_score`（前景分+状态修正+目标空间）**降序**；
       ③ 同分再比入册时间，保证顺序**稳定可复现**（否则同样的数据两次渲染顺序会跳）。
 
     ★ 预警票不会因为排在后面就漏看：「只展开新出现的预警」（band_alert_need_expand）
@@ -5320,7 +5354,7 @@ def band_memory_order(nodes):
       UI 层断言不了顺序，只能靠肉眼盯网页。抽出来后可以直接喂节点列表验顺序。
     """
     return sorted(nodes, key=lambda n: (bool(n.get('closed')),
-                                        -float(n.get('score') or 0),
+                                        -band_memory_score(n),
                                         str(n.get('added_at', ''))))
 
 
@@ -7853,7 +7887,11 @@ def band_memory_ui():
         # 本轮启动标注（2026-09-22）：让「启动确认」这个能持续很多天的标签带上时间 ——
         # 一眼看出它**早就启动**了、还是今天刚启动（见 band_run_text 的说明）。
         _run_txt = band_run_text(node)
+        # ★ 综合分上标题（2026-10-10 用户要求「综合打分并自动排序」）：排序依据必须可见，
+        #   否则顺序像是随机的（选股页「前景分」同理，2026-09-22 已验证过这个原则）。
+        _cscore = band_memory_score(node)
         title = (f"{icon} {node.get('name')}（{code}）　{cur}"
+                 + f"　·　综合 {round(_cscore)}"
                  + ("　⚠️ 状态已变化" if changed else "")
                  + ("　🗄️ 已归档" if node.get('closed') else "")
                  + (f"　·　{stage_txt}" if stage_txt else "")
@@ -7862,12 +7900,12 @@ def band_memory_ui():
         #   这里只负责接线。别把条件再内联回来：AppTest 断言不了展开状态。
         need_show = band_alert_need_expand(node)
         with st.expander(title, expanded=need_show):
-            # ★ 2026-09-21 重写：旧版是「启动价 → 目标价 + 阶段进度」。用户反馈
-            #   「目标为什么这么接近启动价格…启动价格都是现价」，根因见 band_breakout_pivot。
-            #   现在三个位各自说清是什么，而且**不再出现「目标价」**——
-            #   创新高的票上方没有历史阻力，编一个目标出来就是让人去挂单。
+            # ★ 2026-10-10 精简（用户反馈「价格太多了，只要现价/目标价/止损价」）：
+            #   旧 6 列（状态/现价/入选价/突破位/防守位/目标价）压成 3 列 ——
+            #   入选价并进现价的小字（±% 自入选，红涨绿跌）；突破位只在标题行出现
+            #   （band_levels_text 仍带「突破位」，回踩确认要看时展开标题就有）；
+            #   防守位改叫「止损价」（同一个数：20 日线，跌破支撑判定用的就是它）。
             _start = band_start_price(node)
-            _pivot = band_breakout_pivot(node)
             _defense = band_defense_price(node)
             _target = band_target_price(node)
             _cur = _band_num(node.get('price'))
@@ -7875,32 +7913,21 @@ def band_memory_ui():
             # ★ 只有**真的推出了值**才敢叫「推算」：added_price 和轨迹都没有时（例如复盘用的
             #   历史样本、或数据被清过），入选价是 0、界面显示「—」，这时再标「推算」就是骗人。
             _start_guess = (_band_num(node.get('added_price')) <= 0 and _start > 0)
-            _start_help = ("容器重启后本地不保存入选价，这里用**入册那条轨迹的价格**近似；"
-                           "误差通常极小，但它不是原始记录。" if _start_guess else
-                           "入册那天的现价。**自动入册的票它必然≈现价** —— 因为「波段启动确认」"
-                           "就是在当天创新高时命中的，这不是记录错误，是入选机制决定的。")
-            m1, m2, m3, m4, m5, m6 = st.columns(6)
-            m1.metric("当前状态", cur)
-            m2.metric("现价", _fmt_price(_cur))
-            m3.metric("入选价" + ("（推算）" if _start_guess else ""),
-                      _fmt_price(_start), help=_start_help,
-                      delta=(f"{(_cur / _start - 1) * 100:+.1f}% 自入选"
-                             if (_start > 0 and _cur > 0) else None),
-                      delta_color="inverse")
-            m4.metric("突破位", _fmt_price(_pivot),
-                      delta=(f"现价 {(_cur / _pivot - 1) * 100:+.1f}%"
-                             if (_pivot > 0 and _cur > 0) else None),
-                      delta_color="off",
-                      help="**突破前**的 60 日平台上沿（**不含当天**）。现价在它上方是正常突破；"
-                           "回踩到它附近且不破，才算这次突破有效。")
-            m5.metric("防守位（20 日线）", _fmt_price(_defense),
-                      delta=(f"现价 {(_cur / _defense - 1) * 100:+.1f}%"
-                             if (_defense > 0 and _cur > 0) else None),
-                      delta_color="off",
-                      help="与状态判定的「跌破支撑」用的是同一个数：现价跌到它下方就转「跌破支撑」。")
-            # ★ 动态目标价（2026-10-09 重写为多重测算）：测量移动 + 斐波那契 1.618 + 前期阻力，
-            #   取中位数封顶 +25%。现价跌破突破位 5% 以上则目标失效（显示「—」）。
-            m6.metric("目标价", _fmt_price(_target),
+            m1, m2, m3 = st.columns(3)
+            m1.metric("现价", _fmt_price(_cur))
+            # 小字：入选价 + 自入选涨跌幅（A 股口径：涨红跌绿）。缺入选价如实写「入选 —」。
+            if _start > 0 and _cur > 0:
+                _pct = (_cur / _start - 1) * 100.0
+                _col = '#ff4b4b' if _pct >= 0 else '#00cc66'
+                _sub = (f"<span style='font-size:12px;color:#8b949e;'>入选 "
+                        f"{_fmt_price(_start)}{'（推算）' if _start_guess else ''} · </span>"
+                        f"<span style='font-size:12px;color:{_col};'>"
+                        f"{_pct:+.1f}% 自入选</span>")
+            else:
+                _sub = ("<span style='font-size:12px;color:#8b949e;'>入选 —"
+                        "（容器重启会丢，刷新一次按轨迹补算）</span>")
+            m1.markdown(_sub, unsafe_allow_html=True)
+            m2.metric("目标价", _fmt_price(_target),
                       delta=(f"距现价 {(_target / _cur - 1) * 100:+.1f}%"
                              if (_target > 0 and _cur > 0) else None),
                       delta_color="off",
@@ -7908,32 +7935,28 @@ def band_memory_ui():
                            "②斐波那契 1.618 扩展 ③前期阻力，三者取中位数、距现价封顶 +25%。"
                            "随最新日线滚动重算。现价跌破突破位 5% 以上时目标失效显示「—」"
                            "（平台已破，向上目标无意义）。这是参考目标，不是预测，更不是让你无脑挂单。")
+            m3.metric("止损价（20 日线）", _fmt_price(_defense),
+                      delta=(f"现价 {(_cur / _defense - 1) * 100:+.1f}%"
+                             if (_defense > 0 and _cur > 0) else None),
+                      delta_color="off",
+                      help="就是原来的「防守位」：20 日线。与状态判定的「跌破支撑」是同一个数 —— "
+                           "现价跌到它下方就转「跌破支撑」，按纪律该减仓/离场。")
             _miss = []
-            if _start <= 0:
-                _miss.append("入选价没有记录（容器重启后本地信息会丢，"
-                             "点上面的「🔄 刷新全部状态」会按轨迹补算）")
-            if _pivot <= 0:
-                _miss.append("突破位这次没算出来（日线没拉到；点「🔄 刷新全部状态」重试）")
             if _defense <= 0:
-                _miss.append("防守位暂缺（还没刷新过，拿不到 20 日线）")
+                _miss.append("止损价暂缺（还没刷新过，拿不到 20 日线）")
             if _target <= 0:
                 # 目标价 = 0 有两种情况：①老节点没落盘 target_price（刷新补上）；②现价已跌破突破位（目标失效）。
                 _miss.append("目标价暂无（要么还没刷新落盘，要么现价已跌破突破位 5% 以上、向上目标失效）")
             if _miss:
                 st.caption("暂缺：" + "；".join(_miss) + "。")
-            _ph = _band_num(node.get('platform_high'))
-            if _ph > 0:
-                st.caption(f"当前平台高点（近 60 日最高价，**含当天**）{_fmt_price(_ph)}"
-                           "　—— 创新高的票它会≈现价，这是入选机制决定的，不是数据错了。")
-            st.caption("突破位与防守位都是**滚动**算出来的 —— 每刷新一次就跟着最新日线走，"
-                       "所以它们会随时间变化，不是入选那天定死的。")
-            st.caption("三个位都是按固定规则算出来的**参考位，不是预测**。")
+            st.caption("目标价与止损价都是**滚动**算出来的参考位，不是预测 —— 每次刷新跟着最新日线走，"
+                       "会随时间变化，不是入选那天定死的。")
             st.caption(
                 f"入选时间：{node.get('added_at') or '—'}"
                 f"　|　入选时：{add_icon} {node.get('added_status') or '—'}"
                 f"　|　来源：{node.get('added_source') or '—'}"
                 f"　|　最近检查：{node.get('last_check') or '未检查'}"
-                f"　|　20日线：{_fmt_price(node.get('ma20'))}")
+                f"　|　突破位：{_fmt_price(band_breakout_pivot(node))}")
 
             # ★ 2026-09-21：操作行（备注 / 归档 / 删除）**上提到卡片顶部**。
             #   原来它在卡片最底部，上面还压着最多 10 行「状态轨迹」—— 想删一只票要先展开、
