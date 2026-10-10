@@ -5283,24 +5283,24 @@ def band_alert_need_expand(node):
 
 
 def band_levels_text(node):
-    """清单标题行用的紧凑串：「入选价 · 突破位 · 目标价 · 防守位」（不展开也能看到）。
+    """清单标题行用的紧凑串：「现价 · 目标 · 止损」（2026-10-10 与卡片三指标统一口径）。
 
+    ★ 旧口径是「入选 · 突破位 · 目标 · 防守」四件套 —— 卡片精简成 现价/目标价/止损价
+      三指标后它成了两套口径（入选≈现价、防守=止损，还多一个突破位），用户要求统一。
+      入选价在现价下方的小字里；突破位不再上标题（回踩确认时看记忆节点字段/详情页）。
     缺哪一段就**不拼那一段**（不塞「—」占位）—— 标题行已经很长，
     缺什么在展开区里说明原因。三个都没数时返回空串。
     """
     parts = []
-    start = band_start_price(node)
-    if start > 0:
-        parts.append(f"入选 {_fmt_price(start)}")
-    pivot = band_breakout_pivot(node)
-    if pivot > 0:
-        parts.append(f"突破位 {_fmt_price(pivot)}")
+    cur = _band_num(node.get("price"))
+    if cur > 0:
+        parts.append(f"现价 {_fmt_price(cur)}")
     target = band_target_price(node)
     if target > 0:
         parts.append(f"目标 {_fmt_price(target)}")
     defense = band_defense_price(node)
     if defense > 0:
-        parts.append(f"防守 {_fmt_price(defense)}")
+        parts.append(f"止损 {_fmt_price(defense)}")
     return " · ".join(parts)
 
 
