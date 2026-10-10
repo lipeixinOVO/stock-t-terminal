@@ -5304,47 +5304,64 @@ def band_levels_text(node):
     return " · ".join(parts)
 
 
-# ---- 综合打分（2026-10-10 用户要求「记忆内股票综合打分并自动排序」）----
-# 综合分 = 前景分（技术面）+ 状态修正 + 目标空间分，三段都可解释，不是黑盒。
-#   · 前景分：复用 _band_score 算好落盘的 node['score']（0~100，形态/量能/拥挤度）；
-#   · 状态修正：启动确认 +10 / 进行中 +5 / 顶背离 −15 / 跌破支撑 −20
-#     （预警是「最该处理」的减分项，不是加分项 —— 处理完它们自然沉到该在的位置）；
-#   · 目标空间分：距目标价涨幅 0~25% 线性映射 0~10 分（有空间才值得拿着）。
+# ---- 综合打分（2026-10-10 用户要求「记忆内股票综合打分并自动排序」→ 当天下午改口径：
+#      「侧重衡量启动后能到达的高度」）----
+# 综合分 = 上行空间分（主导，0~50）+ 技术质量分（0~30）+ 状态修正（±20）。
+#   · 上行空间分：距**目标价**的涨幅 —— 目标价由 _calc_band_target 多重测算（测量移动 +
+#     斐波那契 + 前期阻力），代表「启动后能到达的高度」，是排序的主角；
+#   · 技术质量分：前景分 node['score']（0~100）折算到 30，衡量「形态好不好、能不能真启动」；
+#   · 状态修正：启动确认 +15 / 进行中 +8 / 顶背离 −15 / 跌破支撑 −20
+#     （预警是「最该处理」的减分项 —— 处理完自然沉到该在的位置）。
 _BAND_SCORE_STATUS_ADJ = {
-    "波段启动确认": 10.0, "波段进行中": 5.0,
+    "波段启动确认": 15.0, "波段进行中": 8.0,
     "顶背离预警": -15.0, "跌破支撑": -20.0,
 }
-_BAND_SCORE_UPSIDE_CAP_PCT = 25.0   # 距目标涨幅封顶：超过 25% 也只按 25% 计（追高的不算空间）
-_BAND_SCORE_UPSIDE_MAX = 10.0       # 空间分满分
+_BAND_SCORE_SPACE_MAX = 50.0        # 上行空间分满分（主导项）
+_BAND_SCORE_SPACE_PEAK_PCT = 40.0   # 距目标涨幅达到 40% 时空间分封顶；再高反而衰减（防失真/追高虚高）
+_BAND_SCORE_TECH_MAX = 30.0         # 技术质量（前景分）折算满分
+
+
+def _band_score_space(tgt, cur):
+    """上行空间分（0~50）：距目标价的涨幅，分两段。
+
+    ★ 这是综合分的**主导项**（用户 2026-10-10 原话「侧重衡量启动后能到达的高度」）：
+      「能到达的高度」= 目标价，距它的涨幅 = 还剩多少上行空间。空间越大、得分越高，
+      但到 40% 封顶、再高反而衰减 —— 因为距现价太远的目标要么是测算失真、要么是追高，
+      不该无脑给满。目标失效（target<=0，即现价已跌破突破位）→ 0 分。
+    """
+    if tgt <= 0 or cur <= 0:
+        return 0.0
+    upside = (tgt / cur - 1.0) * 100.0
+    if upside <= 0:
+        return 0.0
+    peak = _BAND_SCORE_SPACE_PEAK_PCT
+    if upside <= peak:
+        return upside / peak * _BAND_SCORE_SPACE_MAX
+    return max(0.0, _BAND_SCORE_SPACE_MAX - (upside - peak) / peak * _BAND_SCORE_SPACE_MAX)
 
 
 def band_memory_score(node):
-    """记忆清单的**综合分**（0~100）＝前景分 + 状态修正 + 目标空间分。
+    """记忆清单的**综合分**（0~100）＝上行空间分（主导）＋技术质量分＋状态修正。
 
-    ★ 为什么要综合而不只用前景分：前景分只回答「形态好不好」，不管「现在是什么状态、
-      还有多少空间」。一只前景分 92 但已顶背离的票，和一只前景分 85 还在启动初期的票，
-      谁该排前面？只看前景分看不出 —— 综合分把「状态 + 空间」也折进来，排序才完整。
+    ★ 口径（2026-10-10 用户要求「侧重启动后能到达的高度」）：排序主要看「还能涨到哪」，
+      技术形态和当前状态作为修正。目标失效（已跌破突破位）的票空间分为 0，自然沉底。
 
     ★ 缺料一律降级、绝不抛异常：score 缺 → 0；状态未知 → 0 修正；目标/现价缺 → 空间 0。
-      结果 clamp 到 [0, 100]（前景分可能 102+ 或负数，clamp 后保证分值可读可比）。
+      结果 clamp 到 [0, 100]。
     """
-    base = _band_num(node.get("score"))
+    tech = _band_num(node.get("score")) / 100.0 * _BAND_SCORE_TECH_MAX
     adj = _BAND_SCORE_STATUS_ADJ.get(node.get("status") or "", 0.0)
-    cur = _band_num(node.get("price"))
-    tgt = band_target_price(node)
-    space = 0.0
-    if tgt > 0 and cur > 0:
-        upside = min(max((tgt / cur - 1.0) * 100.0, 0.0), _BAND_SCORE_UPSIDE_CAP_PCT)
-        space = upside / _BAND_SCORE_UPSIDE_CAP_PCT * _BAND_SCORE_UPSIDE_MAX
-    return max(0.0, min(100.0, base + adj + space))
+    space = _band_score_space(band_target_price(node), _band_num(node.get("price")))
+    return max(0.0, min(100.0, space + tech + adj))
 
 
 def band_memory_order(nodes):
     """记忆清单的展示顺序 → 排好序的列表。
 
-    ★ 规则（用户 2026-09-22「越靠前越有前景」→ 2026-10-10 升级为**综合分**排序）：
+    ★ 规则（用户 2026-09-22「越靠前越有前景」→ 2026-10-10 升级为**综合分**排序，
+      侧重「启动后能到达的高度」）：
       ① **归档的沉底**（它已经结束，不该占着最上面）；
-      ② 其余按 `band_memory_score`（前景分+状态修正+目标空间）**降序**；
+      ② 其余按 `band_memory_score`（上行空间为主 + 技术质量 + 状态修正）**降序**；
       ③ 同分再比入册时间，保证顺序**稳定可复现**（否则同样的数据两次渲染顺序会跳）。
 
     ★ 预警票不会因为排在后面就漏看：「只展开新出现的预警」（band_alert_need_expand）
