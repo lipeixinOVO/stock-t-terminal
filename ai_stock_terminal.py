@@ -5433,10 +5433,19 @@ def _band_bulk_manage_ui(mem, nodes):
             if isinstance(n, dict):
                 names.append(n.get('name') or c)
         save_band_memory(mem_obj)
-        band_memory_push_github(mem_obj)
-        st.session_state.band_memory_sync_msg = (
-            f"已批量删除 {len(codes)} 只：{'、'.join(names[:5])}"
-            + ("…" if len(names) > 5 else ""))
+        # ★★ 必须 merge_remote=False（与单卡片删除同坑；2026-10-12 用户反馈「批量删除删不掉」）：
+        #   默认 True 会先拉云端那份再合并，而 band_memory_merge_digest 对「云端有、本地没有」
+        #   的条目是**整节点照抄** → 刚删掉的票立刻被云端复活并写回本地 →
+        #   表现就是「点了删除没反应、票还在」。归档不受影响（节点还在，合并无妨）。
+        _ok, _msg = band_memory_push_github(mem_obj, merge_remote=False)
+        if _ok:
+            st.session_state.band_memory_sync_msg = (
+                f"已批量删除 {len(codes)} 只：{'、'.join(names[:5])}"
+                + ("…" if len(names) > 5 else ""))
+        else:
+            st.session_state.band_memory_sync_msg = (
+                f"⚠️ 已在本地删除 {len(codes)} 只，但云端同步失败（{_msg}）——"
+                "下次同步时它们可能被云端那份合并回来，请检查 GITHUB_TOKEN")
         st.session_state.bandmem_bulk_pick = []      # 回调里改 state 是安全的
         st.rerun()
 
@@ -9474,9 +9483,8 @@ try:
         if st.button("🔄 清除数据缓存并重试", key="retry_daily_fetch"):
             get_daily_data.clear(); get_minute_data.clear(); st.rerun()
         st.markdown("---")
-        st.info("📌 下面两个模块不依赖当前标的的日线，仍可正常使用。也可在左侧自选股中切换到其他标的。")
+        st.info("📌 下面的选股模块不依赖当前标的的日线，仍可正常使用。也可在左侧自选股中切换到其他标的。")
         ai_band_picker_ui()
-        dynamic_pool_ui()
         st.stop()
     today_norm  = pd.Timestamp(now_cn().date()); last_k_norm = df_daily['Date'].iloc[-1].normalize()
     if len(df_daily) >= 2 and last_k_norm == today_norm: prev_close = df_daily['Close'].iloc[-2]
@@ -9571,20 +9579,15 @@ try:
                        "（Spring/LPS 处会标买点三角）；**无标注 = 该股最近没有吸筹区间结构，属正常**，不是功能没上线。")
 
     with _tab_pick:
-        # 扫描（今天扫到什么，按状态分组）→ 跟踪清单（我记住的票，唯一一处）→ 动态池
+        # 扫描（今天扫到什么，按状态分组）→ 跟踪清单（我记住的票，唯一一处）。
+        # ★ 2026-10-12：动态股票池栏目整体下线（用户要求「全部删除动态池这一栏目」），
+        #   dynamic_pool_ui 不再渲染（函数定义保留，之后想恢复把调用加回来即可）。
         ai_band_picker_ui()
         try:
             band_memory_ui()
         except Exception as e:
             _log("band_memory_ui", e)
             st.warning("跟踪清单渲染出错（已拦截，不影响上方选股功能）")
-            with st.expander("查看错误详情"):
-                st.code(traceback.format_exc(), language="python")
-        try:
-            dynamic_pool_ui()
-        except Exception as e:
-            _log("dynamic_pool_ui", e)
-            st.warning("动态股票池渲染出错（已拦截，不影响其他功能）")
             with st.expander("查看错误详情"):
                 st.code(traceback.format_exc(), language="python")
 
