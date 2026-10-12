@@ -7922,10 +7922,11 @@ def band_memory_ui():
                  + ("　🗄️ 已归档" if node.get('closed') else "")
                  + (f"　·　{stage_txt}" if stage_txt else "")
                  + (f"　·　{_run_txt}" if _run_txt else ""))
-        # ★ 「只展开新出现的预警」—— 判定抽在 band_alert_need_expand 里（可单测），
-        #   这里只负责接线。别把条件再内联回来：AppTest 断言不了展开状态。
-        need_show = band_alert_need_expand(node)
-        with st.expander(title, expanded=need_show):
+        # ★ 2026-10-12（用户反馈「老有这种展开的，全部设置默认收起」）：自动展开机制下线，
+        #   所有条目一律**默认收起** —— 预警靠标题的 🔴/🔻 标记 + ⚠️ 提醒（标记仍在，
+        #   只是不再抢占屏幕展开）。band_alert_need_expand 函数保留但不再接 UI，
+        #   「👁️ 我已看过」按钮随之退役（它唯一的用途就是关闭自动展开）。
+        with st.expander(title, expanded=False):
             # ★ 2026-10-10 精简（用户反馈「价格太多了，只要现价/目标价/止损价」）：
             #   旧 6 列（状态/现价/入选价/突破位/防守位/目标价）压成 3 列 ——
             #   入选价并进现价的小字（±% 自入选，红涨绿跌）；突破位只在标题行出现
@@ -8023,17 +8024,6 @@ def band_memory_ui():
                         "下次同步时它可能被云端那份合并回来，请检查 GITHUB_TOKEN")
                 st.rerun()
 
-            if need_show:
-                if st.button("👁️ 我已看过这条预警（以后不再自动展开）",
-                             key=f"bandmem_ack_{code}"):
-                    # ★ 2026-09-20 起 alert_ack 也随完整镜像同步，容器重启后不会再重复展开。
-                    #   这里仍然**不主动推送**：点「我已看过」不是状态变化，
-                    #   没必要为它单独提交一次。
-                    node['alert_ack'] = str(node.get('status_ts') or '')
-                    save_band_memory(mem)
-                    st.session_state.band_memory_sync_msg = (
-                        f"{node.get('name')}：已标记看过，之后折叠；状态再变化会重新展开提醒")
-                    st.rerun()
             if node.get('reasons'):
                 st.caption(f"📋 最近依据：{node['reasons']}")
 
