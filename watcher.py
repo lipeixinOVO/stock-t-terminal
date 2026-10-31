@@ -490,16 +490,41 @@ def _print_candidate(title, content):
     print(f"  📤 候选（未推送，等你在网页端选）：{title}　{first}")
 
 
+def _in_push_window():
+    """推送时间窗（2026-10-12 用户要求「不开盘的时间不要推送」）：
+    北京时间**周一至周五 08:00-20:00** 之外一律不发微信。
+
+    ★ 为什么要在 send_wechat 里加这道硬闸（main() 已有 is_trading_time 守卫还不够）：
+      GitHub Actions 的 scheduled run 在高峰期会被大幅延迟（官方文档明说不保证准时），
+      「北京 15:55 的最后一批 run 被拖到深夜执行」是真实会发生的事 —— 用户实测
+      凌晨 12 点多还收到推送。时间闸放在所有推送的**唯一出口**里：
+      无论上游 workflow 怎么延迟、误触发、手动 force，深夜/周末绝不打扰。
+    ★ 窗口 08:00-20:00 而非严格开盘时段：18:00 的日报（daily_digest.py 自带推送实现，
+      不走这里）要保留；周末（weekday >= 5）一律不发 —— 不开盘就不推。
+    """
+    t = now_cn()
+    # ★ 纯数值比较（分钟数），不引用 time/datetime 等模块级名字：
+    #   测试的抽取环境对 from datetime import 的名字注入不全，裸名会 NameError（2026-10-12 踩）。
+    _m = t.hour * 60 + t.minute
+    return t.weekday() < 5 and 8 * 60 <= _m <= 20 * 60
+
+
 def send_wechat(title, content, code="", name=""):
     """微信推送的**唯一出口**（巡检侧 4 个调用点全走这里）。
 
     ★ 2026-09-22 起三道闸，**顺序不许调**（有源码守卫盯着"闸门必须在 requests.post 之前"）：
+      ⓪ 时间窗闸（2026-10-12 新增，最前）—— 非工作日 08:00-20:00 一律不发，
+         见 _in_push_window（用户实测凌晨 12 点多还收到推送）；
       ① 总闸 AUTO_PUSH —— 仓库 Variable `NOTIFY_AUTO_PUSH=0` 时紧急全关；
       ② 白名单闸 —— `code` 不在名单里就只登记候选、**绝不发送**
          （名单为空＝谁都不自动发，这是默认状态）；
       ③ 额度闸 —— 账本剩余 ≤ 0 就不发（4 条与网页端手动点共用，1 条预留 18:00 日报）。
     返回 True 表示"真的发出去了" —— 调用方据此记去重日志、累加计数（含义与之前一致）。
     """
+    if not _in_push_window():
+        print(f"  ⏸ 非推送时段（北京 {now_cn().strftime('%H:%M')}，"
+              f"仅工作日 08:00-20:00 推送）→ 不发：{title}")
+        return False
     if not AUTO_PUSH:
         _print_candidate(title, content)
         return False
@@ -1224,6 +1249,12 @@ def check_band_memory(mem, log, today):
         # 决定要不要打扰用户
         to_alert = _band_alert_decision(old_status, status)
         if not to_alert:
+            continue
+        # ★ 2026-10-12 用户要求：**波段结束预警不再推送微信** —— 状态变化仍写入记忆与
+        #   轨迹（网页端标题 🔴/🔻 标记可见、仍参与综合分排序），但不再打扰。
+        #   「波段启动」推送保留；_band_alert_decision 的 end 判定保留
+        #   （跨文件一致性测试守着，网页端若要复用判定还能用）。
+        if to_alert == "end":
             continue
 
         key = f"{sym}_bandmem_{status}_{today}"
