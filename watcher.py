@@ -979,7 +979,12 @@ def band_snapshot(sym):
 
 
 def check_band_end(sym, log, today):
-    """检查单只股票的日线波段结束信号，同一股票每天只提醒一次。"""
+    """检查单只股票的日线波段结束信号，同一股票每天只提醒一次。
+
+    ★ 2026-11-02 **整体下线**（用户要求「我只要买卖点推送就行」）：main 的调用点已删，
+      本函数不再被调用 —— 这是 10-12 修复时漏掉的**手工名单平行链路**，
+      用户 11-02 仍收到【波段结束预警】就是它推的。保留函数体备查，勿再接回。
+    """
     try:
         status, m = band_snapshot(sym)
         if status is None:
@@ -1246,41 +1251,17 @@ def check_band_memory(mem, log, today):
         changed = True
         print(f"  🔄 {sym} 波段状态 {old_status} → {status}")
 
-        # 决定要不要打扰用户
+        # ★ 2026-11-02 用户要求「我只要买卖点推送就行」：波段状态变化（结束+启动）
+        #   **全部不再推送微信** —— 状态变化仍写入记忆与轨迹（网页端 🔴/🚀 标记可见、
+        #   参与综合分排序），但巡检不再为波段发任何消息。
+        #   _band_alert_decision 保留（跨文件一致性测试守着，将来恢复推送在这接回）。
+        #   历史：2026-10-12 只停了 end；11-02 用户实测仍收到 —— 根因是漏了
+        #   check_band_end（手工名单链路）这条**平行链路**，start 链路也还在。
+        #   这次：check_band_end 调用点删除 + 本段 start 推送一并下线，波段推送清零。
         to_alert = _band_alert_decision(old_status, status)
-        if not to_alert:
-            continue
-        # ★ 2026-10-12 用户要求：**波段结束预警不再推送微信** —— 状态变化仍写入记忆与
-        #   轨迹（网页端标题 🔴/🔻 标记可见、仍参与综合分排序），但不再打扰。
-        #   「波段启动」推送保留；_band_alert_decision 的 end 判定保留
-        #   （跨文件一致性测试守着，网页端若要复用判定还能用）。
-        if to_alert == "end":
-            continue
-
-        key = f"{sym}_bandmem_{status}_{today}"
-        if key in log.get(today, []):
-            continue
-
-        name = node.get("name") or sym
-        reasons = []
-        if status == '顶背离预警':
-            reasons.append("顶背离（股价新高但 MACD 未新高）")
-        if status == '跌破支撑':
-            reasons.append(f"跌破 20 日线支撑（{m['ma20']:.2f}）")
-        title = f"【波段结束预警】{name}" if to_alert == "end" else f"【波段启动】{name}"
-        body = (
-            f"股票：{name} ({sym})\n"
-            f"日期：{today}\n"
-            f"状态：{old_status or '（无记录）'} → {status}\n"
-            f"现价：{m['current']:.2f}　20日线：{m['ma20']:.2f}\n"
-            + (f"依据：{' + '.join(reasons)}\n\n该股票波段可能结束，请注意止盈/止损。"
-               if to_alert == "end" else
-               "\n该股票出现波段启动信号（来自你的波段记忆清单）。")
-        )
-        if send_wechat(title, body, code=sym, name=name):
-            log.setdefault(today, []).append(key)
-            pushed += 1
-            print(f"  ⚠️ {name}({sym}) {old_status} → {status} → 已推送微信")
+        if to_alert:
+            print(f"  ○ {node.get('name') or sym} {old_status} → {status}"
+                  "（波段变化只记录，不推微信）")
     return pushed, changed
 
 
@@ -1494,11 +1475,8 @@ def main():
         if check_symbol(sym, market_change, log, today, _wl0):
             pushed += 1
 
-    # 波段结束预警（日线级别，每天同一股票只提醒一次）
-    band_alert = 0
-    for sym in tradeable:
-        if check_band_end(sym, log, today):
-            band_alert += 1
+    # ★ 2026-11-02（用户要求「我只要买卖点推送就行」）：波段结束预警（check_band_end，
+    #   手工名单链路）整体下线，不再调用。check_band_memory 里的波段状态变化推送也已全停。
 
     # 波段记忆监控（覆盖网页端记入的清单 + BAND_WATCHLIST）
     mem_pushed, mem_changed = check_band_memory(mem, log, today)
@@ -1507,8 +1485,7 @@ def main():
             print("  💾 波段记忆已回写（workflow 会提交回仓库）")
 
     save_log(log)
-    print(f"===== 巡检结束，共推送 {pushed} 条日内信号 / {band_alert} 条波段结束预警 "
-          f"/ {mem_pushed} 条波段记忆变化 =====")
+    print(f"===== 巡检结束，共推送 {pushed} 条日内信号（波段类推送已全部下线） =====")
     return 0
 
 
